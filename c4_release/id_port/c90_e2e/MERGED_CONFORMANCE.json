@@ -1,8 +1,8 @@
 {
   "in_subset_total": 287,
-  "in_subset_pass": 245,
-  "in_subset_fail": 42,
-  "in_subset_pass_rate": 0.8536585365853658,
+  "in_subset_pass": 281,
+  "in_subset_fail": 6,
+  "in_subset_pass_rate": 0.9790940766550522,
   "out_of_subset_total": 34,
   "gcc_skipped": 23,
   "corpus_total": 344,
@@ -1941,14 +1941,13 @@
       "oos": null,
       "name": "cts_00025",
       "category": "strings",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 2, got 51 at line 1",
-      "bug_class": "",
-      "transpiled": "int strlen(char *);\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nchar *p;\n\n\t\n\t\n\tp = \"hello\";\n\treturn strlen(p) - 5;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2059,14 +2058,13 @@
       "oos": null,
       "name": "cts_00034",
       "category": "recursion",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: break at line 18",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint __brk0; int __brk1; int __brk2; int __cont0; int __cont1; int __cont2; \nint __do_once0;\nint x;\n\n \n\t\n\t\n\tx = 0;\n\twhile(1)\n\t\tbreak;\n\t__brk0 = 0;\nwhile ((1) && __brk0 == 0) {\n__cont0 = 0;\nif (__brk0 == 0 && __cont0 == 0) { if (x == 5) {if (__brk0 == 0 && __cont0 == 0) { __brk0 = 1; }\n\n\t\t} }\nif (__brk0 == 0 && __cont0 == 0) { x = x + 1; }\nif (__brk0 == 0 && __cont0 == 0) { __cont0 = 1; }\n\n\t\n}\n\t\n    __brk1 = 0;\nwhile ((1) && __brk1 == 0) {\n__cont1 = 0;\nif (__brk1 == 0 && __cont1 == 0) { if (x == 10) {if (__brk1 == 0 && __cont1 == 0) { __brk1 = 1; }\n\n\t\t} }\nif (__brk1 == 0 && __cont1 == 0) { x = x + 1; }\nif (__brk1 == 0 && __cont1 == 0) { __cont1 = 1; }\n\n\t\n\n    \n}\n\t__do_once0 = 1;\n__brk2 = 0;\nwhile ((__do_once0 || (1)) && __brk2 == 0) {\n__cont2 = 0;\nif (__brk2 == 0 && __cont2 == 0) { __do_once0 = 0; }\nif (__brk2 == 0 && __cont2 == 0) { if (x == 15) {if (__brk2 == 0 && __cont2 == 0) { __brk2 = 1; }\n\n\t\t} }\nif (__brk2 == 0 && __cont2 == 0) { x = x + 1; }\nif (__brk2 == 0 && __cont2 == 0) { __cont2 = 1; }\n\n\t\n\n}\n\treturn x - 15;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2112,14 +2110,13 @@
       "oos": null,
       "name": "cts_00038",
       "category": "bitwise",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 50, got 1 at line 16",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint x;\nint *p;\n\n\t\n\n\tif (sizeof(int) < 2)\n\t\treturn 1;\n\tif (sizeof 0 < 2)\n\t\treturn 1;\n\tif (sizeof(char) < 1)\n\t\treturn 1;\n\tif (sizeof(int) - 2 < 0)\n\t\treturn 1;\n\tif (sizeof(int) != sizeof p)\n\t\treturn 1;\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2146,7 +2143,7 @@
       "port_stdout": "",
       "detail": "did not halt within 60,000,000 cycles (cyc=60,000,000)",
       "bug_class": "",
-      "transpiled": "int N;\nint *t;\n\nint\nchk(int x, int y)\n{\nint i;\nint r;\n\n        \n        \n\n        r=i=0;\n    while (i<8) {\n\n                r = r + t[x + 8*i];\n                r = r + t[i + 8*y];\n                if (x+i < 8 & y+i < 8)\n                        r = r + t[x+i + 8*(y+i)];\n                if (x+i < 8 & y-i >= 0)\n                        r = r + t[x+i + 8*(y-i)];\n                if (x-i >= 0 & y+i < 8)\n                        r = r + t[x-i + 8*(y+i)];\n                if (x-i >= 0 & y-i >= 0)\n                        r = r + t[x-i + 8*(y-i)];\n        \n    i++;\n    }\n        return r;\n}\n\nint\ngo(int n, int x, int y)\n{\n        if (n == 8) {\n                N++;\n                return 0;\n        }\n        \n    while (y<8) {\n\n                \n    while (x<8) {\nif (chk(x, y) == 0) {\n                                t[x + 8*y]++;\n                                go(n+1, x, y);\n                                t[x + 8*y]--;\n                        }\n    x++;\n    }\n                x = 0;\n        \n    y++;\n    }\n\treturn 0;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n        t = calloc(64, sizeof(int));\n        go(0, 0, 0);\n        if(N != 92)\n        \treturn 1;\n        return 0;\n}\n"
+      "transpiled": "int N;\nint *t;\n\nint\nchk(int x, int y)\n{\nint i;\nint r;\n\nr=i=0;\n    while (i<8) {\n\nr = r + t[x + 8*i];\nr = r + t[i + 8*y];\nif (x+i < 8 & y+i < 8)\nr = r + t[x+i + 8*(y+i)];\nif (x+i < 8 & y-i >= 0)\nr = r + t[x+i + 8*(y-i)];\nif (x-i >= 0 & y+i < 8)\nr = r + t[x-i + 8*(y+i)];\nif (x-i >= 0 & y-i >= 0)\nr = r + t[x-i + 8*(y-i)];\n\n    i++;\n    }\nreturn r;\n}\n\nint\ngo(int n, int x, int y)\n{\nif (n == 8) {\nN++;\nreturn 0;\n}\n\n    while (y<8) {\n\n    while (x<8) {\nif (chk(x, y) == 0) {\nt[x + 8*y]++;\ngo(n+1, x, y);\nt[x + 8*y]--;\n}\n    x++;\n    }\nx = 0;\n\n    y++;\n    }\nreturn 0;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nt = calloc(64, sizeof(int));\ngo(0, 0, 0);\nif(N != 92)\nreturn 1;\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -2218,14 +2215,13 @@
       "oos": null,
       "name": "cts_00046",
       "category": "union",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 1 at line 15",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint *v;\n\n    v = malloc((2) * sizeof(int));\n\n\t\n\tv[0] = 1;\n\tv.b1 = 2;\n\tv.c = 3;\n\tv[1] = 4;\n\t\n\tif (v[0] != 1)\n\t\treturn 1;\n\tif (v.b1 != 2 &v.b2 != 2)\n\t\treturn 2;\n\tif (v.c != 3)\n\t\treturn 3;\n\tif (v[1] != 4)\n\t\treturn 4;\n\t\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2245,56 +2241,52 @@
       "oos": null,
       "name": "cts_00048",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 8",
-      "bug_class": "",
-      "transpiled": "int *s;\n\n// --- generated static initializers ---\n\nint s_init()\n{\n    s = malloc((1) * (2) * sizeof(int));\n    s[(0) * (2) + 0] = .b = 2;\n    s[(0) * (2) + 1] = .a = 1;\n}\n\nint c4_static_init()\n{\n    s_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\tif(s[0] != 1)\n\t\treturn 1;\n\tif(s[1] != 2)\n\t\treturn 2;\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00049",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 10",
-      "bug_class": "",
-      "transpiled": "int x;\n\nint *s;\n\n// --- generated static initializers ---\n\nint s_init()\n{\n    s = malloc((1) * (2) * sizeof(int));\n    s[(0) * (2) + 0] = .p = &x;\n    s[(0) * (2) + 1] = .a = 1;\n}\n\nint c4_static_init()\n{\n    x = 10;\n    s_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\tif(s[0] != 1)\n\t\treturn 1;\n\tif(*s[1] != 10)\n\t\treturn 2;\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00050",
       "category": "union",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 51, got 1 at line 25",
-      "bug_class": "",
-      "transpiled": "int *v;\n\n// --- generated static initializers ---\n\nint v_init()\n{\n    v = malloc((1) * (4) * sizeof(int));\n    v[(0) * (4) + 0] = 1;\n    v[(0) * (4) + 1] = 2;\n    v[(0) * (4) + 2] = 3;\n}\n\nint c4_static_init()\n{\n    v_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\tif(v[0] != 1)\n\t\treturn 1;\n\tif(v[1] != 2)\n\t\treturn 2;\n\tif(v.c != 3 || v.d != 3)\n\t\treturn 3;\n\tif(v[2] != 4)\n\t\treturn 4;\n\tif(v[3] != 5)\n\t\treturn 5;\n\t\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00051",
       "category": "switch",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 19",
-      "bug_class": "",
-      "transpiled": "int x;\n\nint c4_static_init()\n{\n    x = 0;\n}\n\nint\nmain()\n{\nint __ent0; int __gx0; int __jmp0; int __st0; c4_static_init(); \n\n__st0 = 0;\n__gx0 = 0;\nwhile (__gx0 == 0) {\n__ent0 = __st0;\nif (__ent0 == 0) { __jmp0 = 0;\nif (__jmp0 == 0) { switch(x)\n\t\tcase 0:\n\t\t\t; }\nif (__jmp0 == 0) { switch(x)\n\t\tcase 0:\n\t\t\t\nif ((x) == (0)) {\n\n\t\t\t\t\t{ __st0 = 1; __jmp0 = 1; }\n}\nelse {\n\n\t\t\t\t\treturn 1;\n\t\t\t\n}\n\n\treturn 1; }\n\n if (__jmp0 == 0) { __st0 = 1; } }\nif (__ent0 == 1) { __jmp0 = 0;\nif (__jmp0 == 0) { switch(x)\n\t\tcase 1:\n\t\t\treturn 1; }\nif (__jmp0 == 0) { if (1) {\nif (__jmp0 == 0) { {\nif (__jmp0 == 0) { x = 1 + 1; }\nif (__jmp0 == 0) { case 1:\n\t\t\t\treturn 1; }\n\n\t\t\n} }\n\n\t\n\n} }\nif (__jmp0 == 0) { if ((x) == (0)) {\nif (__jmp0 == 0) { return x; }\n\n}\nelse if ((x) == (1)) {\nif (__jmp0 == 0) { return 1; }\n\n}\nelse {\nif (__jmp0 == 0) { return 1; }\n\n\t\n\n} }\n\n if (__jmp0 == 0) { __st0 = 2; } }\nif (__st0 >= 2) { __gx0 = 1; }\n}\n\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2358,7 +2350,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpx6s62jsf/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpx6s62jsf/case.c:18:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpboyn39_y/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpboyn39_y/case.c:18:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -2410,7 +2402,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpqu8fm5rz/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // line comment\n      | ^\n/tmp/tmpqu8fm5rz/case.c:1:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp76j176uj/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // line comment\n      | ^\n/tmp/tmp76j176uj/case.c:1:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -2470,28 +2462,26 @@
       "oos": null,
       "name": "cts_00065",
       "category": "misc",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined function: ADD",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\treturn ADD(1, 2) - 3;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00066",
       "category": "misc",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 50 at line 10",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif(FOO(1, 2, (3)) != 6)\n\t\treturn 1 (;)\n\treturn FOO(0,0,0);\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2628,14 +2618,13 @@
       "oos": null,
       "name": "cts_00077",
       "category": "ptrarith",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 2, got 42 at line 2",
-      "bug_class": "",
-      "transpiled": "int\nfoo(int x[100])\n{\nint *y;\nint *p;\n\n    y = malloc((100) * sizeof(int));\n\n\t\n\t\n\t\n\ty[0] = 2000;\n\t\n\tif(x[0] != 1000)\n\t{\n\t\treturn 1;\n\t}\n\t\n\tp = x;\n\t\n\tif(p[0] != 1000)\n\t{\n\t\treturn 2;\n\t}\n\t\n\tp = y;\n\t\n\tif(p[0] != 2000)\n\t{\n\t\treturn 3;\n\t}\n\t\n\tif(((100) * sizeof(int)) != sizeof(int*))\n\t{\n\t\treturn 4;\n\t}\n\t\n\tif(((100) * sizeof(int)) <= ((100) * sizeof(int)))\n\t{\n\t\treturn 5;\n\t}\n\t\n\treturn 0;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint *x;\n\n    x = malloc((100) * sizeof(int));\n\n\t\n\tx[0] = 1000;\n\t\n\treturn foo(x);\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2712,9 +2701,9 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "SyntaxError: Bad identifier: one",
+      "detail": "SyntaxError: Undefined: __VA_ARGS__ at line 39",
       "bug_class": "",
-      "transpiled": "int\none(int a)\n{\n\tif (a != 1)\n\t\treturn 1;\n\t\n\treturn 0;\n}\n\nint\ntwo(int a, int b)\n{\n\tif (a != 1)\n\t\treturn 1;\n\tif (b != 2)\n\t\treturn 1;\n\t\n\treturn 0;\n}\n\nint\nthree(int a, int b, int c)\n{\n\tif (a != 1)\n\t\treturn 1;\n\tif (b != 2)\n\t\treturn 1;\n\tif (c != 3)\n\t\treturn 1;\n\t\n\treturn 0;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif (CALL(one, 1))\n\t\treturn 2;\n\tif (CALL(two, 1, 2))\n\t\treturn 3;\n\tif (CALL(three, 1, 2, 3))\n\t\treturn 4;\n\t\n\treturn 0;\n}\n"
+      "transpiled": "int\none(int a)\n{\nif (a != 1)\nreturn 1;\nreturn 0;\n}\n\nint\ntwo(int a, int b)\n{\nif (a != 1)\nreturn 1;\nif (b != 2)\nreturn 1;\nreturn 0;\n}\n\nint\nthree(int a, int b, int c)\n{\nif (a != 1)\nreturn 1;\nif (b != 2)\nreturn 1;\nif (c != 3)\nreturn 1;\nreturn 0;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nif (one(__VA_ARGS__))\nreturn 2;\nif (CALL(two, 1, 2))\nreturn 3;\nif (CALL(three, 1, 2, 3))\nreturn 4;\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -2726,9 +2715,9 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined function: ARGS",
+      "detail": "SyntaxError: Undefined: __VA_ARGS__ at line 45",
       "bug_class": "",
-      "transpiled": "int\nnone()\n{\n\treturn 0;\n}\n\nint\none(int a)\n{\n\tif (a != 1)\n\t\treturn 1;\n\t\n\treturn 0;\n}\n\nint\ntwo(int a, int b)\n{\n\tif (a != 1)\n\t\treturn 1;\n\tif (b != 2)\n\t\treturn 1;\n\t\n\treturn 0;\n}\n\nint\nthree(int a, int b, int c)\n{\n\tif (a != 1)\n\t\treturn 1;\n\tif (b != 2)\n\t\treturn 1;\n\tif (c != 3)\n\t\treturn 1;\n\t\n\treturn 0;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif (none(ARGS()))\n\t\treturn 1;\n\tif (one(ARGS(1)))\n\t\treturn 2;\n\tif (two(ARGS(1, 2)))\n\t\treturn 3;\n\tif (three(ARGS(1, 2, 3)))\n\t\treturn 4;\n\treturn 0;\n}\n"
+      "transpiled": "int\nnone()\n{\nreturn 0;\n}\n\nint\none(int a)\n{\nif (a != 1)\nreturn 1;\nreturn 0;\n}\n\nint\ntwo(int a, int b)\n{\nif (a != 1)\nreturn 1;\nif (b != 2)\nreturn 1;\nreturn 0;\n}\n\nint\nthree(int a, int b, int c)\n{\nif (a != 1)\nreturn 1;\nif (b != 2)\nreturn 1;\nif (c != 3)\nreturn 1;\nreturn 0;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nif (none(__VA_ARGS__))\nreturn 1;\nif (one(__VA_ARGS__))\nreturn 2;\nif (two(ARGS(1, 2)))\nreturn 3;\nif (three(ARGS(1, 2, 3)))\nreturn 4;\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -2740,9 +2729,9 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined function: ZERO_0",
+      "detail": "SyntaxError: Undefined function: ZERO_VAR",
       "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif (ZERO_0())\n\t\treturn 1;\n\tif ((0))\n\t\treturn 1;\n\tif (ZERO_2(1, 2))\n\t\treturn 1;\n\tif (ZERO_VAR(1))\n\t\treturn 1;\n\tif (ZERO_VAR(1, 2))\n\t\treturn 1;\n\tif (ZERO_1_VAR(1, 2))\n\t\treturn 1;\n\tif (ZERO_1_VAR(1, 2, 3))\n\t\treturn 1;\n\t\t\n\treturn 0;\n}\n"
+      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nif (0)\nreturn 1;\nif (0)\nreturn 1;\nif (0)\nreturn 1;\nif (0)\nreturn 1;\nif (ZERO_VAR(1, 2))\nreturn 1;\nif (0)\nreturn 1;\nif (ZERO_1_VAR(1, 2, 3))\nreturn 1;\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -2769,7 +2758,7 @@
       "port_stdout": "",
       "detail": "SyntaxError: Bad identifier: foo",
       "bug_class": "",
-      "transpiled": "int\nfoo()\n{\n\treturn 0;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint *v;\n\n    v = malloc((1) * sizeof(int));\n\n\t\n\tv[0] = foo;\n\treturn v[0]();\n}\n"
+      "transpiled": "int\nfoo()\n{\nreturn 0;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint *v;\n\n    v = malloc((1) * sizeof(int));\n\nv[0] = foo;\nreturn v[0]();\n}\n"
     },
     {
       "suite": "cts",
@@ -2783,7 +2772,7 @@
       "port_stdout": "",
       "detail": "SyntaxError: Expected 2, got 50 at line 1",
       "bug_class": "",
-      "transpiled": "int (*fptr)() = 0;\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif (fptr)\n\t\treturn 1;\n\treturn 0;\n}\n"
+      "transpiled": "int (*fptr)() = 0;\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nif (fptr)\nreturn 1;\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -2795,9 +2784,9 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 11 at line 7",
+      "detail": "SyntaxError: Expected 56, got 11 at line 6",
       "bug_class": "",
-      "transpiled": "int *s;\n\nstruct \n\n// --- generated static initializers ---\n\nint\nzero()\n{\n\treturn 0;\n}\n\nS *\nanon()\n{\n\treturn &s;\n}\n\nfty\ngo()\n{\n\treturn &anon;\n}\n\nint s_init()\n{\n    s = malloc((1) * (1) * sizeof(int));\n    s[(0) * (1) + 0] = &zero;\n}\n\nint c4_static_init()\n{\n    s_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\treturn go()()->zerofunc();\n}\n"
+      "transpiled": "int *s;\nstruct \n\n// --- generated static initializers ---\n\nint\nzero()\n{\nreturn 0;\n}\n\nS *\nanon()\n{\nreturn &s;\n}\n\nfty\ngo()\n{\nreturn &anon;\n}\n\nint s_init()\n{\n    s = malloc((1) * (1) * sizeof(int));\n    s[(0) * (1) + 0] = &zero;\n}\n\nint c4_static_init()\n{\n    s_init();\n}\n\nint\nmain()\n{ c4_static_init();\nreturn go()()->zerofunc();\n}\n"
     },
     {
       "suite": "cts",
@@ -2876,7 +2865,7 @@
       "port_stdout": "",
       "detail": "SyntaxError: Bad identifier: main",
       "bug_class": "",
-      "transpiled": "int x;\nint x;\nint x;\n\nint main();\n\nint *\nfoo()\n{\n\treturn &main;\n}\n\nint c4_static_init()\n{\n    x = 3;\n}\n\nint\nmain()\n{ c4_static_init();\n\tif (x != 3)\n\t\treturn 0;\n\n\tx = 0;\n\treturn x;\n}\n"
+      "transpiled": "int x;\nint x;\nint x;\nint main();\n\nint *\nfoo()\n{\nreturn &main;\n}\n\nint c4_static_init()\n{\n    x = 3;\n}\n\nint\nmain()\n{ c4_static_init();\nif (x != 3)\nreturn 0;\nx = 0;\nreturn x;\n}\n"
     },
     {
       "suite": "cts",
@@ -2909,14 +2898,13 @@
       "oos": null,
       "name": "cts_00098",
       "category": "misc",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: L0 at line 9",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\treturn L0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2988,14 +2976,14 @@
       "oos": null,
       "name": "cts_00104",
       "category": "bitwise",
-      "stage": "compile_error",
+      "stage": "MISMATCH",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 1,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: int32_t at line 9",
+      "detail": "exit gcc=0 port=1",
       "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tint32_t x;\n\tint64_t l;\n\t\n\tx = 0;\n\tl = 0;\n\t\n\tx = (0 - (x) - 1);\n\tif (x != 0xffffffff)\n\t\treturn 1;\n\t\n\tl = (0 - (l) - 1);\n\tif (x != 0xffffffffffffffff)\n\t\treturn 2;\n\n\t\n\treturn 0;\n}\n"
+      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint x;\nint l;\n\nx = 0;\nl = 0;\nx = (0 - (x) - 1);\nif (x != 0xffffffff)\nreturn 1;\nl = (0 - (l) - 1);\nif (x != 0xffffffffffffffff)\nreturn 2;\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -3132,14 +3120,13 @@
       "oos": null,
       "name": "cts_00115",
       "category": "strings",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 42 at line 1",
-      "bug_class": "",
-      "transpiled": "char s[] = \"abc\";\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif (s[0] != 'a')\n\t\treturn 1;\n\tif (s[1] != 'b')\n\t\treturn 2;\n\tif (s[2] != 'c')\n\t\treturn 3;\n\tif (s[3] != 0)\n\t\treturn 4;\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3224,14 +3211,13 @@
       "oos": null,
       "name": "cts_00122",
       "category": "misc",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Unexpected token: 57 at line 9",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\treturn F(, 1) 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3258,7 +3244,7 @@
       "port_stdout": "",
       "detail": "SyntaxError: Expected 2, got 50 at line 1",
       "bug_class": "",
-      "transpiled": "int (*\nf1(int a, int b))(int c, int b)\n{\n\tif (a != b)\n\t\treturn f2;\n\treturn 0;\n}\n\nint\nf2(int c, int b)\n{\n\treturn c - b;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tint (* (*p)(int a, int b))(int c, int d) = f1;\n\n\treturn (*(*p)(0, 2))(2, 2);\n}\n"
+      "transpiled": "int (*\nf1(int a, int b))(int c, int b)\n{\nif (a != b)\nreturn f2;\nreturn 0;\n}\n\nint\nf2(int c, int b)\n{\nreturn c - b;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint (* (*p)(int a, int b))(int c, int d) = f1;\nreturn (*(*p)(0, 2))(2, 2);\n}\n"
     },
     {
       "suite": "cts",
@@ -3311,7 +3297,7 @@
       "port_stdout": "",
       "detail": "SyntaxError: Expected 2, got 11 at line 9",
       "bug_class": "",
-      "transpiled": "int a;\nint b;\nchar c;\nint d;\nint e;\nint f;\nint g;\nint h;\nint int i;\nint j;\nint k;\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\ta = b;\n\ta = c;\n\ta = d;\n\ta = e;\n\ta = f;\n\ta = g;\n\ta = h;\n\ta = i;\n\ta = j;\n\ta = k;\n\n\tb = a;\n\tb = c;\n\tb = d;\n\tb = e;\n\tb = f;\n\tb = g;\n\tb = h;\n\tb = i;\n\tb = j;\n\tb = k;\n\n\tc = a;\n\tc = b;\n\tc = d;\n\tc = e;\n\tc = f;\n\tc = g;\n\tc = h;\n\tc = i;\n\tc = j;\n\tc = k;\n\n\td = a;\n\td = b;\n\td = c;\n\td = e;\n\td = f;\n\td = g;\n\td = h;\n\td = i;\n\td = j;\n\td = k;\n\n\te = a;\n\te = b;\n\te = c;\n\te = d;\n\te = f;\n\te = g;\n\te = h;\n\te = i;\n\te = j;\n\te = k;\n\n\tf = a;\n\tf = b;\n\tf = c;\n\tf = d;\n\tf = e;\n\tf = g;\n\tf = h;\n\tf = i;\n\tf = j;\n\tf = k;\n\n\tg = a;\n\tg = b;\n\tg = c;\n\tg = d;\n\tg = e;\n\tg = f;\n\tg = h;\n\tg = i;\n\tg = j;\n\tg = k;\n\n\th = a;\n\th = b;\n\th = c;\n\th = d;\n\th = e;\n\th = f;\n\th = g;\n\th = i;\n\th = j;\n\th = k;\n\n\ti = a;\n\ti = b;\n\ti = c;\n\ti = d;\n\ti = e;\n\ti = f;\n\ti = g;\n\ti = h;\n\ti = j;\n\ti = k;\n\n\tj = a;\n\tj = b;\n\tj = c;\n\tj = d;\n\tj = e;\n\tj = f;\n\tj = g;\n\tj = h;\n\tj = i;\n\tj = k;\n\n\tk = a;\n\tk = b;\n\tk = c;\n\tk = d;\n\tk = e;\n\tk = f;\n\tk = g;\n\tk = h;\n\tk = j;\n\tk = i;\n\n\treturn 0;\n}\n"
+      "transpiled": "int a;\nint b;\nchar c;\nint d;\nint e;\nint f;\nint g;\nint h;\nint int i;\nint j;\nint k;\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\na = b;\na = c;\na = d;\na = e;\na = f;\na = g;\na = h;\na = i;\na = j;\na = k;\nb = a;\nb = c;\nb = d;\nb = e;\nb = f;\nb = g;\nb = h;\nb = i;\nb = j;\nb = k;\nc = a;\nc = b;\nc = d;\nc = e;\nc = f;\nc = g;\nc = h;\nc = i;\nc = j;\nc = k;\nd = a;\nd = b;\nd = c;\nd = e;\nd = f;\nd = g;\nd = h;\nd = i;\nd = j;\nd = k;\ne = a;\ne = b;\ne = c;\ne = d;\ne = f;\ne = g;\ne = h;\ne = i;\ne = j;\ne = k;\nf = a;\nf = b;\nf = c;\nf = d;\nf = e;\nf = g;\nf = h;\nf = i;\nf = j;\nf = k;\ng = a;\ng = b;\ng = c;\ng = d;\ng = e;\ng = f;\ng = h;\ng = i;\ng = j;\ng = k;\nh = a;\nh = b;\nh = c;\nh = d;\nh = e;\nh = f;\nh = g;\nh = i;\nh = j;\nh = k;\ni = a;\ni = b;\ni = c;\ni = d;\ni = e;\ni = f;\ni = g;\ni = h;\ni = j;\ni = k;\nj = a;\nj = b;\nj = c;\nj = d;\nj = e;\nj = f;\nj = g;\nj = h;\nj = i;\nj = k;\nk = a;\nk = b;\nk = c;\nk = d;\nk = e;\nk = f;\nk = g;\nk = h;\nk = j;\nk = i;\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -3331,14 +3317,13 @@
       "oos": null,
       "name": "cts_00130",
       "category": "multidim",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: p at line 18",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint *v;\nchar *arr;\n\n\t\n    v = malloc((4) * sizeof(int));\n    arr = malloc((8) * sizeof(char));\n\n\t\n\n\tp = arr;\n\tq = &arr[((1)) * (4) + (3)];\n\tarr[((1)) * (4) + (3)] = 2;\n\tv[0] = 2;\n\n\tif (arr[((1)) * (4) + (3)] != 2)\n\t\treturn 1;\n\tif (p[1][3] != 2)\n\t\treturn 1;\n\tif (*q != 2)\n\t\treturn 1;\n\tif (*v != 2)\n\t\treturn 1;\n\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3350,7 +3335,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpu_d4za3l/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpu_d4za3l/case.c:8:4: error: C++ style comments are not allowed in ISO C90\n    8 |    // this is also a comment sayhello();\n      |    ^\n/tmp/tmpu_d4za3l/case.c:8:4: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpa3th4u3y/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpa3th4u3y/case.c:8:4: error: C++ style comments are not allowed in ISO C90\n    8 |    // this is also a comment sayhello();\n      |    ^\n/tmp/tmpa3th4u3y/case.c:8:4: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3363,7 +3348,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpvc3tfubg/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpvc3tfubg/case.c:18:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpx2fnp7yx/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpx2fnp7yx/case.c:18:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3423,28 +3408,26 @@
       "oos": null,
       "name": "cts_00137",
       "category": "fnptr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Unexpected token: 16 at line 14",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nchar *p;\n\n\t\n\tp = (#(hello))  \" is better than bye\";\n\n\treturn (*p == 'h') ? 0 : 1;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00138",
       "category": "strings",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: M at line 11",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nchar *a;\n\n\ta = A(M,\"hi\");\n\n\treturn (a[1] == 'i') ? 0 : 1;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3471,21 +3454,20 @@
       "port_stdout": "",
       "detail": "SyntaxError: Expected 2, got 1 at line 2",
       "bug_class": "",
-      "transpiled": "int\nf1(struct foo f, int *p, int n, ...)\n{\n\tif (f[0] != p[0])\n\t\treturn 0;\n\treturn p[1] + n;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint *f;\n\n    f = malloc((5) * sizeof(int));\n\n\tf[0] = f[1] = 1;\n\tf1(f, f, 2);\n\tf1(f, f, 2, 1, f, f);\n\n\treturn 0;\n}\n"
+      "transpiled": "int\nf1(struct foo f, int *p, int n, ...)\n{\nif (f[0] != p[0])\nreturn 0;\nreturn p[1] + n;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint *f;\n\n    f = malloc((5) * sizeof(int));\n\nf[0] = f[1] = 1;\nf1(f, f, 2);\nf1(f, f, 2, 1, f, f);\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00141",
       "category": "misc",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined function: CAT",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint foo;\nint bar;\nint foobar;\n\n\t\n\n\tCAT(foo,bar) = foo + bar;\n\tXCAT(foo,bar) = foo + bar;\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3505,14 +3487,13 @@
       "oos": null,
       "name": "cts_00143",
       "category": "switch",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: case at line 41",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nint __do_once0;\nint count;\nint n;\nint *from;\nint *to;\nint *a;\nint *b;\n\n    a = malloc((39) * sizeof(int));\n    b = malloc((39) * sizeof(int));\n\n \n    \n    \n    \n\n    n = 0;\n    while (n < 39) {\n\n        a[n] = n;\n        b[n] = 0;\n    \n    n++;\n    }\n    from = a;\n    to = b;\n    count = 39;\n    n = (count + 7) / 8;\n    \nif ((count % 8) == (0)) {\n __do_once0 = 1;\nwhile (__do_once0 || (--n > 0)) { __do_once0 = 0;\n *to++ = *from++;\n    case 7:      *to++ = *from++;\n    case 6:      *to++ = *from++;\n    case 5:      *to++ = *from++;\n    case 4:      *to++ = *from++;\n    case 3:      *to++ = *from++;\n    case 2:      *to++ = *from++;\n    case 1:      *to++ = *from++;\n            \n}\n    \n}\n\n    n = 0;\n    while (n < 39) {\nif(a[n] != b[n])\n            return 1;\n    n++;\n    }\n    return 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3571,56 +3552,52 @@
       "oos": null,
       "name": "cts_00148",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Unexpected token: 42 at line 8",
-      "bug_class": "",
-      "transpiled": "int *arr;\n\n// --- generated static initializers ---\n\nint arr_init()\n{\n    arr = malloc((2) * (2) * sizeof(int));\n    arr[(0) * (2) + 0] = [1] = {3, 4};\n    arr[(1) * (2) + 0] = [0] = {1, 2};\n}\n\nint c4_static_init()\n{\n    arr_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\tif((arr + (0) * 2)[0] != 1)\n\t\treturn 1;\n\tif((arr + (0) * 2)[1] != 2)\n\t\treturn 2;\n\tif((arr + (1) * 2)[0] != 3)\n\t\treturn 3;\n\tif((arr + (1) * 2)[1] != 4)\n\t\treturn 4;\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00149",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: struct at line 5",
-      "bug_class": "",
-      "transpiled": "int * s;\n\nint c4_static_init()\n{\n    s = &(struct S) { 1, 2 };\n}\n\nint\nmain()\n{ c4_static_init();\n\tif(s[0] != 1)\n\t\treturn 1;\n\tif(s[1] != 2)\n\t\treturn 2;\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00150",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 20 at line 2",
-      "bug_class": "",
-      "transpiled": "int *gs1;\nint *s = &(struct S2) {\n\t{.b = 2, .a = 1},\n\t&gs1,\n\t{[0] = 1,  1+1}\n};\n\n// --- generated static initializers ---\n\nint gs1_init()\n{\n    gs1 = malloc((1) * (2) * sizeof(int));\n    gs1[(0) * (2) + 0] = .a = 1;\n    gs1[(0) * (2) + 1] = 2;\n}\n\nint c4_static_init()\n{\n    gs1_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\tif(s[0] != 1)\n\t\treturn 1;\n\tif(s[1] != 2)\n\t\treturn 2;\n\tif(((int *)(s[2]))[0] != 1)\n\t\treturn 3;\n\tif(((int *)(s[2]))[1] != 2)\n\t\treturn 4;\n\tif(((s + 3))[0] != 1)\n\t\treturn 5;\n\tif(((s + 3))[1] != 2)\n\t\treturn 6;\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00151",
       "category": "multidim",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Unexpected token: 52 at line 8",
-      "bug_class": "",
-      "transpiled": "int *arr;\n\n// --- generated static initializers ---\n\nint arr_init()\n{\n    arr = malloc(((3) * (5)) * sizeof(int));\n    arr[0] = { 0, 0, 3, 5 };\n    arr[1] = { 1, [3] = 6, 7 };\n    arr[2] = 0;\n    arr[3] = { 1, 2 };\n    arr[4] = { [4] = 7, };\n    arr[5] = 0;\n}\n\nint c4_static_init()\n{\n    arr_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\treturn (((arr[(((0)) * (3) + (1)) * (5) + (4)] == arr[(((1)) * (3) + (1)) * (5) + (4)])) == 0);\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3640,14 +3617,13 @@
       "oos": null,
       "name": "cts_00153",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 1 at line 13",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint *s;\n\n    s = malloc((1) * sizeof(int));\n\n\ts.x = 0;\n\treturn s.y();\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3685,7 +3661,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpkzincj33/case.c:15:1: error: C++ style comments are not allowed in ISO C90\n   15 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpkzincj33/case.c:15:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpx3ioj5qp/case.c:15:1: error: C++ style comments are not allowed in ISO C90\n   15 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpx3ioj5qp/case.c:15:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3698,7 +3674,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpnafifq87/case.c:21:1: error: C++ style comments are not allowed in ISO C90\n   21 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpnafifq87/case.c:21:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpzqituluh/case.c:21:1: error: C++ style comments are not allowed in ISO C90\n   21 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpzqituluh/case.c:21:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3711,7 +3687,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpat84fmjv/case.c:29:1: error: C++ style comments are not allowed in ISO C90\n   29 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpat84fmjv/case.c:29:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmppxi5pn7f/case.c:29:1: error: C++ style comments are not allowed in ISO C90\n   29 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmppxi5pn7f/case.c:29:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3724,7 +3700,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpz21p8epq/case.c:35:1: error: C++ style comments are not allowed in ISO C90\n   35 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpz21p8epq/case.c:35:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpluds_6zs/case.c:35:1: error: C++ style comments are not allowed in ISO C90\n   35 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpluds_6zs/case.c:35:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3737,7 +3713,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpx_a79evo/case.c:24:1: error: C++ style comments are not allowed in ISO C90\n   24 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpx_a79evo/case.c:24:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp23b1qhvr/case.c:24:1: error: C++ style comments are not allowed in ISO C90\n   24 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp23b1qhvr/case.c:24:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3750,7 +3726,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp8nu5x0q9/case.c:24:1: error: C++ style comments are not allowed in ISO C90\n   24 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp8nu5x0q9/case.c:24:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpt0tt04_e/case.c:24:1: error: C++ style comments are not allowed in ISO C90\n   24 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpt0tt04_e/case.c:24:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3763,7 +3739,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpci9ine3f/case.c:5:17: error: \u00e2\u0080\u0098restrict\u00e2\u0080\u0099 undeclared here (not in a function)\n    5 | void foor(int x[restrict 5]);\n      |                 ^~~~~~~~\n/tmp/tmpci9ine3f/case.c:5:25: error: expected \u00e2\u0080\u0098]\u00e2\u0080\u0099 before numeric constant\n    5 | void foor(int x[restrict 5]);\n      |                         ^~\n      |                         ]\n/tmp/tmpci9ine3f/case.c:9:16: error: \u00e2\u0080\u0098restrict\u00e2\u0080\u0099 unde",
+      "detail": "gcc-compile: /tmp/tmpc51ypqv1/case.c:5:17: error: \u00e2\u0080\u0098restrict\u00e2\u0080\u0099 undeclared here (not in a function)\n    5 | void foor(int x[restrict 5]);\n      |                 ^~~~~~~~\n/tmp/tmpc51ypqv1/case.c:5:25: error: expected \u00e2\u0080\u0098]\u00e2\u0080\u0099 before numeric constant\n    5 | void foor(int x[restrict 5]);\n      |                         ^~\n      |                         ]\n/tmp/tmpc51ypqv1/case.c:9:16: error: \u00e2\u0080\u0098restrict\u00e2\u0080\u0099 unde",
       "bug_class": ""
     },
     {
@@ -3776,7 +3752,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp48oev2jb/case.c:40:1: error: C++ style comments are not allowed in ISO C90\n   40 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp48oev2jb/case.c:40:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpcwwvncuj/case.c:40:1: error: C++ style comments are not allowed in ISO C90\n   40 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpcwwvncuj/case.c:40:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3789,7 +3765,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpwlodaog0/case.c:40:1: error: C++ style comments are not allowed in ISO C90\n   40 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpwlodaog0/case.c:40:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp22cjrtuy/case.c:40:1: error: C++ style comments are not allowed in ISO C90\n   40 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp22cjrtuy/case.c:40:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3802,7 +3778,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp9xorqf9_/case.c:14:1: error: C++ style comments are not allowed in ISO C90\n   14 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp9xorqf9_/case.c:14:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpd6b_0msn/case.c:14:1: error: C++ style comments are not allowed in ISO C90\n   14 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpd6b_0msn/case.c:14:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3815,7 +3791,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpf2h_rbn4/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpf2h_rbn4/case.c:18:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpggw95vir/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpggw95vir/case.c:18:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3828,7 +3804,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmppcybochn/case.c:21:1: error: C++ style comments are not allowed in ISO C90\n   21 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmppcybochn/case.c:21:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpmqhoirbb/case.c:21:1: error: C++ style comments are not allowed in ISO C90\n   21 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpmqhoirbb/case.c:21:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3869,21 +3845,20 @@
       "port_stdout": "",
       "detail": "SyntaxError: Undefined: it_real_fn at line 7",
       "bug_class": "",
-      "transpiled": "int o;\n\n \n\nint should_compile(int *s)\n{\n  s[0] = it_real_fn;\n}\n\nint it_real_fn()\n{\n  return 1;\n}\n\nint deref_uintptr(int *p)\n{\n  return *p;\n}\n\nint c4_static_init()\n{\n\n}\n\nint main()\n{\nint frod;\nint epos;\n\n   \n   epos = 1;\n\n   printf(\"%3 %3 %3 %3 %3 %3 %3 %3\\n\", 0, 1, 2, 3, 54, 73, 74, 75);\n   \n   frod = 12;\n   printf(\"%3\\n\", frod);\n   frod = 54;\n   printf(\"%3\\n\", frod);\n\n   \n   printf (\"int int: %u\\n\", deref_uintptr(&epos));\n\n   return 0;\n}\n"
+      "transpiled": "int efoo;\n\n \n\nint should_compile(int *s)\n{\ns[0] = it_real_fn;\n}\n\nint it_real_fn()\n{\nreturn 1;\n}\n\nint deref_uintptr(int *p)\n{\nreturn *p;\n}\n\nint c4_static_init()\n{\n\n}\n\nint main()\n{\nint frod;\nint epos;\n\nepos = 1;\nprintf(\"%d %d %d %d %d %d %d %d\\n\", 0, 1, 2, 3, 54, 73, 74, 75);\nfrod = 12;\nprintf(\"%d\\n\", frod);\nfrod = 54;\nprintf(\"%d\\n\", frod);\nprintf (\"int int: %u\\n\", deref_uintptr(&epos));\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00171",
       "category": "bitwise",
-      "stage": "MISMATCH",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "42\nb is not NULL\nc is NULL\n",
       "port_exit": 0,
-      "port_stdout": "42\nb is not 0\nc is 0\n",
-      "detail": "stdout gcc='42\\nb is not NULL\\nc is NULL\\n' port='42\\nb is not 0\\nc is 0\\n'",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nint a;\nint *b;\nint *c;\n\n   \n   \n   \n\n   a = 42;\n   b = &a;\n   c = 0;\n\n   printf(\"%d\\n\", *b);\n\n   if (b == 0)\n      printf(\"b is 0\\n\");\n   else\n      printf(\"b is not 0\\n\");\n\n   if (c == 0)\n      printf(\"c is 0\\n\");\n   else\n      printf(\"c is not 0\\n\");\n\n   return 0;\n}\n"
+      "port_stdout": "42\nb is not NULL\nc is NULL\n",
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3921,7 +3896,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp3i679enq/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp3i679enq/case.c:6:4: error: C++ style comments are not allowed in ISO C90\n    6 |    // variables\n      |    ^\n/tmp/tmp3i679enq/case.c:6:4: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp2cnv93aq/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp2cnv93aq/case.c:6:4: error: C++ style comments are not allowed in ISO C90\n    6 |    // variables\n      |    ^\n/tmp/tmp2cnv93aq/case.c:6:4: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3936,7 +3911,7 @@
       "port_stdout": "char: a\nchar: b\nchar: c\nint: 97\nint: 98\nint: 99\nint: %f\nint: %f\nint: %f\n97 97\n97 97\n%f %f\n",
       "detail": "stdout gcc='char: a\\nchar: b\\nchar: c\\nint: 97\\nint: 98\\nint: 99\\nfloat: 97.000000\\nfloat: 98.000000\\nfloat: 99.000000\\n97 97\\n97 97\\n97.000000 97.000000\\n' port='char: a\\nchar: b\\nchar: c\\nint: 97\\nint: 98\\nint: 99\\nint: %f\\nint: %f\\nint: %f\\n97 97\\n97 97\\n%f %f\\n'",
       "bug_class": "",
-      "transpiled": "int charfunc(char a)\n{\n   printf(\"char: %c\\n\", a);\n}\n\nint intfunc(int a)\n{\n   printf(\"int: %d\\n\", a);\n}\n\nint floatfunc(int a)\n{\n   printf(\"int: %f\\n\", a);\n}\n\nint c4_static_init()\n{\n\n}\n\nint main()\n{\nchar b;\nchar c;\nint d;\nint e;\nint f;\nint g;\n\n   charfunc('a');\n   charfunc(98);\n   charfunc(99);\n\n   intfunc('a');\n   intfunc(98);\n   intfunc(99);\n\n   floatfunc('a');\n   floatfunc(98);\n   floatfunc(99);\n\n   \n   \n   \n\n   b = 97;\n   c = 97;\n\n   printf(\"%d %d\\n\", b, c);\n\n   d = 'a';\n   e = 97;\n\n   printf(\"%d %d\\n\", d, e);\n\n   f = 'a';\n   g = 97;\n\n   printf(\"%f %f\\n\", f, g);\n\n   return 0;\n}\n"
+      "transpiled": "int charfunc(char a)\n{\nprintf(\"char: %c\\n\", a);\n}\n\nint intfunc(int a)\n{\nprintf(\"int: %d\\n\", a);\n}\n\nint floatfunc(int a)\n{\nprintf(\"int: %f\\n\", a);\n}\n\nint c4_static_init()\n{\n\n}\n\nint main()\n{\nchar b;\nchar c;\nint d;\nint e;\nint f;\nint g;\n\ncharfunc('a');\ncharfunc(98);\ncharfunc(99);\nintfunc('a');\nintfunc(98);\nintfunc(99);\nfloatfunc('a');\nfloatfunc(98);\nfloatfunc(99);\nb = 97;\nc = 97;\nprintf(\"%d %d\\n\", b, c);\nd = 'a';\ne = 97;\nprintf(\"%d %d\\n\", d, e);\nf = 'a';\ng = 97;\nprintf(\"%f %f\\n\", f, g);\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -3948,7 +3923,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp7czlo2ak/case.c:5:1: error: C++ style comments are not allowed in ISO C90\n    5 | //Swap integer values by array indexes\n      | ^\n/tmp/tmp7czlo2ak/case.c:5:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp1ywe49n7/case.c:5:1: error: C++ style comments are not allowed in ISO C90\n    5 | //Swap integer values by array indexes\n      | ^\n/tmp/tmp1ywe49n7/case.c:5:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3956,14 +3931,13 @@
       "oos": null,
       "name": "cts_00177",
       "category": "ptrarith",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "1\n8\n64\n1\n14\n16\n64\ntest @\n",
-      "port_exit": null,
-      "port_stdout": "",
-      "detail": "SyntaxError: Undefined: e at line 12",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\n   printf(\"%d\\n\", '\\1');\n   printf(\"%d\\n\", '\\10');\n   printf(\"%d\\n\", '\\100');\n   printf(\"%d\\n\", '\\x01');\n   printf(\"%d\\n\", '\\x0e');\n   printf(\"%d\\n\", '\\x10');\n   printf(\"%d\\n\", '\\x40');\n   printf(\"test \\x40\\n\");\n\n   return 0;\n}\n"
+      "port_exit": 0,
+      "port_stdout": "1\n8\n64\n1\n14\n16\n64\ntest @\n",
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3977,7 +3951,7 @@
       "port_stdout": "8\n8\n8\n8\n",
       "detail": "stdout gcc='1\\n4\\n8\\n4\\n' port='8\\n8\\n8\\n8\\n'",
       "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nchar a;\nint b;\nint c;\n\n   \n   \n   \n\n   printf(\"%d\\n\", sizeof(int));\n   printf(\"%d\\n\", sizeof(int));\n   printf(\"%d\\n\", sizeof(int));\n\n   printf(\"%d\\n\", sizeof(int));\n\n   return 0;\n}\n"
+      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nchar a;\nint b;\nint c;\n\nprintf(\"%d\\n\", sizeof(int));\nprintf(\"%d\\n\", sizeof(int));\nprintf(\"%d\\n\", sizeof(int));\nprintf(\"%d\\n\", sizeof(int));\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -4010,28 +3984,26 @@
       "oos": null,
       "name": "cts_00181",
       "category": "varargs",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "Solution of Tower of Hanoi Problem with 4 Disks\n\nStarting state:\nA:  1  2  3  4 \nB:  0  0  0  0 \nC:  0  0  0  0 \n------------------------------------------\n\n\nSubsequent states:\n\nA:  0  2  3  4 \nB:  0  0  0  0 \nC:  0  0  0  1 \n------------------------------------------\nA:  0  0  3  4 \nB:  0  0  0  2 \nC:  0  0  0  1 \n------------------------------------------\nA:  0  0  3  4 \nB:  0  0  1  2 \nC:  0  0  0  0 \n------------------------------------------\nA:  0  0  0  4 \nB:  0  0  1  2 \nC:  0  0  0  3 \n------------------------------------------\nA:  0  0  1  4 \nB:  0  0  0  2 \nC:  0  0  0  3 \n------------------------------------------\nA:  0  0  1  4 \nB:  0  0  0  0 \nC:  0  0  2  3 \n------------------------------------------\nA:  0  0  0  4 \nB:  0  0  0  0 \nC:  0  1  2  3 \n------------------------------------------\nA:  0  0  0  0 \nB:  0  0  0  4 \nC:  0  1  2  3 \n------------------------------------------\nA:  0  0  0  0 \nB:  0  0  1  4 \nC:  0  0  2  3 \n------------------------------------------\nA:  0  0  0  2 \nB:  0  0  1  4 \nC:  0  0  0  3 \n------------------------------------------\nA:  0  0  1  2 \nB:  0  0  0  4 \nC:  0  0  0  3 \n------------------------------------------\nA:  0  0  1  2 \nB:  0  0  3  4 \nC:  0  0  0  0 \n------------------------------------------\nA:  0  0  0  2 \nB:  0  0  3  4 \nC:  0  0  0  1 \n------------------------------------------\nA:  0  0  0  0 \nB:  0  2  3  4 \nC:  0  0  0  1 \n------------------------------------------\nA:  0  0  0  0 \nB:  1  2  3  4 \nC:  0  0  0  0 \n------------------------------------------\n",
-      "port_exit": null,
-      "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 42 at line 1",
-      "bug_class": "",
-      "transpiled": "int A[(4)], B[(4)], C[(4)]; \n\nint Hanoi(int,int*,int*,int*);\n\nint PrintAll()\n{\nint i;\n\n   \n\n   printf(\"A: \");\n   i=0;\n    while (i<(4)) {\nprintf(\" %d \",A[i]);\n    i++;\n    }\n   printf(\"\\n\");\n\n   printf(\"B: \");\n   i=0;\n    while (i<(4)) {\nprintf(\" %d \",B[i]);\n    i++;\n    }\n   printf(\"\\n\");\n\n   printf(\"C: \");\n   i=0;\n    while (i<(4)) {\nprintf(\" %d \",C[i]);\n    i++;\n    }\n   printf(\"\\n\");\n   printf(\"------------------------------------------\\n\");\n   return;\n}\n\nint Move(int *source, int *dest)\n{\nint i;\nint j;\n\n   i = 0; j = 0;\n\n   while (i<(4) && (source[i])==0) i++;\n   while (j<(4) && (dest[j])==0) j++;\n\n   dest[j-1] = source[i];\n   source[i] = 0;\n   PrintAll();       \n   return dest[j-1];\n}\n\nint Hanoi(int n,int *source, int *dest, int *spare)\n{\nint i;\n\n   \n   if(n==1){\n      Move(source,dest);\n      return;\n   }\n\n   Hanoi(n-1,source,spare,dest);\n   Move(source,dest);\n   Hanoi(n-1,spare,dest,source);\t\n   return;\n}\n\nint c4_static_init()\n{\n\n}\n\nint main()\n{\nint i;\n\n   \n\n   \n   i=0;\n    while (i<(4)) {\nA[i]=i+1;\n    i++;\n    }\n   i=0;\n    while (i<(4)) {\nB[i]=0;\n    i++;\n    }\n   i=0;\n    while (i<(4)) {\nC[i]=0;\n    i++;\n    }\n\n   printf(\"Solution of Tower of Hanoi Problem with %d Disks\\n\\n\",(4));\n\n   \n   printf(\"Starting state:\\n\");\n   PrintAll();\n   printf(\"\\n\\nSubsequent states:\\n\\n\");\n\n   \n   Hanoi((4),A,B,C);\n\n   return 0;\n}\n"
+      "port_exit": 0,
+      "port_stdout": "Solution of Tower of Hanoi Problem with 4 Disks\n\nStarting state:\nA:  1  2  3  4 \nB:  0  0  0  0 \nC:  0  0  0  0 \n------------------------------------------\n\n\nSubsequent states:\n\nA:  0  2  3  4 \nB:  0  0  0  0 \nC:  0  0  0  1 \n------------------------------------------\nA:  0  0  3  4 \nB:  0  0  0  2 \nC:  0  0  0  1 \n------------------------------------------\nA:  0  0  3  4 \nB:  0  0  1  2 \nC:  0  0  0  0 \n------------------------------------------\nA:  0  0  0  4 \nB:  0  0  1  2 \nC:  0  0  0  3 \n------------------------------------------\nA:  0  0  1  4 \nB:  0  0  0  2 \nC:  0  0  0  3 \n------------------------------------------\nA:  0  0  1  4 \nB:  0  0  0  0 \nC:  0  0  2  3 \n------------------------------------------\nA:  0  0  0  4 \nB:  0  0  0  0 \nC:  0  1  2  3 \n------------------------------------------\nA:  0  0  0  0 \nB:  0  0  0  4 \nC:  0  1  2  3 \n------------------------------------------\nA:  0  0  0  0 \nB:  0  0  1  4 \nC:  0  0  2  3 \n------------------------------------------\nA:  0  0  0  2 \nB:  0  0  1  4 \nC:  0  0  0  3 \n------------------------------------------\nA:  0  0  1  2 \nB:  0  0  0  4 \nC:  0  0  0  3 \n------------------------------------------\nA:  0  0  1  2 \nB:  0  0  3  4 \nC:  0  0  0  0 \n------------------------------------------\nA:  0  0  0  2 \nB:  0  0  3  4 \nC:  0  0  0  1 \n------------------------------------------\nA:  0  0  0  0 \nB:  0  2  3  4 \nC:  0  0  0  1 \n------------------------------------------\nA:  0  0  0  0 \nB:  1  2  3  4 \nC:  0  0  0  0 \n------------------------------------------\n",
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00182",
       "category": "switch",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "     _   _       _       _  \n  |  _|  _| |_| |_  |_    | \n  | |_   _|   |  _| |_|   | \n\n",
-      "port_exit": null,
-      "port_stdout": "",
-      "detail": "SyntaxError: Unexpected token: 20 at line 14",
-      "bug_class": "",
-      "transpiled": "int *__sl_print_led_d;\n\nint topline(int d, char *p){\n\n   *p++ = ' ';\n   \nif ((d) == (0) || (d) == (2) || (d) == (3) || (d) == (5) || (d) == (7) || (d) == (8) || (d) == (9)) {\n\n         *p++ = '_';\n         \n}\nelse {\n\n         *p+=' ';\n\n   \n}\n\n   *p+=' ';\n}\n\nint midline(int d, char *p){\n\n   \nif ((d) == (0) || (d) == (4) || (d) == (5) || (d) == (6) || (d) == (8) || (d) == (9)) {\n\n         *p+='|';\n         \n}\nelse {\n\n         *p+=' ';\t\n   \n}\n\n   \nif ((d) == (2) || (d) == (3) || (d) == (4) || (d) == (5) || (d) == (6) || (d) == (8) || (d) == (9)) {\n\n         *p+='_';\n         \n}\nelse {\n\n         *p+=' ';\n\n   \n}\n\n   \nif ((d) == (0) || (d) == (1) || (d) == (2) || (d) == (3) || (d) == (4) || (d) == (7) || (d) == (8) || (d) == (9)) {\n\n         *p+='|';\n         \n}\nelse {\n\n         *p+=' ';\n\n   \n}\n\n}\n\nint botline(int d, char *p){\n\n   \nif ((d) == (0) || (d) == (2) || (d) == (6) || (d) == (8)) {\n\n         *p+='|';\n         \n}\nelse {\n\n         *p+=' ';\t\n   \n}\n\n   \nif ((d) == (0) || (d) == (2) || (d) == (3) || (d) == (5) || (d) == (6) || (d) == (8)) {\n\n         *p+='_';\n         \n}\nelse {\n\n         *p+=' ';\n\n   \n}\n\n   \nif ((d) == (0) || (d) == (1) || (d) == (3) || (d) == (4) || (d) == (5) || (d) == (6) || (d) == (7) || (d) == (8) || (d) == (9)) {\n\n         *p+='|';\n         \n}\nelse {\n\n         *p+=' ';\n\n   \n}\n\n}\n\nint print_led(int x, char *buf)\n{\nint __brk0; int __cont0; \nint i;\nint n;\n\n   i = 0;\n   \n\n   \n\n   n = ( x == 0 ? 1 : 0 );  \n\n   __brk0 = 0;\nwhile ((x) && __brk0 == 0) {\n__cont0 = 0;\nif (__brk0 == 0 && __cont0 == 0) { __sl_print_led_d[n++] = (int)(x%10); }\nif (__brk0 == 0 && __cont0 == 0) { if(n >= (32))__brk0 = 1; }\nif (__brk0 == 0 && __cont0 == 0) { x = x/10; }\n\n   \n}\n\n   \n\n   i=n-1;\n    while (i>=0) {\n\n      topline(__sl_print_led_d[i],buf);\n      buf = buf + (3);\n      *buf+=' ';\n   \n    i--;\n    }\n   *buf+=10; \n\n   \n\n   i=n-1;\n    while (i>=0) {\n\n      midline(__sl_print_led_d[i],buf);\n      buf = buf + (3);\n      *buf+=' ';\n   \n    i--;\n    }\n   *buf+=10;\n\n   \n\n   i=n-1;\n    while (i>=0) {\n\n      botline(__sl_print_led_d[i],buf);\n      buf = buf + (3);\n      *buf+=' ';\n   \n    i--;\n    }\n   *buf+=10;\n   *buf=0;\n}\n\nint c4_static_init()\n{\n    __sl_print_led_d = malloc((((32))) * sizeof(int));\n}\n\nint main()\n{\nchar *buf; c4_static_init();\n\n   \n    buf = malloc((5*(32)) * sizeof(char));\n\n   print_led(1234567, buf);\n   printf(\"%s\\n\",buf);\n\n   return 0;\n}\n"
+      "port_exit": 0,
+      "port_stdout": "     _   _       _       _  \n  |  _|  _| |_| |_  |_    | \n  | |_   _|   |  _| |_|   | \n\n",
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -4058,7 +4030,7 @@
       "port_stdout": "1 8\n8 8\n",
       "detail": "stdout gcc='1 1\\n2 2\\n' port='1 8\\n8 8\\n'",
       "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nchar a;\nint b;\n\n   \n   \n\n   printf(\"%d %d\\n\", sizeof(char), sizeof(int));\n   printf(\"%d %d\\n\", sizeof(int), sizeof(int));\n\n   return 0;\n}\n"
+      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nchar a;\nint b;\n\nprintf(\"%d %d\\n\", sizeof(char), sizeof(int));\nprintf(\"%d %d\\n\", sizeof(int), sizeof(int));\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -4096,9 +4068,9 @@
       "gcc_stdout": "hello\nch: 104 'h'\nch: 101 'e'\nch: 108 'l'\nch: 108 'l'\nch: 111 'o'\nch: 10 '.'\nch: 104 'h'\nch: 101 'e'\nch: 108 'l'\nch: 108 'l'\nch: 111 'o'\nch: 10 '.'\nch: 104 'h'\nch: 101 'e'\nch: 108 'l'\nch: 108 'l'\nch: 111 'o'\nch: 10 '.'\nch: 104 'h'\nch: 101 'e'\nch: 108 'l'\nch: 108 'l'\nch: 111 'o'\nch: 10 '.'\nx: hello\nx: hello\n",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: EOF at line 32",
+      "detail": "SyntaxError: Undefined function: fopen",
       "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nint *f;\nchar *freddy;\nint InChar;\nchar ShowChar;\n\n    freddy = malloc((7) * sizeof(char));\n\n   f = fopen(\"fred.txt\", \"w\");\n   fwrite(\"hello\\nhello\\n\", 1, 12, f);\n   fclose(f);\n\n   \n   f = fopen(\"fred.txt\", \"r\");\n   if (fread(freddy, 1, 6, f) != 6)\n      printf(\"couldn't read fred.txt\\n\");\n\n   freddy[6] = 0;\n   fclose(f);\n\n   printf(\"%s\", freddy);\n\n   \n   \n   f = fopen(\"fred.txt\", \"r\");\n   while ( (InChar = fgetc(f)) != EOF)\n   {\n      ShowChar = InChar;\n      if (ShowChar < ' ')\n         ShowChar = '.';\n\n      printf(\"ch: %d '%c'\\n\", InChar, ShowChar);\n   }\n   fclose(f);\n\n   f = fopen(\"fred.txt\", \"r\");\n   while ( (InChar = getc(f)) != EOF)\n   {\n      ShowChar = InChar;\n      if (ShowChar < ' ')\n         ShowChar = '.';\n\n      printf(\"ch: %d '%c'\\n\", InChar, ShowChar);\n   }\n   fclose(f);\n\n   f = fopen(\"fred.txt\", \"r\");\n   while (fgets(freddy, ((7) * sizeof(char)), f) != 0)\n      printf(\"x: %s\", freddy);\n\n   fclose(f);\n\n   return 0;\n}\n"
+      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nint *f;\nchar *freddy;\nint InChar;\nchar ShowChar;\n\n    freddy = malloc((7) * sizeof(char));\n\nf = fopen(\"fred.txt\", \"w\");\nfwrite(\"hello\\nhello\\n\", 1, 12, f);\nfclose(f);\n\nf = fopen(\"fred.txt\", \"r\");\nif (fread(freddy, 1, 6, f) != 6)\nprintf(\"couldn't read fred.txt\\n\");\nfreddy[6] = 0;\nfclose(f);\nprintf(\"%s\", freddy);\n\nf = fopen(\"fred.txt\", \"r\");\nwhile ( (InChar = fgetc(f)) != (-1))\n{\nShowChar = InChar;\nif (ShowChar < ' ')\nShowChar = '.';\nprintf(\"ch: %d '%c'\\n\", InChar, ShowChar);\n}\nfclose(f);\nf = fopen(\"fred.txt\", \"r\");\nwhile ( (InChar = getc(f)) != (-1))\n{\nShowChar = InChar;\nif (ShowChar < ' ')\nShowChar = '.';\nprintf(\"ch: %d '%c'\\n\", InChar, ShowChar);\n}\nfclose(f);\nf = fopen(\"fred.txt\", \"r\");\nwhile (fgets(freddy, ((7) * sizeof(char)), f) != 0)\nprintf(\"x: %s\", freddy);\nfclose(f);\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -4125,7 +4097,7 @@
       "port_stdout": "",
       "detail": "SyntaxError: Expected 2, got 50 at line 1",
       "bug_class": "",
-      "transpiled": "int (*f)(int) = &fred;\n\nint (*fprintfptr)(int *,  char *, ...) = &fprintf;\n\nint fred(int p)\n{\n   printf(\"yo %d\\n\", p);\n   return 42;\n}\n\nint c4_static_init()\n{\n\n}\n\nint main()\n{\n   fprintfptr(stdout, \"%d\\n\", (*f)(24));\n\n   return 0;\n}\n"
+      "transpiled": "int (*f)(int) = &fred;\nint (*fprintfptr)(int *,  char *, ...) = &fprintf;\n\nint fred(int p)\n{\nprintf(\"yo %d\\n\", p);\nreturn 42;\n}\n\nint c4_static_init()\n{\n\n}\n\nint main()\n{\nfprintfptr(stdout, \"%d\\n\", (*f)(24));\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -4204,7 +4176,7 @@
       "port_stdout": "%f, %f\n",
       "detail": "stdout gcc='12.340000, 56.780000\\n' port='%f, %f\\n'",
       "bug_class": "",
-      "transpiled": "int *point_array;\n\nint c4_static_init()\n{\n    point_array = malloc((2) * (100) * sizeof(int));\n}\n\nint main()\n{\nint my_point; c4_static_init();\n\n   my_point = 10;\n\n   (point_array + (my_point) * 2)[0] = 12;\n   (point_array + (my_point) * 2)[1] = 56;\n\n   printf(\"%f, %f\\n\", (point_array + (my_point) * 2)[0], (point_array + (my_point) * 2)[1]);\n\n   return 0;\n}\n"
+      "transpiled": "int *point_array;\n\nint c4_static_init()\n{\n    point_array = malloc((2) * (100) * sizeof(int));\n}\n\nint main()\n{\nint my_point; c4_static_init();\n\nmy_point = 10;\n(point_array + (my_point) * 2)[0] = 12;\n(point_array + (my_point) * 2)[1] = 56;\nprintf(\"%f, %f\\n\", (point_array + (my_point) * 2)[0], (point_array + (my_point) * 2)[1]);\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -4237,14 +4209,13 @@
       "oos": null,
       "name": "cts_00198",
       "category": "enum",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "a=0\nb=1\nc=2\ne=0\nf=1\ng=2\ni=0\nj=1\nk=2\n",
-      "port_exit": null,
-      "port_stdout": "",
-      "detail": "SyntaxError: Undefined: a at line 10",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nint d;\n\n   printf(\"a=%d\\n\", a);\n   printf(\"b=%d\\n\", b);\n   printf(\"c=%d\\n\", c);\n\n   \n\n   \n   \n\n   printf(\"e=%d\\n\", e);\n   printf(\"f=%d\\n\", f);\n   printf(\"g=%d\\n\", g);\n\n   printf(\"i=%d\\n\", i);\n   printf(\"j=%d\\n\", j);\n   printf(\"k=%d\\n\", k);\n\n   return 0;\n}\n"
+      "port_exit": 0,
+      "port_stdout": "a=0\nb=1\nc=2\ne=0\nf=1\ng=2\ni=0\nj=1\nk=2\n",
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -4271,35 +4242,33 @@
       "port_stdout": "",
       "detail": "SyntaxError: Expected 56, got 20 at line 1",
       "bug_class": "",
-      "transpiled": "int debug, nfailed = 0;\n\n \n\nint check ( char *s, int arg1, int shift)\n{\nint failed;\n\n  failed = arg1 != shift;\n  if (debug || failed)\n    printf (\"%s %d %d\\n\", s, arg1, shift);\n  nfailed = (nfailed) + (failed);\n}\n\nint c4_static_init()\n{\n\n}\n\nint main (int argc, char **argv)\n{\n  debug = argc > 1;\n  TEST4(1);\n  TEST4(-1);\n  printf (\"%d test(s) failed\\n\", nfailed);\n  return nfailed != 0;\n}\n"
+      "transpiled": "int debug, nfailed = 0;\n \n\nint check ( char *s, int arg1, int shift)\n{\nint failed;\n\nfailed = arg1 != shift;\nif (debug || failed)\nprintf (\"%s %d %d\\n\", s, arg1, shift);\nnfailed = (nfailed) + (failed);\n}\n\nint c4_static_init()\n{\n\n}\n\nint main (int argc, char **argv)\n{\nint __do_once0;\nint __do_once1;\nint __do_once10;\nint __do_once11;\nint __do_once12;\nint __do_once13;\nint __do_once14;\nint __do_once15;\nint __do_once16;\nint __do_once17;\nint __do_once18;\nint __do_once19;\nint __do_once2;\nint __do_once20;\nint __do_once21;\nint __do_once22;\nint __do_once23;\nint __do_once24;\nint __do_once25;\nint __do_once26;\nint __do_once27;\nint __do_once28;\nint __do_once29;\nint __do_once3;\nint __do_once30;\nint __do_once31;\nint __do_once32;\nint __do_once33;\nint __do_once34;\nint __do_once35;\nint __do_once36;\nint __do_once37;\nint __do_once38;\nint __do_once39;\nint __do_once4;\nint __do_once40;\nint __do_once41;\nint __do_once42;\nint __do_once43;\nint __do_once44;\nint __do_once45;\nint __do_once46;\nint __do_once47;\nint __do_once48;\nint __do_once49;\nint __do_once5;\nint __do_once50;\nint __do_once51;\nint __do_once52;\nint __do_once53;\nint __do_once54;\nint __do_once55;\nint __do_once56;\nint __do_once57;\nint __do_once58;\nint __do_once59;\nint __do_once6;\nint __do_once60;\nint __do_once61;\nint __do_once62;\nint __do_once63;\nint __do_once64;\nint __do_once65;\nint __do_once66;\nint __do_once67;\nint __do_once68;\nint __do_once69;\nint __do_once7;\nint __do_once70;\nint __do_once71;\nint __do_once72;\nint __do_once73;\nint __do_once74;\nint __do_once75;\nint __do_once76;\nint __do_once77;\nint __do_once78;\nint __do_once79;\nint __do_once8;\nint __do_once80;\nint __do_once81;\nint __do_once82;\nint __do_once83;\nint __do_once84;\nint __do_once85;\nint __do_once86;\nint __do_once87;\nint __do_once88;\nint __do_once89;\nint __do_once9;\n\n                                                                                          \ndebug = argc > 1;\n__do_once0 = 1;\nwhile (__do_once0 || (0)) { __do_once0 = 0;\n __do_once1 = 1;\nwhile (__do_once1 || (0)) { __do_once1 = 0;\n __do_once2 = 1;\nwhile (__do_once2 || (0)) { __do_once2 = 0;\n __do_once3 = 1;\nwhile (__do_once3 || (0)) { __do_once3 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once4 = 1;\nwhile (__do_once4 || (0)) { __do_once4 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once5 = 1;\nwhile (__do_once5 || (0)) { __do_once5 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once6 = 1;\nwhile (__do_once6 || (0)) { __do_once6 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int int) 1) < 0 || -((((int)((1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} __do_once7 = 1;\nwhile (__do_once7 || (0)) { __do_once7 = 0;\n __do_once8 = 1;\nwhile (__do_once8 || (0)) { __do_once8 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once9 = 1;\nwhile (__do_once9 || (0)) { __do_once9 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once10 = 1;\nwhile (__do_once10 || (0)) { __do_once10 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once11 = 1;\nwhile (__do_once11 || (0)) { __do_once11 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int int) 1) < 0 || -((((int)((1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} \n} __do_once12 = 1;\nwhile (__do_once12 || (0)) { __do_once12 = 0;\n __do_once13 = 1;\nwhile (__do_once13 || (0)) { __do_once13 = 0;\n __do_once14 = 1;\nwhile (__do_once14 || (0)) { __do_once14 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once15 = 1;\nwhile (__do_once15 || (0)) { __do_once15 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once16 = 1;\nwhile (__do_once16 || (0)) { __do_once16 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once17 = 1;\nwhile (__do_once17 || (0)) { __do_once17 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int int) 1) < 0 || -((((int)((1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} __do_once18 = 1;\nwhile (__do_once18 || (0)) { __do_once18 = 0;\n __do_once19 = 1;\nwhile (__do_once19 || (0)) { __do_once19 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once20 = 1;\nwhile (__do_once20 || (0)) { __do_once20 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once21 = 1;\nwhile (__do_once21 || (0)) { __do_once21 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once22 = 1;\nwhile (__do_once22 || (0)) { __do_once22 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int int) 1) < 0 || -((((int)((1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} \n} __do_once23 = 1;\nwhile (__do_once23 || (0)) { __do_once23 = 0;\n __do_once24 = 1;\nwhile (__do_once24 || (0)) { __do_once24 = 0;\n __do_once25 = 1;\nwhile (__do_once25 || (0)) { __do_once25 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once26 = 1;\nwhile (__do_once26 || (0)) { __do_once26 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once27 = 1;\nwhile (__do_once27 || (0)) { __do_once27 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once28 = 1;\nwhile (__do_once28 || (0)) { __do_once28 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int int) 1) < 0 || -((((int)((1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} __do_once29 = 1;\nwhile (__do_once29 || (0)) { __do_once29 = 0;\n __do_once30 = 1;\nwhile (__do_once30 || (0)) { __do_once30 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once31 = 1;\nwhile (__do_once31 || (0)) { __do_once31 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once32 = 1;\nwhile (__do_once32 || (0)) { __do_once32 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once33 = 1;\nwhile (__do_once33 || (0)) { __do_once33 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int int) 1) < 0 || -((((int)((1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} \n} __do_once34 = 1;\nwhile (__do_once34 || (0)) { __do_once34 = 0;\n __do_once35 = 1;\nwhile (__do_once35 || (0)) { __do_once35 = 0;\n __do_once36 = 1;\nwhile (__do_once36 || (0)) { __do_once36 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once37 = 1;\nwhile (__do_once37 || (0)) { __do_once37 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once38 = 1;\nwhile (__do_once38 || (0)) { __do_once38 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once39 = 1;\nwhile (__do_once39 || (0)) { __do_once39 = 0;\n check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int) 1) < 0 || -((((int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((1)))\", ((((int)((1)))) < 0 || -(((int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((1)))) << (int int) 1) < 0 || -((((int)((1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} __do_once40 = 1;\nwhile (__do_once40 || (0)) { __do_once40 = 0;\n __do_once41 = 1;\nwhile (__do_once41 || (0)) { __do_once41 = 0;\n check(\"((int int)((1)))\", ((((int int)((1)))) < 0 || -(((int int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((1)))) << (int) 1) < 0 || -((((int int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int int)((1)))\", ((((int int)((1)))) < 0 || -(((int int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((1)))) << (int) 1) < 0 || -((((int int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once42 = 1;\nwhile (__do_once42 || (0)) { __do_once42 = 0;\n check(\"((int int)((1)))\", ((((int int)((1)))) < 0 || -(((int int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((1)))) << (int) 1) < 0 || -((((int int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int int)((1)))\", ((((int int)((1)))) < 0 || -(((int int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((1)))) << (int) 1) < 0 || -((((int int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once43 = 1;\nwhile (__do_once43 || (0)) { __do_once43 = 0;\n check(\"((int int)((1)))\", ((((int int)((1)))) < 0 || -(((int int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((1)))) << (int) 1) < 0 || -((((int int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int int)((1)))\", ((((int int)((1)))) < 0 || -(((int int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((1)))) << (int) 1) < 0 || -((((int int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once44 = 1;\nwhile (__do_once44 || (0)) { __do_once44 = 0;\n check(\"((int int)((1)))\", ((((int int)((1)))) < 0 || -(((int int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((1)))) << (int) 1) < 0 || -((((int int)((1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int int)((1)))\", ((((int int)((1)))) < 0 || -(((int int)((1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((1)))) << (int int) 1) < 0 || -((((int int)((1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} \n} \n}\n__do_once45 = 1;\nwhile (__do_once45 || (0)) { __do_once45 = 0;\n __do_once46 = 1;\nwhile (__do_once46 || (0)) { __do_once46 = 0;\n __do_once47 = 1;\nwhile (__do_once47 || (0)) { __do_once47 = 0;\n __do_once48 = 1;\nwhile (__do_once48 || (0)) { __do_once48 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once49 = 1;\nwhile (__do_once49 || (0)) { __do_once49 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once50 = 1;\nwhile (__do_once50 || (0)) { __do_once50 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once51 = 1;\nwhile (__do_once51 || (0)) { __do_once51 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int int) 1) < 0 || -((((int)((-1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} __do_once52 = 1;\nwhile (__do_once52 || (0)) { __do_once52 = 0;\n __do_once53 = 1;\nwhile (__do_once53 || (0)) { __do_once53 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once54 = 1;\nwhile (__do_once54 || (0)) { __do_once54 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once55 = 1;\nwhile (__do_once55 || (0)) { __do_once55 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once56 = 1;\nwhile (__do_once56 || (0)) { __do_once56 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int int) 1) < 0 || -((((int)((-1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} \n} __do_once57 = 1;\nwhile (__do_once57 || (0)) { __do_once57 = 0;\n __do_once58 = 1;\nwhile (__do_once58 || (0)) { __do_once58 = 0;\n __do_once59 = 1;\nwhile (__do_once59 || (0)) { __do_once59 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once60 = 1;\nwhile (__do_once60 || (0)) { __do_once60 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once61 = 1;\nwhile (__do_once61 || (0)) { __do_once61 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once62 = 1;\nwhile (__do_once62 || (0)) { __do_once62 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int int) 1) < 0 || -((((int)((-1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} __do_once63 = 1;\nwhile (__do_once63 || (0)) { __do_once63 = 0;\n __do_once64 = 1;\nwhile (__do_once64 || (0)) { __do_once64 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once65 = 1;\nwhile (__do_once65 || (0)) { __do_once65 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once66 = 1;\nwhile (__do_once66 || (0)) { __do_once66 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once67 = 1;\nwhile (__do_once67 || (0)) { __do_once67 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int int) 1) < 0 || -((((int)((-1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} \n} __do_once68 = 1;\nwhile (__do_once68 || (0)) { __do_once68 = 0;\n __do_once69 = 1;\nwhile (__do_once69 || (0)) { __do_once69 = 0;\n __do_once70 = 1;\nwhile (__do_once70 || (0)) { __do_once70 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once71 = 1;\nwhile (__do_once71 || (0)) { __do_once71 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once72 = 1;\nwhile (__do_once72 || (0)) { __do_once72 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once73 = 1;\nwhile (__do_once73 || (0)) { __do_once73 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int int) 1) < 0 || -((((int)((-1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} __do_once74 = 1;\nwhile (__do_once74 || (0)) { __do_once74 = 0;\n __do_once75 = 1;\nwhile (__do_once75 || (0)) { __do_once75 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once76 = 1;\nwhile (__do_once76 || (0)) { __do_once76 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once77 = 1;\nwhile (__do_once77 || (0)) { __do_once77 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once78 = 1;\nwhile (__do_once78 || (0)) { __do_once78 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int int) 1) < 0 || -((((int)((-1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} \n} __do_once79 = 1;\nwhile (__do_once79 || (0)) { __do_once79 = 0;\n __do_once80 = 1;\nwhile (__do_once80 || (0)) { __do_once80 = 0;\n __do_once81 = 1;\nwhile (__do_once81 || (0)) { __do_once81 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once82 = 1;\nwhile (__do_once82 || (0)) { __do_once82 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once83 = 1;\nwhile (__do_once83 || (0)) { __do_once83 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once84 = 1;\nwhile (__do_once84 || (0)) { __do_once84 = 0;\n check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int) 1) < 0 || -((((int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int)((-1)))\", ((((int)((-1)))) < 0 || -(((int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int)((-1)))) << (int int) 1) < 0 || -((((int)((-1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} __do_once85 = 1;\nwhile (__do_once85 || (0)) { __do_once85 = 0;\n __do_once86 = 1;\nwhile (__do_once86 || (0)) { __do_once86 = 0;\n check(\"((int int)((-1)))\", ((((int int)((-1)))) < 0 || -(((int int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((-1)))) << (int) 1) < 0 || -((((int int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int int)((-1)))\", ((((int int)((-1)))) < 0 || -(((int int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((-1)))) << (int) 1) < 0 || -((((int int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once87 = 1;\nwhile (__do_once87 || (0)) { __do_once87 = 0;\n check(\"((int int)((-1)))\", ((((int int)((-1)))) < 0 || -(((int int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((-1)))) << (int) 1) < 0 || -((((int int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int int)((-1)))\", ((((int int)((-1)))) < 0 || -(((int int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((-1)))) << (int) 1) < 0 || -((((int int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once88 = 1;\nwhile (__do_once88 || (0)) { __do_once88 = 0;\n check(\"((int int)((-1)))\", ((((int int)((-1)))) < 0 || -(((int int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((-1)))) << (int) 1) < 0 || -((((int int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int int)((-1)))\", ((((int int)((-1)))) < 0 || -(((int int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((-1)))) << (int) 1) < 0 || -((((int int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} __do_once89 = 1;\nwhile (__do_once89 || (0)) { __do_once89 = 0;\n check(\"((int int)((-1)))\", ((((int int)((-1)))) < 0 || -(((int int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((-1)))) << (int) 1) < 0 || -((((int int)((-1)))) << (int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); check(\"((int int)((-1)))\", ((((int int)((-1)))) < 0 || -(((int int)((-1)))) < 0 ? -1 : 1) * (int) sizeof(int), (((((int int)((-1)))) << (int int) 1) < 0 || -((((int int)((-1)))) << (int int) 1) < 0 ? -1 : 1) * (int) sizeof(int)); \n} \n} \n} \n}\nprintf (\"%d test(s) failed\\n\", nfailed);\nreturn nfailed != 0;\n}\n"
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00201",
       "category": "storage",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "42\n",
-      "port_exit": null,
-      "port_stdout": "",
-      "detail": "SyntaxError: Undefined: A at line 11",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nint xy;\n\n  xy = 42;\n  printf(\"%d\\n\", CAT(A,B)(x));\n  return 0;\n}\n"
+      "port_exit": 0,
+      "port_stdout": "42\n",
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00202",
       "category": "compound",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "jim: 21, bob: 42\njim: 63\n",
-      "port_exit": null,
-      "port_stdout": "",
-      "detail": "SyntaxError: Expected 51, got 57 at line 12",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nint bob;\nint jim;\n\n    jim = 21;\n    bob = P(jim,) = ((jim,)) * (2);\n    printf(\"jim: %d, bob: %d\\n\", jim, bob);\n    jim = 60 Q(+,)3;\n    printf(\"jim: %d\\n\", jim);\n    return 0;\n}\n"
+      "port_exit": 0,
+      "port_stdout": "jim: 21, bob: 42\njim: 63\n",
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -4310,10 +4279,10 @@
       "gcc_exit": 0,
       "gcc_stdout": "long long constant test ok.\n",
       "port_exit": 0,
-      "port_stdout": "int constant test 0.\n",
-      "detail": "stdout gcc='long long constant test ok.\\n' port='int constant test 0.\\n'",
+      "port_stdout": "int constant test ok.\n",
+      "detail": "stdout gcc='long long constant test ok.\\n' port='int constant test ok.\\n'",
       "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nint res;\n\n    res = 0;\n\n    if (res < -2147483648) {\n        printf(\"Error: 0 < -2147483648\\n\");\n        return 1;\n    }\n    else\n    if (2147483647 < res) {\n        printf(\"Error: 2147483647 < 0\\n\");\n        return 2;\n    }\n    else\n        printf(\"int constant test 0.\\n\");\n    return 0;\n}\n"
+      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nint res;\n\n    res = 0;\n\nif (res < -2147483648) {\nprintf(\"Error: 0 < -2147483648\\n\");\nreturn 1;\n}\nelse\nif (2147483647 < res) {\nprintf(\"Error: 2147483647 < 0\\n\");\nreturn 2;\n}\nelse\nprintf(\"int constant test ok.\\n\");\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -4325,7 +4294,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpj4yjyadd/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // This program is designed to test some arm64-specific things, such as the\n      | ^\n/tmp/tmpj4yjyadd/case.c:1:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpmqnzz0_n/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // This program is designed to test some arm64-specific things, such as the\n      | ^\n/tmp/tmpmqnzz0_n/case.c:1:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4333,14 +4302,13 @@
       "oos": null,
       "name": "cts_00205",
       "category": "structarr",
-      "stage": "MISMATCH",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "cases[0].c[0]=73400320\ncases[0].c[1]=262144\ncases[0].c[2]=805567999\ncases[0].c[3]=-1\ncases[0].b=1\ncases[0].e=2\ncases[0].k=1\n\ncases[1].c[0]=879754751\ncases[1].c[1]=262144\ncases[1].c[2]=262144\ncases[1].c[3]=805567999\ncases[1].b=2\ncases[1].e=3\ncases[1].k=2\n\ncases[2].c[0]=879754751\ncases[2].c[1]=805567999\ncases[2].c[2]=262144\ncases[2].c[3]=805567999\ncases[2].b=1\ncases[2].e=3\ncases[2].k=2\n\ncases[3].c[0]=879754751\ncases[3].c[1]=805830143\ncases[3].c[2]=524288\ncases[3].c[3]=-1\ncases[3].b=1\ncases[3].e=2\ncases[3].k=1\n\ncases[4].c[0]=879754751\ncases[4].c[1]=805830143\ncases[4].c[2]=1048576\ncases[4].c[3]=805830143\ncases[4].b=1\ncases[4].e=3\ncases[4].k=1\n\ncases[5].c[0]=879754751\ncases[5].c[1]=805830143\ncases[5].c[2]=262144\ncases[5].c[3]=262144\ncases[5].b=1\ncases[5].e=3\ncases[5].k=1\n\ncases[6].c[0]=73400320\ncases[6].c[1]=807403007\ncases[6].c[2]=807403007\ncases[6].c[3]=-1\ncases[6].b=1\ncases[6].e=2\ncases[6].k=1\n\ncases[7].c[0]=839122431\ncases[7].c[1]=2097152\ncases[7].c[2]=807403007\ncases[7].c[3]=-1\ncases[7].b=0\ncases[7].e=2\ncases[7].k=1\n\ncases[8].c[0]=67108864\ncases[8].c[1]=807403007\ncases[8].c[2]=134217728\ncases[8].c[3]=-1\ncases[8].b=0\ncases[8].e=2\ncases[8].k=0\n\n",
       "port_exit": 0,
-      "port_stdout": "((cases + (0) * 7))[0]=73400320\n(cases + (0) * 7)[4]=0\n(cases + (0) * 7)[5]=0\n(cases + (0) * 7)[6]=0\n\n((cases + (1) * 7))[0]=262144\n(cases + (1) * 7)[4]=0\n(cases + (1) * 7)[5]=0\n(cases + (1) * 7)[6]=0\n\n((cases + (2) * 7))[0]=805567999\n(cases + (2) * 7)[4]=0\n(cases + (2) * 7)[5]=0\n(cases + (2) * 7)[6]=0\n\n((cases + (3) * 7))[0]=-1\n(cases + (3) * 7)[4]=0\n(cases + (3) * 7)[5]=0\n(cases + (3) * 7)[6]=0\n\n((cases + (4) * 7))[0]=1\n(cases + (4) * 7)[4]=0\n(cases + (4) * 7)[5]=0\n(cases + (4) * 7)[6]=0\n\n((cases + (5) * 7))[0]=2\n(cases + (5) * 7)[4]=0\n(cases + (5) * 7)[5]=0\n(cases + (5) * 7)[6]=0\n\n((cases + (6) * 7))[0]=1\n(cases + (6) * 7)[4]=0\n(cases + (6) * 7)[5]=0\n(cases + (6) * 7)[6]=0\n\n((cases + (7) * 7))[0]=879754751\n(cases + (7) * 7)[4]=0\n(cases + (7) * 7)[5]=0\n(cases + (7) * 7)[6]=0\n\n((cases + (8) * 7))[0]=262144\n(cases + (8) * 7)[4]=0\n(cases + (8) * 7)[5]=0\n(cases + (8) * 7)[6]=0\n\n((cases + (9) * 7))[0]=262144\n(cases + (9) * 7)[4]=0\n(cases + (9) * 7)[5]=0\n(cases + (9) * 7)[6]=0\n\n((cases + (10) * 7))[0]=805567999\n(cases + (10) * 7)[4]=0\n(cases + (10) * 7)[5]=0\n(cases + (10) * 7)[6]=0\n\n((cases + (11) * 7))[0]=2\n(cases + (11) * 7)[4]=0\n(cases + (11) * 7)[5]=0\n(cases + (11) * 7)[6]=0\n\n((cases + (12) * 7))[0]=3\n(cases + (12) * 7)[4]=0\n(cases + (12) * 7)[5]=0\n(cases + (12) * 7)[6]=0\n\n((cases + (13) * 7))[0]=2\n(cases + (13) * 7)[4]=0\n(cases + (13) * 7)[5]=0\n(cases + (13) * 7)[6]=0\n\n((cases + (14) * 7))[0]=879754751\n(cases + (14) * 7)[4]=0\n(cases + (14) * 7)[5]=0\n(cases + (14) * 7)[6]=0\n\n((cases + (15) * 7))[0]=805567999\n(cases + (15) * 7)[4]=0\n(cases + (15) * 7)[5]=0\n(cases + (15) * 7)[6]=0\n\n((cases + (16) * 7))[0]=262144\n(cases + (16) * 7)[4]=0\n(cases + (16) * 7)[5]=0\n(cases + (16) * 7)[6]=0\n\n((cases + (17) * 7))[0]=805567999\n(cases + (17) * 7)[4]=0\n(cases + (17) * 7)[5]=0\n(cases + (17) * 7)[6]=0\n\n((cases + (18) * 7))[0]=1\n(cases + (18) * 7)[4]=0\n(cases + (18) * 7)[5]=0\n(cases + (18) * 7)[6]=0\n\n((cases + (19) * 7))[0]=3\n(cases + (19) * 7)[4]=0\n(cases + (19) * 7)[5]=0\n(cases + (19) * 7)[6]=0\n\n((cases + (20) * 7))[0]=2\n(cases + (20) * 7)[4]=0\n(cases + (20) * 7)[5]=0\n(cases + (20) * 7)[6]=0\n\n((cases + (21) * 7))[0]=879754751\n(cases + (21) * 7)[4]=0\n(cases + (21) * 7)[5]=0\n(cases + (21) * 7)[6]=0\n\n((cases + (22) * 7))[0]=805830143\n(cases + (22) * 7)[4]=0\n(cases + (22) * 7)[5]=0\n(cases + (22) * 7)[6]=0\n\n((cases + (23) * 7))[0]=524288\n(cases + (23) * 7)[4]=0\n(cases + (23) * 7)[5]=0\n(cases + (23) * 7)[6]=0\n\n((cases + (24) * 7))[0]=-1\n(cases + (24) * 7)[4]=0\n(cases + (24) * 7)[5]=0\n(cases + (24) * 7)[6]=0\n\n((cases + (25) * 7))[0]=1\n(cases + (25) * 7)[4]=0\n(cases + (25) * 7)[5]=0\n(cases + (25) * 7)[6]=0\n\n((cases + (26) * 7))[0]=2\n(cases + (26) * 7)[4]=0\n(cases + (26) * 7)[5]=0\n(cases + (26) * 7)[6]=0\n\n((cases + (27) * 7))[0]=1\n(cases + (27) * 7)[4]=0\n(cases + (27) * 7)[5]=0\n(cases + (27) * 7)[6]=0\n\n((cases + (28) * 7))[0]=879754751\n(cases + (28) * 7)[4]=0\n(cases + (28) * 7)[5]=0\n(cases + (28) * 7)[6]=0\n\n((cases + (29) * 7))[0]=805830143\n(cases + (29) * 7)[4]=0\n(cases + (29) * 7)[5]=0\n(cases + (29) * 7)[6]=0\n\n((cases + (30) * 7))[0]=1048576\n(cases + (30) * 7)[4]=0\n(cases + (30) * 7)[5]=0\n(cases + (30) * 7)[6]=0\n\n((cases + (31) * 7))[0]=805830143\n(cases + (31) * 7)[4]=0\n(cases + (31) * 7)[5]=0\n(cases + (31) * 7)[6]=0\n\n((cases + (32) * 7))[0]=1\n(cases + (32) * 7)[4]=0\n(cases + (32) * 7)[5]=0\n(cases + (32) * 7)[6]=0\n\n((cases + (33) * 7))[0]=3\n(cases + (33) * 7)[4]=0\n(cases + (33) * 7)[5]=0\n(cases + (33) * 7)[6]=0\n\n((cases + (34) * 7))[0]=1\n(cases + (34) * 7)[4]=0\n(cases + (34) * 7)[5]=0\n(cases + (34) * 7)[6]=0\n\n((cases + (35) * 7))[0]=879754751\n(cases + (35) * 7)[4]=0\n(cases + (35) * 7)[5]=0\n(cases + (35) * 7)[6]=0\n\n((cases + (36) * 7))[0]=805830143\n(cases + (36) * 7)[4]=0\n(cases + (36) * 7)[5]=0\n(cases + (36) * 7)[6]=0\n\n((cases + (37) * 7))[0]=262144\n(cases + (37) * 7)[4]=0\n(cases + (37) * 7)[5]=0\n(cases + (37) * 7)[6]=0\n\n((cases + (38) * 7))[0]=262144\n(cases + (38) * 7)[4]=0\n(cases + (38) * 7)[5]=0\n(cases + (38) * 7)[6]=0\n\n((cases + (39) * 7))[0]=1\n(cases + (39) * 7)[4]=0\n(cases + (39) * 7)[5]=0\n(cases + (39) * 7)[6]=0\n\n((cases + (40) * 7))[0]=3\n(cases + (40) * 7)[4]=0\n(cases + (40) * 7)[5]=0\n(cases + (40) * 7)[6]=0\n\n((cases + (41) * 7))[0]=1\n(cases + (41) * 7)[4]=0\n(cases + (41) * 7)[5]=0\n(cases + (41) * 7)[6]=0\n\n((cases + (42) * 7))[0]=73400320\n(cases + (42) * 7)[4]=0\n(cases + (42) * 7)[5]=0\n(cases + (42) * 7)[6]=0\n\n((cases + (43) * 7))[0]=807403007\n(cases + (43) * 7)[4]=0\n(cases + (43) * 7)[5]=0\n(cases + (43) * 7)[6]=0\n\n((cases + (44) * 7))[0]=807403007\n(cases + (44) * 7)[4]=0\n(cases + (44) * 7)[5]=0\n(cases + (44) * 7)[6]=0\n\n((cases + (45) * 7))[0]=-1\n(cases + (45) * 7)[4]=0\n(cases + (45) * 7)[5]=0\n(cases + (45) * 7)[6]=0\n\n((cases + (46) * 7))[0]=1\n(cases + (46) * 7)[4]=0\n(cases + (46) * 7)[5]=0\n(cases + (46) * 7)[6]=0\n\n((cases + (47) * 7))[0]=2\n(cases + (47) * 7)[4]=0\n(cases + (47) * 7)[5]=0\n(cases + (47) * 7)[6]=0\n\n((cases + (48) * 7))[0]=1\n(cases + (48) * 7)[4]=0\n(cases + (48) * 7)[5]=0\n(cases + (48) * 7)[6]=0\n\n((cases + (49) * 7))[0]=839122431\n(cases + (49) * 7)[4]=0\n(cases + (49) * 7)[5]=0\n(cases + (49) * 7)[6]=0\n\n((cases + (50) * 7))[0]=2097152\n(cases + (50) * 7)[4]=0\n(cases + (50) * 7)[5]=0\n(cases + (50) * 7)[6]=0\n\n((cases + (51) * 7))[0]=807403007\n(cases + (51) * 7)[4]=0\n(cases + (51) * 7)[5]=0\n(cases + (51) * 7)[6]=0\n\n((cases + (52) * 7))[0]=-1\n(cases + (52) * 7)[4]=0\n(cases + (52) * 7)[5]=0\n(cases + (52) * 7)[6]=0\n\n((cases + (53) * 7))[0]=0\n(cases + (53) * 7)[4]=0\n(cases + (53) * 7)[5]=0\n(cases + (53) * 7)[6]=0\n\n((cases + (54) * 7))[0]=2\n(cases + (54) * 7)[4]=0\n(cases + (54) * 7)[5]=0\n(cases + (54) * 7)[6]=0\n\n((cases + (55) * 7))[0]=1\n(cases + (55) * 7)[4]=0\n(cases + (55) * 7)[5]=0\n(cases + (55) * 7)[6]=0\n\n((cases + (56) * 7))[0]=67108864\n(cases + (56) * 7)[4]=0\n(cases + (56) * 7)[5]=0\n(cases + (56) * 7)[6]=0\n\n((cases + (57) * 7))[0]=807403007\n(cases + (57) * 7)[4]=0\n(cases + (57) * 7)[5]=0\n(cases + (57) * 7)[6]=0\n\n((cases + (58) * 7))[0]=134217728\n(cases + (58) * 7)[4]=0\n(cases + (58) * 7)[5]=0\n(cases + (58) * 7)[6]=0\n\n((cases + (59) * 7))[0]=-1\n(cases + (59) * 7)[4]=0\n(cases + (59) * 7)[5]=0\n(cases + (59) * 7)[6]=0\n\n((cases + (60) * 7))[0]=0\n(cases + (60) * 7)[4]=0\n(cases + (60) * 7)[5]=0\n(cases + (60) * 7)[6]=0\n\n((cases + (61) * 7))[0]=2\n(cases + (61) * 7)[4]=0\n(cases + (61) * 7)[5]=0\n(cases + (61) * 7)[6]=0\n\n((cases + (62) * 7))[0]=0\n(cases + (62) * 7)[4]=0\n(cases + (62) * 7)[5]=0\n(cases + (62) * 7)[6]=0\n\n",
-      "detail": "stdout gcc='cases[0].c[0]=73400320\\ncases[0].c[1]=262144\\ncases[0].c[2]=805567999\\ncases[0].c[3]=-1\\ncases[0].b=1\\ncases[0].e=2\\ncases[0].k=1\\n\\ncases[1].c[0]=879754751\\ncases[1].c[1]=262144\\ncases[1].c[2]=262144\\ncases[1].c[3]=805567999\\ncases[1].b=2\\ncases[1].e=3\\ncases[1].k=2\\n\\ncases[2].c[0]=879754751\\ncases[2].c[1]=805567999\\ncases[2].c[2]=262144\\ncases[2].c[3]=805567999\\ncases[2].b=1\\ncases[2].e=3\\ncases[2].k=2\\n\\ncases[3].c[0]=879754751\\ncases[3].c[1]=805830143\\ncases[3].c[2]=524288\\ncases[3].c[3]=-1\\ncases[3].b=1\\ncases[3].e=2\\ncases[3].k=1\\n\\ncases[4].c[0]=879754751\\ncases[4].c[1]=805830143\\ncases[4].c[2]=1048576\\ncases[4].c[3]=805830143\\ncases[4].b=1\\ncases[4].e=3\\ncases[4].k=1\\n\\ncases[5].c[0]=879754751\\ncases[5].c[1]=805830143\\ncases[5].c[2]=262144\\ncases[5].c[3]=262144\\ncases[5].b=1\\ncases[5].e=3\\ncases[5].k=1\\n\\ncases[6].c[0]=73400320\\ncases[6].c[1]=807403007\\ncases[6].c[2]=807403007\\ncases[6].c[3]=-1\\ncases[6].b=1\\ncases[6].e=2\\ncases[6].k=1\\n\\ncases[7].c[0]=839122431\\ncases[7].c[1]=2097152\\ncases[7].c[2]=807403007\\ncases[7].c[3]=-1\\ncases[7].b=0\\ncases[7].e=2\\ncases[7].k=1\\n\\ncases[8].c[0]=67108864\\ncases[8].c[1]=807403007\\ncases[8].c[2]=134217728\\ncases[8].c[3]=-1\\ncases[8].b=0\\ncases[8].e=2\\ncases[8].k=0\\n\\n' port='((cases + (0) * 7))[0]=73400320\\n(cases + (0) * 7)[4]=0\\n(cases + (0) * 7)[5]=0\\n(cases + (0) * 7)[6]=0\\n\\n((cases + (1) * 7))[0]=262144\\n(cases + (1) * 7)[4]=0\\n(cases + (1) * 7)[5]=0\\n(cases + (1) * 7)[6]=0\\n\\n((cases + (2) * 7))[0]=805567999\\n(cases + (2) * 7)[4]=0\\n(cases + (2) * 7)[5]=0\\n(cases + (2) * 7)[6]=0\\n\\n((cases + (3) * 7))[0]=-1\\n(cases + (3) * 7)[4]=0\\n(cases + (3) * 7)[5]=0\\n(cases + (3) * 7)[6]=0\\n\\n((cases + (4) * 7))[0]=1\\n(cases + (4) * 7)[4]=0\\n(cases + (4) * 7)[5]=0\\n(cases + (4) * 7)[6]=0\\n\\n((cases + (5) * 7))[0]=2\\n(cases + (5) * 7)[4]=0\\n(cases + (5) * 7)[5]=0\\n(cases + (5) * 7)[6]=0\\n\\n((cases + (6) * 7))[0]=1\\n(cases + (6) * 7)[4]=0\\n(cases + (6) * 7)[5]=0\\n(cases + (6) * 7)[6]=0\\n\\n((cases + (7) * 7))[0]=879754751\\n(cases + (7) * 7)[4]=0\\n(cases + (7) * 7)[5]=0\\n(cases + (7) * 7)[6]=0\\n\\n((cases + (8) * 7))[0]=262144\\n(cases + (8) * 7)[4]=0\\n(cases + (8) * 7)[5]=0\\n(cases + (8) * 7)[6]=0\\n\\n((cases + (9) * 7))[0]=262144\\n(cases + (9) * 7)[4]=0\\n(cases + (9) * 7)[5]=0\\n(cases + (9) * 7)[6]=0\\n\\n((cases + (10) * 7))[0]=805567999\\n(cases + (10) * 7)[4]=0\\n(cases + (10) * 7)[5]=0\\n(cases + (10) * 7)[6]=0\\n\\n((cases + (11) * 7))[0]=2\\n(cases + (11) * 7)[4]=0\\n(cases + (11) * 7)[5]=0\\n(cases + (11) * 7)[6]=0\\n\\n((cases + (12) * 7))[0]=3\\n(cases + (12) * 7)[4]=0\\n(cases + (12) * 7)[5]=0\\n(cases + (12) * 7)[6]=0\\n\\n((cases + (13) * 7))[0]=2\\n(cases + (13) * 7)[4]=0\\n(cases + (13) * 7)[5]=0\\n(cases + (13) * 7)[6]=0\\n\\n((cases + (14) * 7))[0]=879754751\\n(cases + (14) * 7)[4]=0\\n(cases + (14) * 7)[5]=0\\n(cases + (14) * 7)[6]=0\\n\\n((cases + (15) * 7))[0]=805567999\\n(cases + (15) * 7)[4]=0\\n(cases + (15) * 7)[5]=0\\n(cases + (15) * 7)[6]=0\\n\\n((cases + (16) * 7))[0]=262144\\n(cases + (16) * 7)[4]=0\\n(cases + (16) * 7)[5]=0\\n(cases + (16) * 7)[6]=0\\n\\n((cases + (17) * 7))[0]=805567999\\n(cases + (17) * 7)[4]=0\\n(cases + (17) * 7)[5]=0\\n(cases + (17) * 7)[6]=0\\n\\n((cases + (18) * 7))[0]=1\\n(cases + (18) * 7)[4]=0\\n(cases + (18) * 7)[5]=0\\n(cases + (18) * 7)[6]=0\\n\\n((cases + (19) * 7))[0]=3\\n(cases + (19) * 7)[4]=0\\n(cases + (19) * 7)[5]=0\\n(cases + (19) * 7)[6]=0\\n\\n((cases + (20) * 7))[0]=2\\n(cases + (20) * 7)[4]=0\\n(cases + (20) * 7)[5]=0\\n(cases + (20) * 7)[6]=0\\n\\n((cases + (21) * 7))[0]=879754751\\n(cases + (21) * 7)[4]=0\\n(cases + (21) * 7)[5]=0\\n(cases + (21) * 7)[6]=0\\n\\n((cases + (22) * 7))[0]=805830143\\n(cases + (22) * 7)[4]=0\\n(cases + (22) * 7)[5]=0\\n(cases + (22) * 7)[6]=0\\n\\n((cases + (23) * 7))[0]=524288\\n(cases + (23) * 7)[4]=0\\n(cases + (23) * 7)[5]=0\\n(cases + (23) * 7)[6]=0\\n\\n((cases + (24) * 7))[0]=-1\\n(cases + (24) * 7)[4]=0\\n(cases + (24) * 7)[5]=0\\n(cases + (24) * 7)[6]=0\\n\\n((cases + (25) * 7))[0]=1\\n(cases + (25) * 7)[4]=0\\n(cases + (25) * 7)[5]=0\\n(cases + (25) * 7)[6]=0\\n\\n((cases + (26) * 7))[0]=2\\n(cases + (26) * 7)[4]=0\\n(cases + (26) * 7)[5]=0\\n(cases + (26) * 7)[6]=0\\n\\n((cases + (27) * 7))[0]=1\\n(cases + (27) * 7)[4]=0\\n(cases + (27) * 7)[5]=0\\n(cases + (27) * 7)[6]=0\\n\\n((cases + (28) * 7))[0]=879754751\\n(cases + (28) * 7)[4]=0\\n(cases + (28) * 7)[5]=0\\n(cases + (28) * 7)[6]=0\\n\\n((cases + (29) * 7))[0]=805830143\\n(cases + (29) * 7)[4]=0\\n(cases + (29) * 7)[5]=0\\n(cases + (29) * 7)[6]=0\\n\\n((cases + (30) * 7))[0]=1048576\\n(cases + (30) * 7)[4]=0\\n(cases + (30) * 7)[5]=0\\n(cases + (30) * 7)[6]=0\\n\\n((cases + (31) * 7))[0]=805830143\\n(cases + (31) * 7)[4]=0\\n(cases + (31) * 7)[5]=0\\n(cases + (31) * 7)[6]=0\\n\\n((cases + (32) * 7))[0]=1\\n(cases + (32) * 7)[4]=0\\n(cases + (32) * 7)[5]=0\\n(cases + (32) * 7)[6]=0\\n\\n((cases + (33) * 7))[0]=3\\n(cases + (33) * 7)[4]=0\\n(cases + (33) * 7)[5]=0\\n(cases + (33) * 7)[6]=0\\n\\n((cases + (34) * 7))[0]=1\\n(cases + (34) * 7)[4]=0\\n(cases + (34) * 7)[5]=0\\n(cases + (34) * 7)[6]=0\\n\\n((cases + (35) * 7))[0]=879754751\\n(cases + (35) * 7)[4]=0\\n(cases + (35) * 7)[5]=0\\n(cases + (35) * 7)[6]=0\\n\\n((cases + (36) * 7))[0]=805830143\\n(cases + (36) * 7)[4]=0\\n(cases + (36) * 7)[5]=0\\n(cases + (36) * 7)[6]=0\\n\\n((cases + (37) * 7))[0]=262144\\n(cases + (37) * 7)[4]=0\\n(cases + (37) * 7)[5]=0\\n(cases + (37) * 7)[6]=0\\n\\n((cases + (38) * 7))[0]=262144\\n(cases + (38) * 7)[4]=0\\n(cases + (38) * 7)[5]=0\\n(cases + (38) * 7)[6]=0\\n\\n((cases + (39) * 7))[0]=1\\n(cases + (39) * 7)[4]=0\\n(cases + (39) * 7)[5]=0\\n(cases + (39) * 7)[6]=0\\n\\n((cases + (40) * 7))[0]=3\\n(cases + (40) * 7)[4]=0\\n(cases + (40) * 7)[5]=0\\n(cases + (40) * 7)[6]=0\\n\\n((cases + (41) * 7))[0]=1\\n(cases + (41) * 7)[4]=0\\n(cases + (41) * 7)[5]=0\\n(cases + (41) * 7)[6]=0\\n\\n((cases + (42) * 7))[0]=73400320\\n(cases + (42) * 7)[4]=0\\n(cases + (42) * 7)[5]=0\\n(cases + (42) * 7)[6]=0\\n\\n((cases + (43) * 7))[0]=807403007\\n(cases + (43) * 7)[4]=0\\n(cases + (43) * 7)[5]=0\\n(cases + (43) * 7)[6]=0\\n\\n((cases + (44) * 7))[0]=807403007\\n(cases + (44) * 7)[4]=0\\n(cases + (44) * 7)[5]=0\\n(cases + (44) * 7)[6]=0\\n\\n((cases + (45) * 7))[0]=-1\\n(cases + (45) * 7)[4]=0\\n(cases + (45) * 7)[5]=0\\n(cases + (45) * 7)[6]=0\\n\\n((cases + (46) * 7))[0]=1\\n(cases + (46) * 7)[4]=0\\n(cases + (46) * 7)[5]=0\\n(cases + (46) * 7)[6]=0\\n\\n((cases + (47) * 7))[0]=2\\n(cases + (47) * 7)[4]=0\\n(cases + (47) * 7)[5]=0\\n(cases + (47) * 7)[6]=0\\n\\n((cases + (48) * 7))[0]=1\\n(cases + (48) * 7)[4]=0\\n(cases + (48) * 7)[5]=0\\n(cases + (48) * 7)[6]=0\\n\\n((cases + (49) * 7))[0]=839122431\\n(cases + (49) * 7)[4]=0\\n(cases + (49) * 7)[5]=0\\n(cases + (49) * 7)[6]=0\\n\\n((cases + (50) * 7))[0]=2097152\\n(cases + (50) * 7)[4]=0\\n(cases + (50) * 7)[5]=0\\n(cases + (50) * 7)[6]=0\\n\\n((cases + (51) * 7))[0]=807403007\\n(cases + (51) * 7)[4]=0\\n(cases + (51) * 7)[5]=0\\n(cases + (51) * 7)[6]=0\\n\\n((cases + (52) * 7))[0]=-1\\n(cases + (52) * 7)[4]=0\\n(cases + (52) * 7)[5]=0\\n(cases + (52) * 7)[6]=0\\n\\n((cases + (53) * 7))[0]=0\\n(cases + (53) * 7)[4]=0\\n(cases + (53) * 7)[5]=0\\n(cases + (53) * 7)[6]=0\\n\\n((cases + (54) * 7))[0]=2\\n(cases + (54) * 7)[4]=0\\n(cases + (54) * 7)[5]=0\\n(cases + (54) * 7)[6]=0\\n\\n((cases + (55) * 7))[0]=1\\n(cases + (55) * 7)[4]=0\\n(cases + (55) * 7)[5]=0\\n(cases + (55) * 7)[6]=0\\n\\n((cases + (56) * 7))[0]=67108864\\n(cases + (56) * 7)[4]=0\\n(cases + (56) * 7)[5]=0\\n(cases + (56) * 7)[6]=0\\n\\n((cases + (57) * 7))[0]=807403007\\n(cases + (57) * 7)[4]=0\\n(cases + (57) * 7)[5]=0\\n(cases + (57) * 7)[6]=0\\n\\n((cases + (58) * 7))[0]=134217728\\n(cases + (58) * 7)[4]=0\\n(cases + (58) * 7)[5]=0\\n(cases + (58) * 7)[6]=0\\n\\n((cases + (59) * 7))[0]=-1\\n(cases + (59) * 7)[4]=0\\n(cases + (59) * 7)[5]=0\\n(cases + (59) * 7)[6]=0\\n\\n((cases + (60) * 7))[0]=0\\n(cases + (60) * 7)[4]=0\\n(cases + (60) * 7)[5]=0\\n(cases + (60) * 7)[6]=0\\n\\n((cases + (61) * 7))[0]=2\\n(cases + (61) * 7)[4]=0\\n(cases + (61) * 7)[5]=0\\n(cases + (61) * 7)[6]=0\\n\\n((cases + (62) * 7))[0]=0\\n(cases + (62) * 7)[4]=0\\n(cases + (62) * 7)[5]=0\\n(cases + (62) * 7)[6]=0\\n\\n'",
-      "bug_class": "",
-      "transpiled": "int *cases;\n\n// --- generated static initializers ---\n\nint cases_init()\n{\n    cases = malloc((63) * (7) * sizeof(int));\n    cases[(0) * (7) + 0] = ((int)4194304 +(int)2097152 +(int)67108864);\n    cases[(1) * (7) + 0] = (int)262144;\n    cases[(2) * (7) + 0] = (((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(3) * (7) + 0] = -1;\n    cases[(4) * (7) + 0] = 1;\n    cases[(5) * (7) + 0] = 2;\n    cases[(6) * (7) + 0] = 1;\n    cases[(7) * (7) + 0] = ((int)+4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(8) * (7) + 0] = (int)262144;\n    cases[(9) * (7) + 0] = (int)262144;\n    cases[(10) * (7) + 0] = (((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(11) * (7) + 0] = 2;\n    cases[(12) * (7) + 0] = 3;\n    cases[(13) * (7) + 0] = 2;\n    cases[(14) * (7) + 0] = ((int)4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(15) * (7) + 0] = (((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(16) * (7) + 0] = (int)262144;\n    cases[(17) * (7) + 0] = (((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(18) * (7) + 0] = 1;\n    cases[(19) * (7) + 0] = 3;\n    cases[(20) * (7) + 0] = 2;\n    cases[(21) * (7) + 0] = ((int)4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(22) * (7) + 0] = (int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(23) * (7) + 0] = (int)524288;\n    cases[(24) * (7) + 0] = -1;\n    cases[(25) * (7) + 0] = 1;\n    cases[(26) * (7) + 0] = 2;\n    cases[(27) * (7) + 0] = 1;\n    cases[(28) * (7) + 0] = ((int)4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(29) * (7) + 0] = (int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(30) * (7) + 0] = (int)1048576;\n    cases[(31) * (7) + 0] = (int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(32) * (7) + 0] = 1;\n    cases[(33) * (7) + 0] = 3;\n    cases[(34) * (7) + 0] = 1;\n    cases[(35) * (7) + 0] = ((int)4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(36) * (7) + 0] = (int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(37) * (7) + 0] = (int)262144;\n    cases[(38) * (7) + 0] = (int)262144;\n    cases[(39) * (7) + 0] = 1;\n    cases[(40) * (7) + 0] = 3;\n    cases[(41) * (7) + 0] = 1;\n    cases[(42) * (7) + 0] = ((int)4194304 +(int)2097152 +(int)67108864);\n    cases[(43) * (7) + 0] = ((int)1048576 +(int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(44) * (7) + 0] = ((int)1048576 +(int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(45) * (7) + 0] = -1;\n    cases[(46) * (7) + 0] = 1;\n    cases[(47) * (7) + 0] = 2;\n    cases[(48) * (7) + 0] = 1;\n    cases[(49) * (7) + 0] = (int)33554432 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(50) * (7) + 0] = (int)2097152;\n    cases[(51) * (7) + 0] = ((int)1048576 +(int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(52) * (7) + 0] = -1;\n    cases[(53) * (7) + 0] = 0;\n    cases[(54) * (7) + 0] = 2;\n    cases[(55) * (7) + 0] = 1;\n    cases[(56) * (7) + 0] = (int)67108864;\n    cases[(57) * (7) + 0] = ((int)1048576 +(int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(58) * (7) + 0] = (int)134217728;\n    cases[(59) * (7) + 0] = -1;\n    cases[(60) * (7) + 0] = 0;\n    cases[(61) * (7) + 0] = 2;\n    cases[(62) * (7) + 0] = 0;\n}\n\nint c4_static_init()\n{\n    cases_init();\n}\n\nint main() {\nint i;\nint j; c4_static_init();\n\n    \n\n    j=0;\n    while (j < 63) {\n\n\ti=0;\n    while (i < sizeof(int)/sizeof(int)) {\nprintf(\"((cases + (%d) * 7))[%d]=%ld\\n\", j, i, ((cases + (j) * 7))[i]);\n    i++;\n    }\n\n\tprintf(\"(cases + (%d) * 7)[4]=%ld\\n\", j, (cases + (j) * 7)[4]);\n\tprintf(\"(cases + (%d) * 7)[5]=%ld\\n\", j, (cases + (j) * 7)[5]);\n\tprintf(\"(cases + (%d) * 7)[6]=%ld\\n\", j, (cases + (j) * 7)[6]);\n\tprintf(\"\\n\");\n    \n    j++;\n    }\n    return 0;\n}\n"
+      "port_stdout": "cases[0].c[0]=73400320\ncases[0].c[1]=262144\ncases[0].c[2]=805567999\ncases[0].c[3]=-1\ncases[0].b=1\ncases[0].e=2\ncases[0].k=1\n\ncases[1].c[0]=879754751\ncases[1].c[1]=262144\ncases[1].c[2]=262144\ncases[1].c[3]=805567999\ncases[1].b=2\ncases[1].e=3\ncases[1].k=2\n\ncases[2].c[0]=879754751\ncases[2].c[1]=805567999\ncases[2].c[2]=262144\ncases[2].c[3]=805567999\ncases[2].b=1\ncases[2].e=3\ncases[2].k=2\n\ncases[3].c[0]=879754751\ncases[3].c[1]=805830143\ncases[3].c[2]=524288\ncases[3].c[3]=-1\ncases[3].b=1\ncases[3].e=2\ncases[3].k=1\n\ncases[4].c[0]=879754751\ncases[4].c[1]=805830143\ncases[4].c[2]=1048576\ncases[4].c[3]=805830143\ncases[4].b=1\ncases[4].e=3\ncases[4].k=1\n\ncases[5].c[0]=879754751\ncases[5].c[1]=805830143\ncases[5].c[2]=262144\ncases[5].c[3]=262144\ncases[5].b=1\ncases[5].e=3\ncases[5].k=1\n\ncases[6].c[0]=73400320\ncases[6].c[1]=807403007\ncases[6].c[2]=807403007\ncases[6].c[3]=-1\ncases[6].b=1\ncases[6].e=2\ncases[6].k=1\n\ncases[7].c[0]=839122431\ncases[7].c[1]=2097152\ncases[7].c[2]=807403007\ncases[7].c[3]=-1\ncases[7].b=0\ncases[7].e=2\ncases[7].k=1\n\ncases[8].c[0]=67108864\ncases[8].c[1]=807403007\ncases[8].c[2]=134217728\ncases[8].c[3]=-1\ncases[8].b=0\ncases[8].e=2\ncases[8].k=0\n\n",
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -4350,11 +4318,11 @@
       "stage": "MISMATCH",
       "gcc_exit": 12,
       "gcc_stdout": "abort = 111\nabort = 222\nabort = 333\nabort = 222\nabort = 111\n",
-      "port_exit": 0,
-      "port_stdout": "",
-      "detail": "exit gcc=12 port=0; stdout gcc='abort = 111\\nabort = 222\\nabort = 333\\nabort = 222\\nabort = 111\\n' port=''",
+      "port_exit": 12,
+      "port_stdout": "abort = 333\nabort = 333\nabort = 333\nabort = 333\nabort = 333\n",
+      "detail": "stdout gcc='abort = 111\\nabort = 222\\nabort = 333\\nabort = 222\\nabort = 111\\n' port='abort = 333\\nabort = 333\\nabort = 333\\nabort = 333\\nabort = 333\\n'",
       "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\n    \n\n    \n\n    printf(\"\"333\" = %s\\n\", \"333\");\n\n    printf(\"\"333\" = %s\\n\", \"333\");\n\n    printf(\"\"333\" = %s\\n\", \"333\");\n\n    printf(\"\"333\" = %s\\n\", \"333\");\n\n    printf(\"\"333\" = %s\\n\", \"333\");\n}\n"
+      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main()\n{\nprintf(\"abort = %s\\n\", \"333\");\nprintf(\"abort = %s\\n\", \"333\");\nprintf(\"abort = %s\\n\", \"333\");\nprintf(\"abort = %s\\n\", \"333\");\nprintf(\"abort = %s\\n\", \"333\");\n}\n"
     },
     {
       "suite": "cts",
@@ -4379,7 +4347,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp6mt5z6qf/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp6mt5z6qf/case.c:21:4: error: C++ style comments are not allowed in ISO C90\n   21 |    //printf (\"tcc has %s %s\\n\", s, q.data);\n      |    ^\n/tmp/tmp6mt5z6qf/case.c:21:4: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmprz6itzw7/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmprz6itzw7/case.c:21:4: error: C++ style comments are not allowed in ISO C90\n   21 |    //printf (\"tcc has %s %s\\n\", s, q.data);\n      |    ^\n/tmp/tmprz6itzw7/case.c:21:4: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4394,7 +4362,7 @@
       "port_stdout": "",
       "detail": "SyntaxError: Expected 56, got 2 at line 4",
       "bug_class": "",
-      "transpiled": "int *e;\n int *e1;\nint  *e2;\nstruct S *s;\n struct S *s1;\nstruct S  *s2;\n\nint f1 (int (), int);\n\nint f2 (int (int x), int);\n\nint f3 (int (int), int);\n\nint f4 (int (*[4])(int), int);\n\nint f5 (int (int()), fptr1);\n\nint f8 (int ([4]), int);\n\nint f1 (fptr1 fp, int i)\n{\n  return (*fp)(i);\n}\n\nint f2 (fptr2 fp, int i)\n{\n  return (*fp)(i);\n}\n\nint f3 (fptr3 fp, int i)\n{\n  return (*fp)(i);\n}\n\nint f4 (fptr4 fp, int i)\n{\n  return (*fp[i])(i);\n}\n\nint f5 (fptr5 fp, fptr1 i)\n{\n  return fp(i);\n}\n\nint c4_static_init()\n{\n\n}\n\nint main () { return 0; }\n"
+      "transpiled": "int *e;\n int *e1;\nint  *e2;\nstruct S *s;\n struct S *s1;\nstruct S  *s2;\n\nint f1 (int (),int __p1);\n\nint f2 (int (int x),int __p1);\n\nint f3 (int (int),int __p1);\n\nint f4 (int (*[4])(int),int __p1);\n\nint f5 (int (int()), fptr1);\n\nint f8 (int ([4]),int __p1);\n\nint f1 (fptr1 fp, int i)\n{\nreturn (*fp)(i);\n}\n\nint f2 (fptr2 fp, int i)\n{\nreturn (*fp)(i);\n}\n\nint f3 (fptr3 fp, int i)\n{\nreturn (*fp)(i);\n}\n\nint f4 (fptr4 fp, int i)\n{\nreturn (*fp[i])(i);\n}\n\nint f5 (fptr5 fp, fptr1 i)\n{\nreturn fp(i);\n}\n\nint c4_static_init()\n{\n\n}\n\nint main () { return 0; }\n"
     },
     {
       "suite": "cts",
@@ -4408,7 +4376,7 @@
       "port_stdout": "",
       "detail": "SyntaxError: Expected 2, got 50 at line 1",
       "bug_class": "",
-      "transpiled": "int (__attribute__((__noinline__))) actual_function() {\n  return 42;\n}\n\nint __attribute__((stdcall)) foo ()\n{\n}\n\nint c4_static_init()\n{\n\n}\n\nint main()\n{\nint *function_pointer;\nint a;\nint b;\n\n    function_pointer = &actual_function;\n\n    a = (((__attribute__((__noinline__))) int(*) ()) function_pointer)();\n    printf(\"%i\\n\", a);\n\n    \n    b = ( (int((__attribute__((__noinline__))) *)())  function_pointer)();\n    printf(\"%i\\n\", b);\n\n    return 0;\n}\n"
+      "transpiled": "int __attribute__((__noinline__)) actual_function() {\nreturn 42;\n}\n\nint __attribute__((__noinline__)) actual_function() {\nreturn 42;\n}\n\nint c4_static_init()\n{\n\n}\n\nint main()\n{\nint *function_pointer;\nint a;\nint b;\n\nfunction_pointer = &actual_function;\na = ((__attribute__((__noinline__)) int(*) ()) function_pointer)();\nprintf(\"%i\\n\", a);\nb = ( (int(__attribute__((__noinline__)) *)()) function_pointer)();\nprintf(\"%i\\n\", b);\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -4420,7 +4388,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpnnn7ola9/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpnnn7ola9/case.c:11:1: error: C++ style comments are not allowed in ISO C90\n   11 | //    printf(\"n+1 = %d\\n\", 0xe+1);\n      | ^\n/tmp/tmpnnn7ola9/case.c:11:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpaug5pjlf/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpaug5pjlf/case.c:11:1: error: C++ style comments are not allowed in ISO C90\n   11 | //    printf(\"n+1 = %d\\n\", 0xe+1);\n      | ^\n/tmp/tmpaug5pjlf/case.c:11:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4435,49 +4403,46 @@
       "port_stdout": "",
       "detail": "SyntaxError: Unexpected token: 51 at line 9",
       "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\t()printf(\"KO no __*LP*__ defined.\\n\");\n}\n"
+      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n()printf(\"KO no __*LP*__ defined.\\n\");\n}\n"
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00213",
       "category": "switch",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "timeout=2\ntimeout=1\nboo\nyeah\ntwice\nonce\ntwice\nSEtwice\nSEonce\nSEtwice\ntwice2\nonce2\ntwice2\ntwice3\nonce3\ntwice3\ncaseok\ncaseok2\ng=1\ncheck 1\ng=2\ncheck 2\ng=3\n",
-      "port_exit": null,
-      "port_stdout": "",
-      "detail": "SyntaxError: Unexpected token: 52 at line 25",
-      "bug_class": "",
-      "transpiled": "int global;\n\n \n\n \n\n \n\nint kb_wait_1()\n{\nint __ent0; int __gx0; int __jmp0; int __st0; \nint __do_once0; int timeout; int i;\n\n__st0 = 0;\n__gx0 = 0;\nwhile (__gx0 == 0) {\n__ent0 = __st0;\nif (__ent0 == 0) { __jmp0 = 0;\nif (__jmp0 == 0) { timeout = 2; }\nif (__jmp0 == 0) { __do_once0 = 1; }\nif (__jmp0 == 0) { while ((__do_once0 || (timeout)) && __jmp0 == 0) {\nif (__jmp0 == 0) { __do_once0 = 0; }\nif (__jmp0 == 0) { (1 ? \n       printf(\"timeout=%ld\\n\", timeout) :\n       ({\n\ti = 1;\n\twhile (1)\n\t  while (i--)\n\t    {{ __st0 = 1; __jmp0 = 1; }\n}\n{ __st0 = 2; __jmp0 = 1; }\n{ __st0 = 1; __jmp0 = 1; }\n}\n{ __st0 = 3; __jmp0 = 1; }\n{ __st0 = 1; __jmp0 = 1; } }\n} }\nif (__jmp0 == 0) { {\nif (__jmp0 == 0) { __st0 = 4; }\nif (__jmp0 == 0) { __jmp0 = 1; }\n \n} }\n\n if (__jmp0 == 0) { __st0 = 1; } }\nif (__ent0 == 1) { __jmp0 = 0;\nif (__jmp0 == 0) { printf(\"error\\n\"); }\n \n\n if (__jmp0 == 0) { __st0 = 2; } }\nif (__ent0 == 2) { __jmp0 = 0;\nif (__jmp0 == 0) { ; }\nif (__jmp0 == 0) { {\nif (__jmp0 == 0) { __st0 = 1; }\nif (__jmp0 == 0) { __jmp0 = 1; }\n \n} }\n\n\t\n\n if (__jmp0 == 0) { __st0 = 3; } }\nif (__ent0 == 3) { __jmp0 = 0;\nif (__jmp0 == 0) { ; }\nif (__jmp0 == 0) { )\n      );\n      timeout--; }\n if (__jmp0 == 0) { __st0 = 4; } }\nif (__ent0 == 4) { __jmp0 = 0;\nif (__jmp0 == 0) { ; }\n\n if (__jmp0 == 0) { __st0 = 5; } }\nif (__st0 >= 5) { __gx0 = 1; }\n}\n\n}\n\nint foo(int i)\n{\n  global = (global) + (i);\n  printf (\"g=%d\\n\", global);\n}\n\nint check()\n{\n  printf (\"check %d\\n\", global);\n  return 1;\n}\n\nint dowhile()\n{\nint __brk0; int __cont0; \nint __do_once0;\n\n \n  __do_once0 = 1;\n__brk0 = 0;\nwhile ((__do_once0 || (check())) && __brk0 == 0) {\n__cont0 = 0;\nif (__brk0 == 0 && __cont0 == 0) { __do_once0 = 0; }\nif (__brk0 == 0 && __cont0 == 0) { foo(1); }\nif (__brk0 == 0 && __cont0 == 0) { if (global == 1) {if (__brk0 == 0 && __cont0 == 0) { __cont0 = 1; }\n\n      } else if (global == 2) {if (__brk0 == 0 && __cont0 == 0) { __cont0 = 1; }\n\n      } }\nif (__brk0 == 0 && __cont0 == 0) { __brk0 = 1; }\n\n  \n\n}\n}\n\nint c4_static_init()\n{\n\n}\n\nint main ()\n{\nint __ent1; int __gx1; int __jmp1; int __st1; \nint __do_once0; int i; int j;\n\n__st1 = 0;\n__gx1 = 0;\nwhile (__gx1 == 0) {\n__ent1 = __st1;\nif (__ent1 == 0) { __jmp1 = 0;\nif (__jmp1 == 0) { i = 1; }\nif (__jmp1 == 0) { kb_wait_1(); }\nif (__jmp1 == 0) { if (0) {\nif (__jmp1 == 0) { {\nif (__jmp1 == 0) { __st1 = 1; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\n\n} }\nif (__jmp1 == 0) { {\nif (__jmp1 == 0) { __st1 = 2; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\n\n if (__jmp1 == 0) { __st1 = 1; } }\nif (__ent1 == 1) { __jmp1 = 0;\nif (__jmp1 == 0) { printf (\"yeah\\n\"); }\n\n  \n\n if (__jmp1 == 0) { __st1 = 2; } }\nif (__ent1 == 2) { __jmp1 = 0;\nif (__jmp1 == 0) { ; }\nif (__jmp1 == 0) { else {\n      printf (\"boo\\n\");\n  }\n  if (i--)\n    { __st1 = 1; __jmp1 = 1; }\n\n  \n  i = 1; }\nif (__jmp1 == 0) { if (0) {\nif (__jmp1 == 0) { while ((i--) && __jmp1 == 0) {\nif (__jmp1 == 0) { printf (\"once\\n\"); }\nif (__jmp1 == 0) { {\nif (__jmp1 == 0) { __st1 = 3; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\n\n} }\n\n  \n} }\nif (__jmp1 == 0) { {\nif (__jmp1 == 0) { __st1 = 4; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\n\n if (__jmp1 == 0) { __st1 = 3; } }\nif (__ent1 == 3) { __jmp1 = 0;\nif (__jmp1 == 0) { printf (\"twice\\n\"); }\n\n      \n\n if (__jmp1 == 0) { __st1 = 4; } }\nif (__ent1 == 4) { __jmp1 = 0;\nif (__jmp1 == 0) { ; }\nif (__jmp1 == 0) { if (i >= 0) {\nif (__jmp1 == 0) { __st1 = 3; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\nif (__jmp1 == 0) { i = ({\n      j = 1;\n      if (0) {\n\t  while (j--) {\n\t      printf (\"SEonce\\n\");\n{ __st1 = 5; __jmp1 = 1; }\n}\n      }\n{ __st1 = 6; __jmp1 = 1; }\n{ __st1 = 5; __jmp1 = 1; }\n}\n{ __st1 = 7; __jmp1 = 1; } }\n if (__jmp1 == 0) { __st1 = 5; } }\nif (__ent1 == 5) { __jmp1 = 0;\nif (__jmp1 == 0) { printf (\"SEtwice\\n\"); }\n\n\t  \n\n if (__jmp1 == 0) { __st1 = 6; } }\nif (__ent1 == 6) { __jmp1 = 0;\nif (__jmp1 == 0) { ; }\nif (__jmp1 == 0) { if (j >= 0) {\nif (__jmp1 == 0) { __st1 = 5; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\nif (__jmp1 == 0) { j; }\n \n\n if (__jmp1 == 0) { __st1 = 7; } }\nif (__ent1 == 7) { __jmp1 = 0;\nif (__jmp1 == 0) { ; }\nif (__jmp1 == 0) { );\n\n  \n  i = 1;\n  if (0) {\n      i = 1; }\nif (__jmp1 == 0) { while ((i--) && __jmp1 == 0) {\nif (__jmp1 == 0) { printf (\"once2\\n\"); }\nif (__jmp1 == 0) { {\nif (__jmp1 == 0) { __st1 = 8; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\n\n} }\nif (__jmp1 == 0) { }\n{ __st1 = 9; }\nif (__jmp1 == 0) { __jmp1 = 1; }\nif (__jmp1 == 0) { } }\n if (__jmp1 == 0) { __st1 = 8; } }\nif (__ent1 == 8) { __jmp1 = 0;\nif (__jmp1 == 0) { printf (\"twice2\\n\"); }\n\n      \n\n    \n\n if (__jmp1 == 0) { __st1 = 9; } }\nif (__ent1 == 9) { __jmp1 = 0;\nif (__jmp1 == 0) { ; }\nif (__jmp1 == 0) { if (i > 0) {\nif (__jmp1 == 0) { __st1 = 8; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\nif (__jmp1 == 0) { i = 1; }\nif (__jmp1 == 0) { if (0) {\nif (__jmp1 == 0) { __do_once0 = 1; }\nif (__jmp1 == 0) { while ((__do_once0 || (i--)) && __jmp1 == 0) {\nif (__jmp1 == 0) { __do_once0 = 0; }\nif (__jmp1 == 0) { printf (\"once3\\n\"); }\nif (__jmp1 == 0) { {\nif (__jmp1 == 0) { __st1 = 10; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\n\n} }\n\n  \n} }\nif (__jmp1 == 0) { {\nif (__jmp1 == 0) { __st1 = 11; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\n\n if (__jmp1 == 0) { __st1 = 10; } }\nif (__ent1 == 10) { __jmp1 = 0;\nif (__jmp1 == 0) { printf (\"twice3\\n\"); }\n\n      \n\n if (__jmp1 == 0) { __st1 = 11; } }\nif (__ent1 == 11) { __jmp1 = 0;\nif (__jmp1 == 0) { ; }\nif (__jmp1 == 0) { if (i > 0) {\nif (__jmp1 == 0) { __st1 = 10; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\nif (__jmp1 == 0) { i = 41; }\nif (__jmp1 == 0) { if (1) {\nif (__jmp1 == 0) { if (0) {\nif (__jmp1 == 0) { printf (\"error\\n\"); }\nif (__jmp1 == 0) { case 42:\n\t  printf (\"error2\\n\"); }\nif (__jmp1 == 0) { case 41:\n\t  printf (\"caseok\\n\"); }\n\n      \n} }\n\n  \n\n} }\nif (__jmp1 == 0) { i = 41; }\nif (__jmp1 == 0) { if (1) {\nif (__jmp1 == 0) { if (0) {\nif (__jmp1 == 0) { printf (\"error3\\n\"); }\nif (__jmp1 == 0) { default:\n\t  printf (\"caseok2\\n\"); }\nif (__jmp1 == 0) { case 42:\n\t  printf (\"error4\\n\"); }\n\n      \n} }\n\n  \n\n} }\nif (__jmp1 == 0) { dowhile(); }\nif (__jmp1 == 0) { return 0; }\n\n if (__jmp1 == 0) { __st1 = 12; } }\nif (__st1 >= 12) { __gx1 = 1; }\n}\n\n}\n"
+      "port_exit": 0,
+      "port_stdout": "timeout=2\ntimeout=1\nboo\nyeah\ntwice\nonce\ntwice\nSEtwice\nSEonce\nSEtwice\ntwice2\nonce2\ntwice2\ntwice3\nonce3\ntwice3\ncaseok\ncaseok2\ng=1\ncheck 1\ng=2\ncheck 2\ng=3\n",
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00214",
       "category": "varargs",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "okay\nokay\n",
-      "port_exit": null,
-      "port_stdout": "",
-      "detail": "SyntaxError: Unexpected token: 52 at line 50",
-      "bug_class": "",
-      "transpiled": "int _brk_start;\nint _brk_end;\n\n \n\nint * extend_brk(int size, int align)\n{\nint __do_once0;\nint __do_once1;\nint mask;\nint *ret;\n\n  \n    mask = align - 1;\n    ret = 0;\n\n     __do_once0 = 1;\nwhile (__do_once0 || (0)) { __do_once0 = 0;\n\n\t if (__builtin_expect((((((_brk_start == 0)) == 0)) == 0), 0))\n\t   __do_once1 = 1;\nwhile (__do_once1 || (0)) { __do_once1 = 0;\n\n\t       printf(\"wrong1\\n\");\n\t   \n}\n     \n}\n     _brk_end = (_brk_end + mask) & (0 - (mask) - 1);\n     ret = (int *)_brk_end;\n     _brk_end = (_brk_end) + (size);\n\n     return ret;\n}\n\nint get_args (int a, int b)\n{\n  if (a != 1)\n    printf(\"wrong2\\n\");\n  else\n    printf(\"okay\\n\");\n}\n\nint bla()\n{\nint __ret;\nint x;\n\n  __ret = 42;\n  ({\n    if (__builtin_expect((((((0)) == 0)) == 0), 0)) {\n      if (__builtin_expect(((((__ret) == 0)) == 0), 0))\n        printf(\"wrong3\\n\");\n      x = (((((__ret)) == 0)) == 0);\n    }\n    __ret;\n  });\n  get_args(((((__ret) == 0)) == 0), sizeof(int));\n}\n\n_Bool chk(int addr, int limit, int size)\n{\n  _Bool ret;\n  \n  if (0)\n    ret = 0 != ((((((addr > limit - size)) == 0)) == 0));\n}\n\nint c4_static_init()\n{\n\n}\n\nint main()\n{\nint *r;\n\n  \n  _brk_start = 1024;\n  _brk_end = 1024;\n  r = extend_brk (4096, 16);\n  if (((r) == 0))\n    printf(\"wrong4\\n\");\n  else\n    printf(\"okay\\n\");\n  bla();\n  return 0;\n}\n"
+      "port_exit": 0,
+      "port_stdout": "okay\nokay\n",
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00215",
       "category": "switch",
-      "stage": "MISMATCH",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "begin\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=1\nend\n",
       "port_exit": 0,
-      "port_stdout": "begin\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=2\ntimeout=2\ntimeout=1\nend\n",
-      "detail": "stdout gcc='begin\\ntimeout=2\\ntimeout=1\\ntimeout=2\\ntimeout=1\\ntimeout=2\\ntimeout=1\\ntimeout=2\\ntimeout=1\\ntimeout=2\\ntimeout=1\\ntimeout=2\\ntimeout=1\\nend\\n' port='begin\\ntimeout=2\\ntimeout=1\\ntimeout=2\\ntimeout=1\\ntimeout=2\\ntimeout=1\\ntimeout=2\\ntimeout=2\\ntimeout=2\\ntimeout=1\\nend\\n'",
-      "bug_class": "",
-      "transpiled": "int kb_wait_1()\n{\nint __do_once0;\nint timeout;\n\n \n    timeout = 2;\n    __do_once0 = 1;\nwhile (__do_once0 || (timeout)) { __do_once0 = 0;\n\n        if (1) printf(\"timeout=%ld\\n\", timeout);\n        else\n        {\n            while (1)\n                printf(\"error\\n\");\n        }\n        timeout--;\n    \n}\n}\n\nint kb_wait_2()\n{\nint __do_once0;\nint timeout;\n\n \n    timeout = 2;\n    __do_once0 = 1;\nwhile (__do_once0 || (timeout)) { __do_once0 = 0;\n\n        if (1) printf(\"timeout=%ld\\n\", timeout);\n        else\n        {\n            \n    while (1) {\nprintf(\"error\\n\");\n\n    }\n        }\n        timeout--;\n    \n}\n}\n\nint kb_wait_2_1()\n{\nint __do_once0;\nint __do_once1;\nint timeout;\n\n  \n    timeout = 2;\n    __do_once0 = 1;\nwhile (__do_once0 || (timeout)) { __do_once0 = 0;\n\n        if (1) printf(\"timeout=%ld\\n\", timeout);\n        else\n        {\n            __do_once1 = 1;\nwhile (__do_once1 || (1)) { __do_once1 = 0;\n\n                printf(\"error\\n\");\n            \n}\n        }\n        timeout--;\n    \n}\n}\n\nint kb_wait_2_2()\n{\nint __ent0; int __gx0; int __jmp0; int __st0; \nint __do_once0; int timeout;\n\n__st0 = 0;\n__gx0 = 0;\nwhile (__gx0 == 0) {\n__ent0 = __st0;\nif (__ent0 == 0) { __jmp0 = 0;\nif (__jmp0 == 0) { timeout = 2; }\nif (__jmp0 == 0) { __do_once0 = 1; }\nif (__jmp0 == 0) { while ((__do_once0 || (timeout)) && __jmp0 == 0) {\nif (__jmp0 == 0) { __do_once0 = 0; }\nif (__jmp0 == 0) { if (1) printf(\"timeout=%ld\\n\", timeout);\nelse {\nif (__jmp0 == 0) { {\nif (__jmp0 == 0) { __st0 = 1; }\nif (__jmp0 == 0) { __jmp0 = 1; }\n \n} }\n\n} }\nif (__jmp0 == 0) { {\nif (__jmp0 == 0) { __st0 = 2; }\nif (__jmp0 == 0) { __jmp0 = 1; }\n \n} }\nif (__jmp0 == 0) { {\nif (__jmp0 == 0) { __st0 = 1; }\nif (__jmp0 == 0) { __jmp0 = 1; }\n \n} }\n\n} }\nif (__jmp0 == 0) { {\nif (__jmp0 == 0) { __st0 = 3; }\nif (__jmp0 == 0) { __jmp0 = 1; }\n \n} }\n\n if (__jmp0 == 0) { __st0 = 1; } }\nif (__ent0 == 1) { __jmp0 = 0;\nif (__jmp0 == 0) { printf(\"error\\n\"); }\nif (__jmp0 == 0) { {\nif (__jmp0 == 0) { __st0 = 1; }\nif (__jmp0 == 0) { __jmp0 = 1; }\n \n} }\n\n        \n\n if (__jmp0 == 0) { __st0 = 2; } }\nif (__ent0 == 2) { __jmp0 = 0;\nif (__jmp0 == 0) { ; }\nif (__jmp0 == 0) { timeout--; }\n\n    \n\n if (__jmp0 == 0) { __st0 = 3; } }\nif (__ent0 == 3) { __jmp0 = 0;\nif (__jmp0 == 0) { ; }\n\n if (__jmp0 == 0) { __st0 = 4; } }\nif (__st0 >= 4) { __gx0 = 1; }\n}\n\n}\n\nint kb_wait_3()\n{\nint __ent1; int __gx1; int __jmp1; int __st1; \nint __do_once0; int timeout; int i;\n\n__st1 = 0;\n__gx1 = 0;\nwhile (__gx1 == 0) {\n__ent1 = __st1;\nif (__ent1 == 0) { __jmp1 = 0;\nif (__jmp1 == 0) { timeout = 2; }\nif (__jmp1 == 0) { __do_once0 = 1; }\nif (__jmp1 == 0) { while ((__do_once0 || (timeout)) && __jmp1 == 0) {\nif (__jmp1 == 0) { __do_once0 = 0; }\nif (__jmp1 == 0) { if (1) printf(\"timeout=%ld\\n\", timeout);\nelse {\nif (__jmp1 == 0) { i = 1; }\nif (__jmp1 == 0) { {\nif (__jmp1 == 0) { __st1 = 1; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\nif (__jmp1 == 0) { i = i + 2; }\nif (__jmp1 == 0) { {\nif (__jmp1 == 0) { __st1 = 1; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\n\n} }\nif (__jmp1 == 0) { {\nif (__jmp1 == 0) { __st1 = 2; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\nif (__jmp1 == 0) { {\nif (__jmp1 == 0) { __st1 = 1; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\n\n} }\nif (__jmp1 == 0) { {\nif (__jmp1 == 0) { __st1 = 3; }\nif (__jmp1 == 0) { __jmp1 = 1; }\n \n} }\n\n if (__jmp1 == 0) { __st1 = 1; } }\nif (__ent1 == 1) { __jmp1 = 0;\nif (__jmp1 == 0) { i = i + 3; }\n\n        \n\n if (__jmp1 == 0) { __st1 = 2; } }\nif (__ent1 == 2) { __jmp1 = 0;\nif (__jmp1 == 0) { ; }\nif (__jmp1 == 0) { timeout--; }\n\n    \n\n if (__jmp1 == 0) { __st1 = 3; } }\nif (__ent1 == 3) { __jmp1 = 0;\nif (__jmp1 == 0) { ; }\n\n if (__jmp1 == 0) { __st1 = 4; } }\nif (__st1 >= 4) { __gx1 = 1; }\n}\n\n}\n\nint kb_wait_4()\n{\nint __do_once0;\nint timeout;\n\n \n    timeout = 2;\n    __do_once0 = 1;\nwhile (__do_once0 || (timeout)) { __do_once0 = 0;\n\n\tif (1) printf(\"timeout=%ld\\n\", timeout);\n        else\n        {\n            \nif ((timeout) == (2)) {\n\n                    printf(\"timeout is 2\");\n                    \n}\nelse if ((timeout) == (1)) {\n\n                    printf(\"timeout is 1\");\n                    \n}\nelse {\n\n                    printf(\"timeout is 0?\");\n                    \n            \n}\n;\n            \n        }\n        timeout--;\n    \n}\n}\n\nint c4_static_init()\n{\n\n}\n\nint main()\n{\n    printf(\"begin\\n\");\n    kb_wait_1();\n    kb_wait_2();\n    kb_wait_2_1();\n    kb_wait_2_2();\n    kb_wait_3();\n    kb_wait_4();\n    printf(\"end\\n\");\n    return 0;\n}\n"
+      "port_stdout": "begin\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=1\ntimeout=2\ntimeout=1\nend\n",
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -4489,7 +4454,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpamqipk0i/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpamqipk0i/case.c:277:3: error: C++ style comments are not allowed in ISO C90\n  277 |   //printf(\"q: %s\\n\", q);\n      |   ^\n/tmp/tmpamqipk0i/case.c:277:3: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp8aruubc9/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp8aruubc9/case.c:277:3: error: C++ style comments are not allowed in ISO C90\n  277 |   //printf(\"q: %s\\n\", q);\n      |   ^\n/tmp/tmp8aruubc9/case.c:277:3: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4504,21 +4469,20 @@
       "port_stdout": "",
       "detail": "SyntaxError: Expected 2, got 57 at line 1",
       "bug_class": "",
-      "transpiled": "int printf( char *, ...);\nchar t[] = \"012345678\";\n\nint c4_static_init()\n{\n\n}\n\nint main()\n{\nchar *data;\nint r;\nint a;\nint b;\n\n    data = t;\n    r = 4;\n    a = 5;\n    b = 12;\n\n    *(int*)(data + r) = ((data + r)) + (a - b);\n\n    printf(\"data = \\\"%s\\\"\\n\", data);\n    return 0;\n}\n"
+      "transpiled": "int printf( char *, ...);\nchar *t;\n\nint c4_static_init()\n{\n    t = \"012345678\";\n}\n\nint main()\n{\nchar *data;\nint r;\nint a;\nint b; c4_static_init();\n\ndata = t;\nr = 4;\na = 5;\nb = 12;\n*(int*)(data + r) = ((data + r)) + (a - b);\nprintf(\"data = \\\"%s\\\"\\n\", data);\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00218",
       "category": "union",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "union tree_node\n{\nint *common;\n };\n\nint blah(){return 0;}\n\nint convert_like_real (tree convs)\n{\n  \nif ((((int e) (convs)->common[2])) == (152)) {\n \n      return blah();\n}\nelse {\n\n      \n    \n}\n;\n   printf(\"int t-fields broken\\n\");\n}\n\nint c4_static_init()\n{\n    common = malloc((3) * sizeof(int));\n}\n\nint main()\n{ c4_static_init();\n  union tree_node convs;\n\n  convs.common[2] = 152;\n  convert_like_real (&convs);\n  return 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -4532,7 +4496,7 @@
       "port_stdout": "",
       "detail": "SyntaxError: Unexpected token: 11 at line 40",
       "bug_class": "",
-      "transpiled": "int a;\n\nint a_f()\n{\n\treturn 20;\n}\n\nint b_f()\n{\n\treturn 10;\n}\n\nint foo(int i)\n{\n  return i;\n}\n\nint c4_static_init()\n{\n    a = 0;\n}\n\nint main()\n{\nint i;\nint l;\nint *titi;\nint *ptr;\nchar *ti;\nint i2; c4_static_init();\n\n\ti = 0;\n\tl = 2;\n\n\t \n\t \n\t\n    titi = malloc((1) * sizeof(int));\n\n\ti = _Generic(a, int: a_f,  int: b_f)();\n\tprintf(\"%d\\n\", i);\n\ti = _Generic(a, int: a_f() / 2,  int: b_f() / 2);\n\tprintf(\"%d\\n\", i);\n\ti = _Generic(ptr, int *:1, int * :2, default:20);\n\tprintf(\"%d\\n\", i);\n\ti = (_Generic((a),  char *: 1, default: 8, int: 123););\n\tprintf(\"%d\\n\", i);\n\ti = _Generic(titi, struct a:1, struct b:2, default:20);\n\tprintf(\"%d\\n\", i);\n\ti = _Generic(i2, char: 1, int : 0);\n\tprintf(\"%d\\n\", i);\n\ti = _Generic(a, char:1, int[4]:2, default:5);\n\tprintf(\"%d\\n\", i);\n\ti = _Generic(17, int :1, int **:2);\n\tprintf(\"%d\\n\", i);\n\ti = _Generic(17, int :1, int :2, int : 3);\n\tprintf(\"%d\\n\", i);\n\ti = _Generic(\"17, io\", char *: 3,  char *: 1);\n\tprintf(\"%d\\n\", i);\n\ti = _Generic(ti,  int *:1,  char *:4, char *:3,\n\t\t      int *:2);\n\tprintf(\"%d\\n\", i);\n\tprintf(\"%s\\n\", _Generic(i + 2, int: \"int\", int: \"int\",\n\t\t\t\tint: \"int\"));\n\ti = _Generic(l, int: 1, int: 2);\n\tprintf(\"%d\\n\", i);\n\ti = _Generic(foo, fptr: 3, int: 4);\n\tprintf(\"%d\\n\", i);\n\treturn 0;\n}\n"
+      "transpiled": "int a;\n\nint a_f()\n{\nreturn 20;\n}\n\nint b_f()\n{\nreturn 10;\n}\n\nint foo(int i)\n{\nreturn i;\n}\n\nint c4_static_init()\n{\n    a = 0;\n}\n\nint main()\n{\nint i;\nint l;\nint *titi;\nint *ptr;\nchar *ti;\nint i2; c4_static_init();\n\ni = 0;\nl = 2;\n\n \n \n\n    titi = malloc((1) * sizeof(int));\n\ni = _Generic(a, int: a_f,  int: b_f)();\nprintf(\"%d\\n\", i);\ni = _Generic(a, int: a_f() / 2,  int: b_f() / 2);\nprintf(\"%d\\n\", i);\ni = _Generic(ptr, int *:1, int * :2, default:20);\nprintf(\"%d\\n\", i);\ni = _Generic(a,  char *: 1, default: 8, int: 123);;\nprintf(\"%d\\n\", i);\ni = _Generic(titi, struct a:1, struct b:2, default:20);\nprintf(\"%d\\n\", i);\ni = _Generic(i2, char: 1, int : 0);\nprintf(\"%d\\n\", i);\ni = _Generic(a, char:1, int[4]:2, default:5);\nprintf(\"%d\\n\", i);\ni = _Generic(17, int :1, int **:2);\nprintf(\"%d\\n\", i);\ni = _Generic(17, int :1, int :2, int : 3);\nprintf(\"%d\\n\", i);\ni = _Generic(\"17, io\", char *: 3,  char *: 1);\nprintf(\"%d\\n\", i);\ni = _Generic(ti,  int *:1,  char *:4, char *:3,\n int *:2);\nprintf(\"%d\\n\", i);\nprintf(\"%s\\n\", _Generic(i + 2, int: \"int\", int: \"int\",\nint: \"int\"));\ni = _Generic(l, int: 1, int: 2);\nprintf(\"%d\\n\", i);\ni = _Generic(foo, fptr: 3, int: 4);\nprintf(\"%d\\n\", i);\nreturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -4544,7 +4508,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmponqc2hf7/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // this file contains BMP chars encoded in UTF-8\n      | ^\n/tmp/tmponqc2hf7/case.c:1:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp7vrdwg8i/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // this file contains BMP chars encoded in UTF-8\n      | ^\n/tmp/tmp7vrdwg8i/case.c:1:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     }
   ]
