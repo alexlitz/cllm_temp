@@ -185,8 +185,13 @@ def run_port(src: str, stdin: bytes, timeout_cycles: int = 40_000_000) -> Result
     # -- stage 1: transpile (with a per-file struct/union contract) --
     try:
         contract = build_file_contract(src)
-        tsrc = T.transpile(src, contract=contract) if contract is not None \
-            else T.transpile(src)
+        # preprocess=True: run the transpiler's OPT-IN full C90 macro
+        # preprocessor (object + function-like macros with #/##, + stdint/EOF/
+        # NULL prelude).  DEFAULT-OFF for the DOOM build (byte-identity), ON here
+        # because the c-testsuite cases are self-contained programs that expect
+        # real cpp semantics.
+        tsrc = T.transpile(src, contract=contract, preprocess=True) \
+            if contract is not None else T.transpile(src, preprocess=True)
     except Exception as e:
         r.stage = "transpile_error"
         r.detail = f"{type(e).__name__}: {e}"
