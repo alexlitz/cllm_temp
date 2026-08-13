@@ -198,13 +198,16 @@ def run_port(src: str, stdin: bytes, timeout_cycles: int = 40_000_000) -> Result
         # NULL prelude).  DEFAULT-OFF for the DOOM build (byte-identity), ON here
         # because the c-testsuite cases are self-contained programs that expect
         # real cpp semantics.
-        # emul_i32=False: THIS is the genuinely-32-bit machine (compiler32 WORD=4
-        # + c4vm32u STRIDE=4, 32-bit two's-complement ALU).  It matches the
-        # `gcc -m32` width/sizeof/wraparound observable NATIVELY, so it does NOT
-        # use the emul_i32 software-emulation lowering that the 64-bit machine
-        # needs.  This is the whole point: no emulation, principled 32-bit.
-        tsrc = T.transpile(src, contract=contract, preprocess=True, emul_i32=False) \
-            if contract is not None else T.transpile(src, preprocess=True, emul_i32=False)
+        # native32=True (emul_i32=False): THIS is the genuinely-32-bit machine
+        # (compiler32 WORD=4 + c4vm32u STRIDE=4, 32-bit two's-complement ALU).
+        # Width/sizeof/wraparound match `gcc -m32` NATIVELY -- no software
+        # emulation.  native32 lowers the ONE thing the c4 ISA lacks natively --
+        # UNSIGNED compare/div/mod/shr -- into 32-bit-native __u* helpers (sign-bit
+        # flip / logical-shift; NO 64-bit masking).  This is the principled route:
+        # native word width + minimal unsigned-op helpers, vs the 64-bit machine's
+        # full emul_i32 emulation of 32-bit-in-64-bit.
+        tsrc = T.transpile(src, contract=contract, preprocess=True, native32=True) \
+            if contract is not None else T.transpile(src, preprocess=True, native32=True)
     except Exception as e:
         r.stage = "transpile_error"
         r.detail = f"{type(e).__name__}: {e}"
