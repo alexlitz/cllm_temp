@@ -196,8 +196,17 @@ def run_port(src: str, stdin: bytes, timeout_cycles: int = 40_000_000) -> Result
         # preprocess=True this is DEFAULT-OFF in the transpiler (Doom's flagless
         # build is byte-identical); the conformance harness enables it because the
         # oracle is `gcc -m32`.  Verified to keep the 337-corpus at 281/281.
-        tsrc = T.transpile(src, contract=contract, preprocess=True, emul_i32=True) \
-            if contract is not None else T.transpile(src, preprocess=True, emul_i32=True)
+        # fnptr=True: OPT-IN generic function-pointer lowering (address-taken
+        # functions -> integer FN_IDs + arity-typed `__call_by_idN` dispatchers,
+        # the GENERIC form of Doom's own fnptr_link.py FN_ID scheme).  DEFAULT-OFF
+        # in the transpiler -- Doom keeps its hand-authored fnptr path, so the
+        # byte-exact title-frame build (golden 174ece66, doom_linked sha
+        # 4a9e837c) is untouched; the conformance harness enables it to close the
+        # c-torture fnptr cluster.
+        tsrc = T.transpile(src, contract=contract, preprocess=True,
+                           emul_i32=True, fnptr=True) \
+            if contract is not None else T.transpile(src, preprocess=True,
+                                                     emul_i32=True, fnptr=True)
     except Exception as e:
         r.stage = "transpile_error"
         r.detail = f"{type(e).__name__}: {e}"
