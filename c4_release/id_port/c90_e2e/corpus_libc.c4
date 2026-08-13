@@ -329,6 +329,12 @@ int memmove(int dst, int src, int n) {
     return dst;
 }
 
+// mempcpy: like memcpy but returns dst + n (a pointer PAST the last byte copied).
+int mempcpy(int dst, int src, int n) {
+    memcpy(dst, src, n);
+    return dst + n;
+}
+
 // ---- <stdio.h> ---------------------------------------------------------------
 
 // puts: write a string + newline to stdout, return a non-negative value.
