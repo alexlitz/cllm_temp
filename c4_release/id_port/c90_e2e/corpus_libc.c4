@@ -102,6 +102,64 @@ int labs(int x) {
     return x;
 }
 
+// <ctype.h> classifiers (C locale).  Each takes an int (a char value or EOF) and
+// returns non-zero if the character is in the class.  Provided here because the
+// c-testsuite cases call them and memory.c4 does not.
+int isdigit(int c) {
+    if (c >= 48 && c <= 57) { return 1; }
+    return 0;
+}
+int isupper(int c) {
+    if (c >= 65 && c <= 90) { return 1; }
+    return 0;
+}
+int islower(int c) {
+    if (c >= 97 && c <= 122) { return 1; }
+    return 0;
+}
+int isalpha(int c) {
+    if (isupper(c) || islower(c)) { return 1; }
+    return 0;
+}
+int isalnum(int c) {
+    if (isalpha(c) || isdigit(c)) { return 1; }
+    return 0;
+}
+int isxdigit(int c) {
+    if (isdigit(c)) { return 1; }
+    if (c >= 65 && c <= 70) { return 1; }
+    if (c >= 97 && c <= 102) { return 1; }
+    return 0;
+}
+int isspace(int c) {
+    if (c == 32 || (c >= 9 && c <= 13)) { return 1; }
+    return 0;
+}
+int iscntrl(int c) {
+    if ((c >= 0 && c <= 31) || c == 127) { return 1; }
+    return 0;
+}
+int isprint(int c) {
+    if (c >= 32 && c <= 126) { return 1; }
+    return 0;
+}
+int isgraph(int c) {
+    if (c >= 33 && c <= 126) { return 1; }
+    return 0;
+}
+int ispunct(int c) {
+    if (isgraph(c) && !isalnum(c)) { return 1; }
+    return 0;
+}
+int toupper(int c) {
+    if (islower(c)) { return c - 32; }
+    return c;
+}
+int tolower(int c) {
+    if (isupper(c)) { return c + 32; }
+    return c;
+}
+
 // atoi: parse a leading optional-sign decimal integer.
 int atoi(char *s) {
     int sign;
