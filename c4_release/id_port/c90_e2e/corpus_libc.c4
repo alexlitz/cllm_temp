@@ -329,6 +329,22 @@ int memmove(int dst, int src, int n) {
     return dst;
 }
 
+// mempcpy: like memcpy but returns dst + n (a pointer PAST the last byte copied).
+int mempcpy(int dst, int src, int n) {
+    memcpy(dst, src, n);
+    return dst + n;
+}
+
+// link_error: a c-torture sentinel meant to be UNREACHABLE (the test expects the
+// compiler to prove the guarding condition is dead and never emit a call).  The
+// c4 pipeline does not perform that elimination, so provide a definition: if
+// control ever DOES reach it the test's own reachability assumption is violated,
+// so abort (the same observable as an unresolved link error would represent).
+int link_error() {
+    abort();
+    return 0;
+}
+
 // ---- <stdio.h> ---------------------------------------------------------------
 
 // puts: write a string + newline to stdout, return a non-negative value.
