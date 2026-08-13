@@ -1,0 +1,1261 @@
+"""
+C4 Compiler (32-BIT / 4-byte-word variant) - Compiles C source to VM bytecode.
+
+This is the 4-byte-address-grid sibling of ``src/compiler.py``.  It is a copy of
+that (golden, 8-byte-word, byte-exact-Doom) compiler with EXACTLY ONE thing
+changed: the machine WORD size is 4 instead of 8.  That makes ``sizeof(int)==4``
+(matching the gcc ``-m32`` oracle) and lays out every int/pointer on a 4-byte
+grid, so the addressing is self-consistently 32-bit -- no emulation.
+
+The golden ``src/compiler.py`` and the byte-exact 8-byte Doom path it bakes are
+UNTOUCHED; this file is a pure parallel addition consumed only by the 32-bit VM
+``id_port/c4vm32u.py``.
+
+The single word-size knob is ``WORD = 4`` below; every place the original hard-
+coded ``8`` for the int/pointer size, this uses ``WORD``:
+  * ``sizeof(int)`` / ``sizeof(ptr)``      (char stays 1),
+  * array/pointer element scaling for ``a[i]``, ``p+i``, ``p-i``, ``p++``, etc.
+    (char* stays stride 1),
+  * global address stride and per-global storage reservation,
+  * data alignment padding of string literals,
+  * the ENT/LEA/ADJ frame math: param slots, local slots, and the frame base
+    (2 words = 8 bytes now, vs 16 before).
+
+The packed ``op | imm<<8`` instruction encoding and the PC/instruction stride
+are unchanged (orthogonal to the data word size).
+"""
+
+from enum import IntEnum
+from typing import List, Dict, Tuple, Optional
+from pathlib import Path
+
+# The one knob that makes this the 32-bit machine: a machine word (int / pointer)
+# is 4 bytes.  char is always 1.  ``FRAME_BASE`` = the 2 saved words (old bp +
+# return pc) at the top of a call frame = 2 * WORD.
+WORD = 4
+FRAME_BASE = 2 * WORD          # was 16 (2 * 8); now 8 (2 * 4)
+
+# Import constants for instruction addressing
+try:
+    from neural_vm.constants import INSTR_WIDTH, PC_OFFSET
+except ImportError:
+    # Fallback if neural_vm not available
+    INSTR_WIDTH = 8
+    PC_OFFSET = 2
+
+
+class Op(IntEnum):
+    """C4 opcodes."""
+    LEA = 0    # load effective address
+    IMM = 1    # load immediate
+    JMP = 2    # jump
+    JSR = 3    # jump subroutine
+    BZ = 4     # branch if zero
+    BNZ = 5    # branch if not zero
+    ENT = 6    # enter subroutine
+    ADJ = 7    # adjust stack
+    LEV = 8    # leave subroutine
+    LI = 9     # load int
+    LC = 10    # load char
+    SI = 11    # store int
+    SC = 12    # store char
+    PSH = 13   # push
+
+    OR = 14
+    XOR = 15
+    AND = 16
+    EQ = 17
+    NE = 18
+    LT = 19
+    GT = 20
+    LE = 21
+    GE = 22
+    SHL = 23
+    SHR = 24
+    ADD = 25
+    SUB = 26
+    MUL = 27
+    DIV = 28
+    MOD = 29
+
+    OPEN = 30
+    READ = 31
+    CLOS = 32
+    PRTF = 33
+    MALC = 34
+    FREE = 35
+    MSET = 36
+    MCMP = 37
+    EXIT = 38
+    NOP = 39
+
+    # I/O opcodes
+    GETCHAR = 64
+    PUTCHAR = 65
+    PRINTF2 = 66
+
+
+# Type constants
+CHAR = 0
+INT = 1
+PTR = 2
+STDLIB_SYMBOLS = ("malloc", "free", "memset", "memcmp")
+
+
+class TokenType(IntEnum):
+    NUM = 1
+    ID = 2
+    CHAR_LIT = 3
+    STRING = 4
+    KW_CHAR = 10
+    KW_INT = 11
+    KW_ENUM = 12
+    KW_IF = 13
+    KW_ELSE = 14
+    KW_WHILE = 15
+    KW_RETURN = 16
+    KW_SIZEOF = 17
+    ASSIGN = 20
+    COND = 21
+    LOR = 22
+    LAND = 23
+    OR = 24
+    XOR = 25
+    AND = 26
+    EQ = 27
+    NE = 28
+    LT = 29
+    GT = 30
+    LE = 31
+    GE = 32
+    SHL = 33
+    SHR = 34
+    ADD = 35
+    SUB = 36
+    MUL = 37
+    DIV = 38
+    MOD = 39
+    INC = 40
+    DEC = 41
+    BRAK = 42
+    NOT = 43     # unary logical not '!'  (prefix only)
+    BNOT = 44    # unary bitwise not '~'  (prefix only)
+    LPAREN = 50
+    RPAREN = 51
+    LBRACE = 52
+    RBRACE = 53
+    LBRACKET = 54
+    RBRACKET = 55
+    SEMI = 56
+    COMMA = 57
+    COLON = 58
+    EOF = 99
+
+
+class Lexer:
+    def __init__(self, source: str):
+        self.source = source
+        self.pos = 0
+        self.line = 1
+        self.keywords = {
+            'char': TokenType.KW_CHAR,
+            'int': TokenType.KW_INT,
+            'enum': TokenType.KW_ENUM,
+            'if': TokenType.KW_IF,
+            'else': TokenType.KW_ELSE,
+            'while': TokenType.KW_WHILE,
+            'return': TokenType.KW_RETURN,
+            'sizeof': TokenType.KW_SIZEOF,
+        }
+        self.data: List[int] = []
+        self.data_offset = 0
+
+    def peek(self, offset=0) -> str:
+        pos = self.pos + offset
+        return self.source[pos] if pos < len(self.source) else ''
+
+    def advance(self) -> str:
+        ch = self.peek()
+        self.pos += 1
+        if ch == '\n':
+            self.line += 1
+        return ch
+
+    def skip_whitespace(self):
+        while self.peek() and self.peek() in ' \t\n\r':
+            self.advance()
+        if self.peek() == '/' and self.peek(1) == '/':
+            while self.peek() and self.peek() != '\n':
+                self.advance()
+            self.skip_whitespace()
+        if self.peek() == '/' and self.peek(1) == '*':
+            self.advance()
+            self.advance()
+            while self.peek() and not (self.peek() == '*' and self.peek(1) == '/'):
+                self.advance()
+            if self.peek():
+                self.advance()
+                self.advance()
+            self.skip_whitespace()
+        if self.peek() == '#':
+            while self.peek() and self.peek() != '\n':
+                self.advance()
+            self.skip_whitespace()
+
+    def next_token(self) -> Tuple[TokenType, any, int]:
+        self.skip_whitespace()
+
+        if not self.peek():
+            return (TokenType.EOF, None, self.line)
+
+        ch = self.peek()
+        line = self.line
+
+        if ch.isdigit():
+            num = 0
+            if ch == '0' and self.peek(1) in 'xX':
+                self.advance()
+                self.advance()
+                while self.peek() in '0123456789abcdefABCDEF':
+                    d = self.advance()
+                    num = num * 16 + int(d, 16)
+            elif ch == '0':
+                while self.peek() in '01234567':
+                    num = num * 8 + int(self.advance())
+            else:
+                while self.peek().isdigit():
+                    num = num * 10 + int(self.advance())
+            return (TokenType.NUM, num, line)
+
+        if ch.isalpha() or ch == '_':
+            ident = ''
+            while self.peek().isalnum() or self.peek() == '_':
+                ident += self.advance()
+            if ident in self.keywords:
+                return (self.keywords[ident], ident, line)
+            return (TokenType.ID, ident, line)
+
+        if ch == "'":
+            self.advance()                 # opening '
+            c = self.advance()             # first char inside the quotes
+            if c == '\\':                  # escape: test the FIRST inner char (was mis-testing the next)
+                esc = self.advance()
+                val = {'n': 10, 't': 9, '\\': 92, "'": 39, '0': 0}.get(esc, ord(esc))
+            else:
+                val = ord(c)
+            self.advance()                 # closing '
+            return (TokenType.NUM, val, line)
+
+        if ch == '"':
+            self.advance()
+            str_start = self.data_offset
+            while self.peek() and self.peek() != '"':
+                c = self.advance()
+                if c == '\\':
+                    esc = self.advance()
+                    c = {'n': '\n', 't': '\t', '\\': '\\', '"': '"', '0': '\0'}.get(esc, esc)
+                self.data.append(ord(c))
+                self.data_offset += 1
+            self.advance()
+            self.data.append(0)
+            self.data_offset += 1
+            while self.data_offset % WORD != 0:
+                self.data.append(0)
+                self.data_offset += 1
+            return (TokenType.STRING, str_start, line)
+
+        self.advance()
+
+        if ch == '+':
+            if self.peek() == '+':
+                self.advance()
+                return (TokenType.INC, '++', line)
+            return (TokenType.ADD, '+', line)
+        if ch == '-':
+            if self.peek() == '-':
+                self.advance()
+                return (TokenType.DEC, '--', line)
+            return (TokenType.SUB, '-', line)
+        if ch == '*':
+            return (TokenType.MUL, '*', line)
+        if ch == '/':
+            return (TokenType.DIV, '/', line)
+        if ch == '%':
+            return (TokenType.MOD, '%', line)
+
+        if ch == '=':
+            if self.peek() == '=':
+                self.advance()
+                return (TokenType.EQ, '==', line)
+            return (TokenType.ASSIGN, '=', line)
+        if ch == '!':
+            if self.peek() == '=':
+                self.advance()
+                return (TokenType.NE, '!=', line)
+            return (TokenType.NOT, '!', line)
+        if ch == '<':
+            if self.peek() == '=':
+                self.advance()
+                return (TokenType.LE, '<=', line)
+            if self.peek() == '<':
+                self.advance()
+                return (TokenType.SHL, '<<', line)
+            return (TokenType.LT, '<', line)
+        if ch == '>':
+            if self.peek() == '=':
+                self.advance()
+                return (TokenType.GE, '>=', line)
+            if self.peek() == '>':
+                self.advance()
+                return (TokenType.SHR, '>>', line)
+            return (TokenType.GT, '>', line)
+
+        if ch == '&':
+            if self.peek() == '&':
+                self.advance()
+                return (TokenType.LAND, '&&', line)
+            return (TokenType.AND, '&', line)
+        if ch == '|':
+            if self.peek() == '|':
+                self.advance()
+                return (TokenType.LOR, '||', line)
+            return (TokenType.OR, '|', line)
+        if ch == '^':
+            return (TokenType.XOR, '^', line)
+        if ch == '~':
+            return (TokenType.BNOT, '~', line)
+
+        if ch == '?':
+            return (TokenType.COND, '?', line)
+        if ch == ':':
+            return (TokenType.COLON, ':', line)
+
+        if ch == '(':
+            return (TokenType.LPAREN, '(', line)
+        if ch == ')':
+            return (TokenType.RPAREN, ')', line)
+        if ch == '{':
+            return (TokenType.LBRACE, '{', line)
+        if ch == '}':
+            return (TokenType.RBRACE, '}', line)
+        if ch == '[':
+            return (TokenType.BRAK, '[', line)
+        if ch == ']':
+            return (TokenType.RBRACKET, ']', line)
+        if ch == ';':
+            return (TokenType.SEMI, ';', line)
+        if ch == ',':
+            return (TokenType.COMMA, ',', line)
+
+        return (TokenType.NUM, 0, line)
+
+
+class Symbol:
+    def __init__(self, name: str, sclass: str, stype: int, value: int):
+        self.name = name
+        self.sclass = sclass
+        self.stype = stype
+        self.value = value
+        self.h_class = None
+        self.h_type = None
+        self.h_value = None
+
+
+class Compiler32:
+    def __init__(self):
+        self.code: List[int] = []
+        self.symbols: Dict[str, Symbol] = {}
+        self.local_offset = 0
+        self.current_type = INT
+        self.expr_type = INT
+        self.data_base = 0x10000
+        self.data: List[int] = []
+        self.call_patches: List[Tuple[int, str]] = []
+        self.current_function: Optional[str] = None
+        self.defined_functions: List[str] = []
+        self.function_defined: Dict[str, bool] = {}
+        self.function_param_counts: Dict[str, int] = {}
+        self.function_local_offsets: Dict[str, int] = {}
+
+        # Syscalls (removed malloc/free/memset/memcmp - now in stdlib)
+        syscalls = ['open', 'read', 'close', 'printf', 'exit']
+        for i, name in enumerate(syscalls):
+            self.symbols[name] = Symbol(name, 'Sys', INT, Op.OPEN + i)
+
+        # I/O syscalls
+        self.symbols['getchar'] = Symbol('getchar', 'Sys', INT, Op.GETCHAR)
+        self.symbols['putchar'] = Symbol('putchar', 'Sys', INT, Op.PUTCHAR)
+
+    def emit(self, op: Op, imm: int = 0):
+        self.code.append(int(op) + (imm << 8))
+
+    def current_addr(self) -> int:
+        """Get the current static instruction index.
+
+        The neural control-flow path materializes branch and call immediates
+        as instruction indices. The runners still accept PC-style targets for
+        compatibility, but compiler output should use the neural-native form.
+        """
+        return len(self.code)
+
+    def patch(self, addr: int, target: int):
+        """Patch instruction at addr with new target."""
+        idx = addr
+        op = self.code[idx] & 0xFF
+        self.code[idx] = op + (target << 8)
+
+    def compile(self, source: str) -> Tuple[List[int], List[int]]:
+        lexer = Lexer(source)
+        self.tokens = []
+        while True:
+            tok = lexer.next_token()
+            self.tokens.append(tok)
+            if tok[0] == TokenType.EOF:
+                break
+
+        self.data = lexer.data
+        self.pos = 0
+
+        self.emit(Op.JSR, 0)
+        self.emit(Op.EXIT, 0)
+        # Keep user entrypoints off instruction index 2. Strict neural JSR
+        # already passes the smoke target shape with a dead slot between the
+        # caller EXIT and callee, and this padding is unreachable after return.
+        self.emit(Op.NOP, 0)
+
+        self.parse_program()
+
+        if 'main' in self.symbols:
+            main_addr = self.symbols['main'].value
+            self.code[0] = int(Op.JSR) + (main_addr << 8)
+        self._patch_pending_calls()
+        self._strip_leaf_main_startup()
+
+        return self.code, self.data
+
+    def _patch_pending_calls(self):
+        for idx, name in self.call_patches:
+            sym = self.symbols.get(name)
+            if (
+                sym is None
+                or sym.sclass != 'Fun'
+                or not self.function_defined.get(name, False)
+            ):
+                raise SyntaxError(f"Undefined function: {name}")
+            self.code[idx] = int(Op.JSR) + (sym.value << 8)
+
+    def _strip_leaf_main_startup(self):
+        """Compile leaf ``main`` programs to direct bytecode.
+
+        Strict neural ALU smoke is stable for direct programs, while wrapping
+        a no-frame main body in JSR/ENT currently introduces avoidable
+        call-frame failures. This preserves full function semantics whenever
+        there are helper calls, params, or locals.
+        """
+        if self.defined_functions != ['main']:
+            return
+        if self.function_param_counts.get('main', 0) != 0:
+            return
+        if self.function_local_offsets.get('main', 0) != 0:
+            return
+        main_addr = self.symbols['main'].value
+        prologue_width = main_addr + 1
+        if main_addr < 0 or main_addr >= len(self.code):
+            return
+        self.code = self.code[prologue_width:]
+        branch_ops = {int(Op.JMP), int(Op.JSR), int(Op.BZ), int(Op.BNZ)}
+        for idx, instr in enumerate(self.code):
+            op = instr & 0xFF
+            imm = instr >> 8
+            if op in branch_ops and imm >= prologue_width:
+                self.code[idx] = op + ((imm - prologue_width) << 8)
+
+    def peek(self) -> TokenType:
+        return self.tokens[self.pos][0]
+
+    def token_val(self):
+        return self.tokens[self.pos][1]
+
+    def token_line(self):
+        return self.tokens[self.pos][2]
+
+    def advance(self):
+        self.pos += 1
+
+    def expect(self, t: TokenType):
+        if self.peek() != t:
+            raise SyntaxError(f"Expected {t}, got {self.peek()} at line {self.token_line()}")
+        self.advance()
+
+    def parse_program(self):
+        while self.peek() != TokenType.EOF:
+            self.parse_global_decl()
+
+    def parse_global_decl(self):
+        # ``decl_base`` is the base type WITHOUT the leading pointer stars
+        # (int/char). Each declarator re-reads its own pointer stars so
+        # ``int a, *b, **c;`` gives a:int, b:int*, c:int**, matching c4.c's
+        # per-declarator ``while (tk == Mul)`` loop.
+        decl_base = INT
+
+        if self.peek() == TokenType.KW_INT:
+            self.advance()
+            decl_base = INT
+        elif self.peek() == TokenType.KW_CHAR:
+            self.advance()
+            decl_base = CHAR
+        elif self.peek() == TokenType.KW_ENUM:
+            self.parse_enum()
+            return
+
+        base_type = decl_base
+        while self.peek() == TokenType.MUL:
+            self.advance()
+            base_type += PTR
+
+        name = self.token_val()
+        self.expect(TokenType.ID)
+
+        if self.peek() == TokenType.LPAREN:
+            self.parse_function(name, base_type)
+        else:
+            self.symbols[name] = Symbol(name, 'Glo', base_type, self.data_base + len(self.data) * WORD)
+            for _ in range(WORD):
+                self.data.append(0)
+            # Comma-separated globals: ``int a, b, *c;`` — each subsequent
+            # declarator re-reads its own pointer stars off ``decl_base``.
+            while self.peek() == TokenType.COMMA:
+                self.advance()
+                gtype = decl_base
+                while self.peek() == TokenType.MUL:
+                    self.advance()
+                    gtype += PTR
+                gname = self.token_val()
+                self.expect(TokenType.ID)
+                self.symbols[gname] = Symbol(gname, 'Glo', gtype, self.data_base + len(self.data) * WORD)
+                for _ in range(WORD):
+                    self.data.append(0)
+            self.expect(TokenType.SEMI)
+
+    def parse_enum(self):
+        self.advance()
+        if self.peek() == TokenType.ID:
+            self.advance()
+        self.expect(TokenType.LBRACE)
+
+        val = 0
+        while self.peek() != TokenType.RBRACE:
+            name = self.token_val()
+            self.expect(TokenType.ID)
+            if self.peek() == TokenType.ASSIGN:
+                self.advance()
+                val = self.token_val()
+                self.expect(TokenType.NUM)
+            self.symbols[name] = Symbol(name, 'Num', INT, val)
+            val += 1
+            if self.peek() == TokenType.COMMA:
+                self.advance()
+
+        self.expect(TokenType.RBRACE)
+        if self.peek() == TokenType.SEMI:
+            self.advance()
+
+    def parse_parameter_list(self) -> List[Tuple[str, int]]:
+        params: List[Tuple[str, int]] = []
+        while self.peek() != TokenType.RPAREN:
+            ptype = INT
+            if self.peek() == TokenType.KW_INT:
+                self.advance()
+            elif self.peek() == TokenType.KW_CHAR:
+                self.advance()
+                ptype = CHAR
+
+            while self.peek() == TokenType.MUL:
+                self.advance()
+                ptype += PTR
+
+            pname = self.token_val()
+            self.expect(TokenType.ID)
+
+            params.append((pname, ptype))
+
+            if self.peek() == TokenType.COMMA:
+                self.advance()
+
+        self.expect(TokenType.RPAREN)
+        return params
+
+    def parse_function(self, name: str, ret_type: int):
+        self.expect(TokenType.LPAREN)
+        params = self.parse_parameter_list()
+
+        if self.peek() == TokenType.SEMI:
+            self.advance()
+            sym = self.symbols.get(name)
+            if sym is None:
+                self.symbols[name] = Symbol(name, 'Fun', ret_type, 0)
+            elif sym.sclass != 'Fun':
+                raise SyntaxError(f"Cannot redeclare non-function as function: {name}")
+            return
+
+        self.expect(TokenType.LBRACE)
+
+        if self.function_defined.get(name, False):
+            raise SyntaxError(f"Redefinition of function: {name}")
+
+        func_addr = self.current_addr()
+        self.symbols[name] = Symbol(name, 'Fun', ret_type, func_addr)
+        self.defined_functions.append(name)
+        self.function_defined[name] = True
+        prev_function = self.current_function
+        self.current_function = name
+
+        param_count = len(params)
+        for param_index, (pname, ptype) in enumerate(params):
+            if pname in self.symbols:
+                sym = self.symbols[pname]
+                sym.h_class = sym.sclass
+                sym.h_type = sym.stype
+                sym.h_value = sym.value
+            else:
+                self.symbols[pname] = Symbol(pname, 'Loc', ptype, 0)
+
+            self.symbols[pname].sclass = 'Loc'
+            self.symbols[pname].stype = ptype
+            self.symbols[pname].value = FRAME_BASE + (param_count - 1 - param_index) * WORD
+
+        ent_addr = self.current_addr()
+        self.emit(Op.ENT, 0)
+
+        self.local_offset = 0
+        while self.peek() in (TokenType.KW_INT, TokenType.KW_CHAR):
+            ltype = INT if self.peek() == TokenType.KW_INT else CHAR
+            self.advance()
+
+            while self.peek() == TokenType.MUL:
+                self.advance()
+                ltype += PTR
+
+            while True:
+                lname = self.token_val()
+                self.expect(TokenType.ID)
+
+                ltype_actual = ltype
+                while self.peek() == TokenType.MUL:
+                    self.advance()
+                    ltype_actual += PTR
+
+                if lname in self.symbols:
+                    sym = self.symbols[lname]
+                    if sym.h_class is None:
+                        sym.h_class = sym.sclass
+                        sym.h_type = sym.stype
+                        sym.h_value = sym.value
+                else:
+                    self.symbols[lname] = Symbol(lname, 'Loc', ltype_actual, 0)
+
+                self.local_offset += WORD
+                self.symbols[lname].sclass = 'Loc'
+                self.symbols[lname].stype = ltype_actual
+                self.symbols[lname].value = -self.local_offset
+
+                if self.peek() == TokenType.COMMA:
+                    self.advance()
+                else:
+                    break
+
+            self.expect(TokenType.SEMI)
+
+        self.patch(ent_addr, self.local_offset)
+        self.function_param_counts[name] = param_count
+        self.function_local_offsets[name] = self.local_offset
+
+        body_returns = False
+        while self.peek() != TokenType.RBRACE:
+            body_returns = self.parse_statement() or body_returns
+
+        self.expect(TokenType.RBRACE)
+        if not body_returns:
+            self.emit(Op.EXIT if name == 'main' else Op.LEV)
+        self.current_function = prev_function
+
+        for sym in self.symbols.values():
+            if sym.h_class is not None:
+                sym.sclass = sym.h_class
+                sym.stype = sym.h_type
+                sym.value = sym.h_value
+                sym.h_class = None
+
+    def parse_statement(self) -> bool:
+        if self.peek() == TokenType.KW_IF:
+            self.advance()
+            self.expect(TokenType.LPAREN)
+            self.parse_expression(TokenType.ASSIGN)
+            self.expect(TokenType.RPAREN)
+
+            bz_addr = self.current_addr()
+            self.emit(Op.BZ, 0)
+
+            then_returns = self.parse_statement()
+
+            if self.peek() == TokenType.KW_ELSE:
+                self.advance()
+                jmp_addr = self.current_addr()
+                self.emit(Op.JMP, 0)
+                self.patch(bz_addr, self.current_addr())
+                else_returns = self.parse_statement()
+                self.patch(jmp_addr, self.current_addr())
+                return then_returns and else_returns
+            else:
+                self.patch(bz_addr, self.current_addr())
+                return False
+
+        elif self.peek() == TokenType.KW_WHILE:
+            self.advance()
+            loop_addr = self.current_addr()
+            self.expect(TokenType.LPAREN)
+            self.parse_expression(TokenType.ASSIGN)
+            self.expect(TokenType.RPAREN)
+
+            bz_addr = self.current_addr()
+            self.emit(Op.BZ, 0)
+
+            self.parse_statement()
+            self.emit(Op.JMP, loop_addr)
+            self.patch(bz_addr, self.current_addr())
+            return False
+
+        elif self.peek() == TokenType.KW_RETURN:
+            self.advance()
+            if self.peek() != TokenType.SEMI:
+                self.parse_expression(TokenType.ASSIGN)
+            self.expect(TokenType.SEMI)
+            self.emit(Op.EXIT if self.current_function == 'main' else Op.LEV)
+            return True
+
+        elif self.peek() == TokenType.LBRACE:
+            self.advance()
+            block_returns = False
+            while self.peek() != TokenType.RBRACE:
+                block_returns = self.parse_statement() or block_returns
+            self.expect(TokenType.RBRACE)
+            return block_returns
+
+        elif self.peek() == TokenType.SEMI:
+            self.advance()
+            return False
+
+        else:
+            self.parse_expression(TokenType.ASSIGN)
+            self.expect(TokenType.SEMI)
+            return False
+
+    def parse_expression(self, level: TokenType):
+        if self.peek() == TokenType.NUM:
+            val = self.token_val()
+            self.advance()
+            self.emit(Op.IMM, val)
+            self.expr_type = INT
+
+        elif self.peek() == TokenType.STRING:
+            addr = self.data_base + self.token_val()
+            self.advance()
+            self.emit(Op.IMM, addr)
+            self.expr_type = PTR + CHAR
+
+        elif self.peek() == TokenType.KW_SIZEOF:
+            self.advance()
+            self.expect(TokenType.LPAREN)
+            t = INT
+            if self.peek() == TokenType.KW_INT:
+                self.advance()
+            elif self.peek() == TokenType.KW_CHAR:
+                self.advance()
+                t = CHAR
+            while self.peek() == TokenType.MUL:
+                self.advance()
+                t += PTR
+            self.expect(TokenType.RPAREN)
+            self.emit(Op.IMM, WORD if t >= PTR or t == INT else 1)
+            self.expr_type = INT
+
+        elif self.peek() == TokenType.ID:
+            name = self.token_val()
+            self.advance()
+
+            if self.peek() == TokenType.LPAREN:
+                self.advance()
+                argc = 0
+                while self.peek() != TokenType.RPAREN:
+                    self.parse_expression(TokenType.ASSIGN)
+                    self.emit(Op.PSH)
+                    argc += 1
+                    if self.peek() == TokenType.COMMA:
+                        self.advance()
+                self.expect(TokenType.RPAREN)
+
+                sym = self.symbols.get(name)
+                if sym is None:
+                    sym = Symbol(name, 'Fun', INT, 0)
+                    self.symbols[name] = sym
+
+                if sym.sclass == 'Sys':
+                    self.emit(Op(sym.value))
+                elif sym.sclass == 'Fun':
+                    self.call_patches.append((len(self.code), name))
+                    self.emit(Op.JSR, sym.value)
+                else:
+                    raise SyntaxError(f"Not a function: {name}")
+
+                if argc:
+                    self.emit(Op.ADJ, argc * WORD)
+                self.expr_type = sym.stype
+
+            else:
+                sym = self.symbols.get(name)
+                if sym is None:
+                    raise SyntaxError(f"Undefined: {name} at line {self.token_line()}")
+
+                if sym.sclass == 'Num':
+                    self.emit(Op.IMM, sym.value)
+                    self.expr_type = INT
+
+                elif sym.sclass == 'Loc':
+                    self.emit(Op.LEA, sym.value)
+                    self.expr_type = sym.stype
+                    self.emit(Op.LI if self.expr_type != CHAR else Op.LC)
+
+                elif sym.sclass == 'Glo':
+                    self.emit(Op.IMM, sym.value)
+                    self.expr_type = sym.stype
+                    self.emit(Op.LI if self.expr_type != CHAR else Op.LC)
+
+                else:
+                    raise SyntaxError(f"Bad identifier: {name}")
+
+        elif self.peek() == TokenType.LPAREN:
+            self.advance()
+            if self.peek() in (TokenType.KW_INT, TokenType.KW_CHAR):
+                t = INT if self.peek() == TokenType.KW_INT else CHAR
+                self.advance()
+                while self.peek() == TokenType.MUL:
+                    self.advance()
+                    t += PTR
+                self.expect(TokenType.RPAREN)
+                self.parse_expression(TokenType.INC)
+                self.expr_type = t
+            else:
+                self.parse_expression(TokenType.ASSIGN)
+                self.expect(TokenType.RPAREN)
+
+        elif self.peek() == TokenType.MUL:
+            self.advance()
+            self.parse_expression(TokenType.INC)
+            if self.expr_type >= PTR:
+                self.expr_type -= PTR
+            self.emit(Op.LI if self.expr_type != CHAR else Op.LC)
+
+        elif self.peek() == TokenType.AND:
+            self.advance()
+            self.parse_expression(TokenType.INC)
+            if self.code and (self.code[-1] & 0xFF) in (Op.LI, Op.LC):
+                self.code.pop()
+            self.expr_type += PTR
+
+        elif self.peek() == TokenType.ADD:
+            # Unary plus: +x is a no-op that yields an int rvalue. Mirrors c4.c
+            # expr() `else if (tk == Add) { next(); expr(Inc); ty = INT; }`.
+            self.advance()
+            self.parse_expression(TokenType.INC)
+            self.expr_type = INT
+
+        elif self.peek() == TokenType.SUB:
+            self.advance()
+            self.emit(Op.IMM, -1)
+            self.emit(Op.PSH)
+            self.parse_expression(TokenType.INC)
+            self.emit(Op.MUL)
+            self.expr_type = INT
+
+        elif self.peek() == TokenType.NOT:
+            # Logical not: !x  ==  (x == 0).  Mirrors c4.c expr() '!' handler.
+            self.advance()
+            self.parse_expression(TokenType.INC)
+            self.emit(Op.PSH)
+            self.emit(Op.IMM, 0)
+            self.emit(Op.EQ)
+            self.expr_type = INT
+
+        elif self.peek() == TokenType.BNOT:
+            # Bitwise not: ~x  ==  (x ^ -1).  Mirrors c4.c expr() '~' handler.
+            self.advance()
+            self.parse_expression(TokenType.INC)
+            self.emit(Op.PSH)
+            self.emit(Op.IMM, -1)
+            self.emit(Op.XOR)
+            self.expr_type = INT
+
+        elif self.peek() == TokenType.INC or self.peek() == TokenType.DEC:
+            is_inc = self.peek() == TokenType.INC
+            self.advance()
+            self.parse_expression(TokenType.INC)
+            # Prefix ++p/--p strides sizeof(*p): 1 for char* (base is CHAR),
+            # WORD otherwise (int*; char**/int** -> pointer element = WORD).
+            # Non-pointers stride 1. Mirrors c4.c and the postfix ++/--,
+            # pointer +/- and [k] paths.
+            if self.expr_type >= PTR:
+                step = 1 if (self.expr_type - PTR) == CHAR else WORD
+            else:
+                step = 1
+            if self.code and (self.code[-1] & 0xFF) in (Op.LI, Op.LC):
+                is_char = (self.code[-1] & 0xFF) == Op.LC
+                self.code[-1] = int(Op.PSH)
+                self.emit(Op.LC if is_char else Op.LI)
+            self.emit(Op.PSH)
+            self.emit(Op.IMM, step)
+            self.emit(Op.ADD if is_inc else Op.SUB)
+            self.emit(Op.SC if self.expr_type == CHAR else Op.SI)
+
+        else:
+            raise SyntaxError(f"Unexpected token: {self.peek()} at line {self.token_line()}")
+
+        while self.peek() >= level:
+            saved_type = self.expr_type
+
+            if self.peek() == TokenType.ASSIGN:
+                self.advance()
+                last_op = self.code[-1] & 0xFF if self.code else None
+                if last_op in (Op.LI, Op.LC):
+                    self.code[-1] = int(Op.PSH)
+                elif last_op == Op.LEA:
+                    self.emit(Op.PSH)
+                self.parse_expression(TokenType.ASSIGN)
+                self.emit(Op.SC if saved_type == CHAR else Op.SI)
+
+            elif self.peek() == TokenType.COND:
+                self.advance()
+                bz_addr = self.current_addr()
+                self.emit(Op.BZ, 0)
+                self.parse_expression(TokenType.ASSIGN)
+                self.expect(TokenType.COLON)
+                jmp_addr = self.current_addr()
+                self.emit(Op.JMP, 0)
+                self.patch(bz_addr, self.current_addr())
+                self.parse_expression(TokenType.COND)
+                self.patch(jmp_addr, self.current_addr())
+
+            elif self.peek() == TokenType.LOR:
+                self.advance()
+                bnz_addr = self.current_addr()
+                self.emit(Op.BNZ, 0)
+                self.parse_expression(TokenType.LAND)
+                self.patch(bnz_addr, self.current_addr())
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.LAND:
+                self.advance()
+                bz_addr = self.current_addr()
+                self.emit(Op.BZ, 0)
+                self.parse_expression(TokenType.OR)
+                self.patch(bz_addr, self.current_addr())
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.OR:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.XOR)
+                self.emit(Op.OR)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.XOR:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.AND)
+                self.emit(Op.XOR)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.AND:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.EQ)
+                self.emit(Op.AND)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.EQ:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.LT)
+                self.emit(Op.EQ)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.NE:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.LT)
+                self.emit(Op.NE)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.LT:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.SHL)
+                self.emit(Op.LT)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.GT:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.SHL)
+                self.emit(Op.GT)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.LE:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.SHL)
+                self.emit(Op.LE)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.GE:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.SHL)
+                self.emit(Op.GE)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.SHL:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.ADD)
+                self.emit(Op.SHL)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.SHR:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.ADD)
+                self.emit(Op.SHR)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.ADD:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.MUL)
+                if saved_type >= PTR:
+                    base_type = saved_type - PTR
+                    # Element size is sizeof(*p): 1 for char* (base CHAR), else WORD
+                    # (int* AND any pointer-to-pointer int**/char** -> a pointer is
+                    # WORD bytes). Mirrors c4.c's `if ((ty = t) > PTR)` scale (t > PTR
+                    # holds for every non-char base) and the ++/-- stride below.
+                    elem_size = 1 if base_type == CHAR else WORD
+                    if elem_size > 1:
+                        self.emit(Op.PSH)
+                        self.emit(Op.IMM, elem_size)
+                        self.emit(Op.MUL)
+                self.emit(Op.ADD)
+                self.expr_type = saved_type
+
+            elif self.peek() == TokenType.SUB:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.MUL)
+                if saved_type >= PTR and self.expr_type >= PTR:
+                    base_type = saved_type - PTR
+                    # ptr - ptr: divide the byte delta by sizeof(*p) (1 for char*,
+                    # else WORD). c4.c: `if (t > PTR && t == ty) { SUB; DIV sizeof(int) }`.
+                    elem_size = 1 if base_type == CHAR else WORD
+                    self.emit(Op.SUB)
+                    if elem_size > 1:
+                        self.emit(Op.PSH)
+                        self.emit(Op.IMM, elem_size)
+                        self.emit(Op.DIV)
+                    self.expr_type = INT
+                elif saved_type >= PTR:
+                    base_type = saved_type - PTR
+                    # ptr - int: scale the int by sizeof(*p) before subtracting.
+                    elem_size = 1 if base_type == CHAR else WORD
+                    if elem_size > 1:
+                        self.emit(Op.PSH)
+                        self.emit(Op.IMM, elem_size)
+                        self.emit(Op.MUL)
+                    self.emit(Op.SUB)
+                    self.expr_type = saved_type
+                else:
+                    self.emit(Op.SUB)
+                    self.expr_type = INT
+
+            elif self.peek() == TokenType.MUL:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.INC)
+                self.emit(Op.MUL)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.DIV:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.INC)
+                self.emit(Op.DIV)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.MOD:
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.INC)
+                self.emit(Op.MOD)
+                self.expr_type = INT
+
+            elif self.peek() == TokenType.INC or self.peek() == TokenType.DEC:
+                is_inc = self.peek() == TokenType.INC
+                self.advance()
+                # p++/p-- strides sizeof(*p): 1 for char* (base is CHAR),
+                # WORD otherwise (int* -> sizeof(int)=WORD; char**/int** -> sizeof
+                # of a pointer = WORD). Non-pointers stride 1. This mirrors
+                # c4.c (p++ adds sizeof(*p)) and the pointer +/- and [k]
+                # paths above.
+                if saved_type >= PTR:
+                    step = 1 if (saved_type - PTR) == CHAR else WORD
+                else:
+                    step = 1
+                if self.code and (self.code[-1] & 0xFF) in (Op.LI, Op.LC):
+                    is_char = (self.code[-1] & 0xFF) == Op.LC
+                    self.code[-1] = int(Op.PSH)
+                    self.emit(Op.LC if is_char else Op.LI)
+                self.emit(Op.PSH)
+                self.emit(Op.IMM, step)
+                self.emit(Op.ADD if is_inc else Op.SUB)
+                self.emit(Op.SC if saved_type == CHAR else Op.SI)
+                self.emit(Op.PSH)
+                self.emit(Op.IMM, step)
+                self.emit(Op.SUB if is_inc else Op.ADD)
+
+            elif self.peek() == TokenType.BRAK:
+                # Capture the token immediately before this `[` BEFORE consuming
+                # the index expression (self.pos still points at `[`). Used below
+                # to tell a compound index `a[i][j]` (prev == `]`) from a bare
+                # single index `arr[k]` (prev == identifier / `)`).
+                _prev_before_brak = (
+                    self.tokens[self.pos - 1][0] if self.pos >= 1 else None
+                )
+                self.advance()
+                self.emit(Op.PSH)
+                self.parse_expression(TokenType.ASSIGN)
+                self.expect(TokenType.RBRACKET)
+                if saved_type >= PTR:
+                    base_type = saved_type - PTR
+                    # p[k] indexes by sizeof(*p): 1 for char*, else WORD (int* AND
+                    # int**/char** — a pointer element is WORD bytes). c4.c Brak uses
+                    # `if (t > PTR) { ... MUL sizeof(int) }`.
+                    elem_size = 1 if base_type == CHAR else WORD
+                    if elem_size > 1:
+                        self.emit(Op.PSH)
+                        self.emit(Op.IMM, elem_size)
+                        self.emit(Op.MUL)
+                    self.emit(Op.ADD)
+                    self.expr_type = saved_type - PTR
+                    self.emit(Op.LI if self.expr_type != CHAR else Op.LC)
+                else:
+                    # Indexing a NON-pointer value `v[k]`.  In strict C this is a
+                    # type error (c4.c prints "pointer type expected" and exits),
+                    # but the flattened Doom port uses two distinct idioms that
+                    # both land here, and they want OPPOSITE strides:
+                    #
+                    #  (a) COMPOUND index `tbl[i][j]` where `tbl` is single-star
+                    #      `int*` (a flat table of block POINTERS stored as words).
+                    #      `tbl[i]` has type int (the pointer VALUE), and the inner
+                    #      `[j]` must scale by the WORD size (4 here) to read the
+                    #      int at `block + j*WORD`.  Byte-striding it was the dominant
+                    #      compound-index bug (dropped the ×WORD, needed a hand
+                    #      `((int*)tbl[i])[j]` cast at every render call site:
+                    #      R_GetColumn, R_DrawSprite ds[9]/ds[10], sprites[..][..]).
+                    #
+                    #  (b) SINGLE index `arr[k]` on a bare-`int` global that holds a
+                    #      malloc'd base pointer (`int players; players=malloc(...)`;
+                    #      likewise playeringame/wminfo/... ).  The port already
+                    #      encodes these subscripts in the units the surrounding
+                    #      code expects (byte offsets — `players[i*74+field]`), so
+                    #      this MUST retain the historical stride-1 (byte) lowering;
+                    #      word-scaling it corrupts the whole player/game state.
+                    #
+                    # Discriminate structurally: a compound index (a) has a `]`
+                    # immediately before this `[` (the outer subscript just
+                    # closed); a bare-array index (b) has an identifier / `)`
+                    # there.  Only (a) gets the ×WORD word scale.  Genuine char
+                    # blocks (e.g. `myargv` holding `char*`) use an explicit
+                    # `(char*)` cast at the site so they take the byte-stride
+                    # pointer branch above.
+                    if _prev_before_brak == TokenType.RBRACKET:
+                        self.emit(Op.PSH)
+                        self.emit(Op.IMM, WORD)
+                        self.emit(Op.MUL)
+                    self.emit(Op.ADD)
+                    self.expr_type = INT
+                    self.emit(Op.LI)
+
+            else:
+                break
+
+
+def _source_calls_any(source: str, names: Tuple[str, ...]) -> bool:
+    lexer = Lexer(source)
+    prev: Optional[Tuple[TokenType, object, int]] = None
+    name_set = set(names)
+
+    while True:
+        tok = lexer.next_token()
+        if (
+            prev is not None
+            and prev[0] == TokenType.ID
+            and prev[1] in name_set
+            and tok[0] == TokenType.LPAREN
+        ):
+            return True
+        if tok[0] == TokenType.EOF:
+            return False
+        prev = tok
+
+
+def _undefined_stdlib_name(exc: SyntaxError) -> Optional[str]:
+    prefix = "Undefined function: "
+    message = str(exc)
+    if not message.startswith(prefix):
+        return None
+    name = message[len(prefix):]
+    return name if name in STDLIB_SYMBOLS else None
+
+
+def compile_c(source: str, link_stdlib: bool = True) -> Tuple[List[int], List[int]]:
+    """Compile C source, return (code, data).
+
+    Args:
+        source: C source code to compile
+        link_stdlib: If True, automatically prepend stdlib (malloc, free, etc.)
+
+    Returns:
+        Tuple of (bytecode, data)
+    """
+    if not link_stdlib or not _source_calls_any(source, STDLIB_SYMBOLS):
+        return Compiler32().compile(source)
+
+    try:
+        return Compiler32().compile(source)
+    except SyntaxError as exc:
+        if _undefined_stdlib_name(exc) is None:
+            raise
+
+    stdlib_path = Path(__file__).parent / 'stdlib' / 'memory.c4'
+    if not stdlib_path.exists():
+        return Compiler32().compile(source)
+
+    stdlib_source = stdlib_path.read_text()
+    # Keep the user entrypoint near the startup stub so strict neural
+    # control-flow does not depend on large static target literals. Calls into
+    # stdlib are patched after all functions are parsed.
+    return Compiler32().compile(source + '\n' + stdlib_source)
+
+
+__all__ = ['compile_c', 'Compiler32', 'Compiler', 'Op', 'WORD']
+
+# Alias so code that does ``from src.compiler32 import Compiler`` (mirroring the
+# 8-byte ``from src.compiler import Compiler``) gets the 32-bit compiler.
+Compiler = Compiler32
