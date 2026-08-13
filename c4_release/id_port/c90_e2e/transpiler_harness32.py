@@ -206,8 +206,19 @@ def run_port(src: str, stdin: bytes, timeout_cycles: int = 40_000_000) -> Result
         # flip / logical-shift; NO 64-bit masking).  This is the principled route:
         # native word width + minimal unsigned-op helpers, vs the 64-bit machine's
         # full emul_i32 emulation of 32-bit-in-64-bit.
-        tsrc = T.transpile(src, contract=contract, preprocess=True, native32=True) \
-            if contract is not None else T.transpile(src, preprocess=True, native32=True)
+        # fnptr=True: OPT-IN generic function-pointer lowering (address-taken
+        # functions -> integer FN_IDs + arity-typed `__call_by_idN` dispatchers,
+        # the GENERIC form of Doom's own fnptr_link.py FN_ID scheme).  DEFAULT-OFF
+        # in the transpiler -- Doom keeps its hand-authored fnptr path so the
+        # byte-exact title-frame build (golden 174ece66) is untouched; enabled here
+        # to close the c-torture fnptr cluster.  The nested-function / packed-ABI /
+        # GNU-misc + char/short-width wave-2 passes are DEFAULT-ACTIVE inside
+        # transpile() (each byte-neutral / no-op on any source lacking that
+        # construct, including Doom), so they run automatically -- no flag needed.
+        tsrc = T.transpile(src, contract=contract, preprocess=True, native32=True,
+                           fnptr=True) \
+            if contract is not None else T.transpile(src, preprocess=True,
+                                                     native32=True, fnptr=True)
     except Exception as e:
         r.stage = "transpile_error"
         r.detail = f"{type(e).__name__}: {e}"
