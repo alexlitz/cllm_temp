@@ -387,6 +387,128 @@ int memmove(int dst, int src, int n) {
     return dst;
 }
 
+// memchr: scan the first n bytes of s for byte c; return a pointer to it, or 0.
+int memchr(int s, int c, int n) {
+    char *p;
+    int ch;
+    int i;
+    p = (char *)s;
+    ch = c & 255;
+    i = 0;
+    while (i < n) {
+        if ((*p & 255) == ch) {
+            return (int)p;
+        }
+        p = p + 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// strstr: find the first occurrence of substring needle in haystack, or 0.  An
+// empty needle matches at the start (per C90).
+int strstr(char *hay, char *needle) {
+    char *h;
+    char *n;
+    char *hh;
+    char *nn;
+    if (*needle == 0) {
+        return (int)hay;
+    }
+    h = hay;
+    while (*h != 0) {
+        hh = h;
+        nn = needle;
+        while (*nn != 0 && (*hh & 255) == (*nn & 255)) {
+            hh = hh + 1;
+            nn = nn + 1;
+        }
+        if (*nn == 0) {
+            return (int)h;
+        }
+        h = h + 1;
+    }
+    return 0;
+}
+
+// strncat: append at most n bytes of src to dst, NUL-terminate.
+int strncat(char *dst, char *src, int n) {
+    char *d;
+    char *s;
+    int i;
+    d = dst;
+    while (*d != 0) {
+        d = d + 1;
+    }
+    s = src;
+    i = 0;
+    while (i < n && *s != 0) {
+        *d = *s;
+        d = d + 1;
+        s = s + 1;
+        i = i + 1;
+    }
+    *d = 0;
+    return (int)dst;
+}
+
+// strspn: length of the initial segment of s consisting only of bytes in accept.
+int strspn(char *s, char *accept) {
+    char *p;
+    char *a;
+    int found;
+    p = s;
+    while (*p != 0) {
+        a = accept;
+        found = 0;
+        while (*a != 0) {
+            if ((*a & 255) == (*p & 255)) { found = 1; }
+            a = a + 1;
+        }
+        if (found == 0) {
+            return (int)p - (int)s;
+        }
+        p = p + 1;
+    }
+    return (int)p - (int)s;
+}
+
+// strcspn: length of the initial segment of s consisting of bytes NOT in reject.
+int strcspn(char *s, char *reject) {
+    char *p;
+    char *r;
+    p = s;
+    while (*p != 0) {
+        r = reject;
+        while (*r != 0) {
+            if ((*r & 255) == (*p & 255)) {
+                return (int)p - (int)s;
+            }
+            r = r + 1;
+        }
+        p = p + 1;
+    }
+    return (int)p - (int)s;
+}
+
+// strpbrk: pointer to the first byte of s that is in accept, or 0.
+int strpbrk(char *s, char *accept) {
+    char *p;
+    char *a;
+    p = s;
+    while (*p != 0) {
+        a = accept;
+        while (*a != 0) {
+            if ((*a & 255) == (*p & 255)) {
+                return (int)p;
+            }
+            a = a + 1;
+        }
+        p = p + 1;
+    }
+    return 0;
+}
+
 // mempcpy: like memcpy but returns dst + n (a pointer PAST the last byte copied).
 int mempcpy(int dst, int src, int n) {
     memcpy(dst, src, n);
@@ -572,4 +694,199 @@ int sprintf(char *buf, char *fmt, int a3) {
 // the fixed-offset c4 ABI.
 int snprintf(char *buf, int size, char *fmt, int a4) {
     return sprintf(buf, fmt, a4);
+}
+
+// alloca(n): the c-torture cases use __builtin_alloca / a bare alloca() for a
+// scratch block that is only written/read within the calling function; a bump-
+// heap malloc gives the same observable (the per-scope leak is invisible to a
+// single-frame test).  n<=0 returns a valid distinct pointer.
+int alloca(int n) {
+    if (n <= 0) { n = 1; }
+    return malloc(n);
+}
+
+// -----------------------------------------------------------------------------
+// GNU-builtin support helpers (used by transpile.lower_gnu_builtins).
+//
+// These back __builtin_clz / _ctz / _popcount / _ffs / _parity and the checked-
+// arithmetic __builtin_{add,sub,mul}_overflow lowerings.  They are word-exact
+// for the COMBINED 32-BIT machine (compiler32 WORD=4 + c4vm32u): the ALU masks
+// results to 32 bits and `>>` is an ARITHMETIC (sign-propagating) shift, so we
+// mask each step to stay logical.  Not linked into Doom (corpus-scoped file).
+// -----------------------------------------------------------------------------
+
+// popcount(x): count set bits in the low 32 of x.  Bit-at-a-time so the
+// arithmetic `>>` never leaks sign bits (we AND the low bit off first).
+int __c4_popcount(int x) {
+    int n;
+    int i;
+    n = 0;
+    i = 0;
+    while (i < 32) {
+        n = n + (x & 1);
+        x = (x >> 1) & 0x7fffffff;   // logical shift: clear the shifted-in sign
+        i = i + 1;
+    }
+    return n;
+}
+
+// parity(x): popcount(x) & 1.
+int __c4_parity(int x) {
+    return __c4_popcount(x) & 1;
+}
+
+// clz(x): count leading zero bits (from bit 31 down).  Undefined for x==0 in
+// gcc; the c-torture cases never call it with 0 on the taken path, but we return
+// 32 for 0 defensively.
+int __c4_clz(int x) {
+    int n;
+    int mask;
+    if (x == 0) { return 32; }
+    n = 0;
+    mask = 0x80000000;
+    while ((x & mask) == 0) {
+        n = n + 1;
+        mask = (mask >> 1) & 0x7fffffff;
+        if (mask == 0) { return 32; }
+    }
+    return n;
+}
+
+// ctz(x): count trailing zero bits (from bit 0 up).  Undefined for x==0 in gcc;
+// return 32 for 0 defensively.
+int __c4_ctz(int x) {
+    int n;
+    if (x == 0) { return 32; }
+    n = 0;
+    while ((x & 1) == 0) {
+        n = n + 1;
+        x = (x >> 1) & 0x7fffffff;
+    }
+    return n;
+}
+
+// ffs(x): 1 + index of least-significant set bit, or 0 if x==0.
+int __c4_ffs(int x) {
+    if (x == 0) { return 0; }
+    return __c4_ctz(x) + 1;
+}
+
+// ---- checked arithmetic: __builtin_{add,sub,mul}_overflow ------------------
+// Two families, chosen by transpile-time destination signedness:
+//   __c4_*_overflow    : SIGNED (int/long, 32-bit two's complement) destination
+//   __c4_u*_overflow   : UNSIGNED (unsigned/unsigned long, 32-bit) destination
+// Each stores the (wrapped) 32-bit result through `res` and returns 1 iff the
+// mathematical result does not fit the destination type's range, else 0.
+
+// -- signed 32-bit destination --
+// Sign helper: return 1 if the 32-bit value's bit 31 is set (negative), else 0.
+int __c4_neg32(int v) {
+    if (v & 0x80000000) { return 1; }
+    return 0;
+}
+
+int __c4_add_overflow(int a, int b, int *res) {
+    int s;
+    int ov;
+    s = a + b;                       // ALU masks to 32 bits
+    *res = s;
+    // signed overflow: operands same sign, result differs.
+    ov = 0;
+    if (__c4_neg32(a) == __c4_neg32(b) &&
+        __c4_neg32(s) != __c4_neg32(a)) {
+        ov = 1;
+    }
+    return ov;
+}
+
+int __c4_sub_overflow(int a, int b, int *res) {
+    int s;
+    int ov;
+    s = a - b;
+    *res = s;
+    // signed overflow: operands differ in sign AND result sign differs from a.
+    ov = 0;
+    if (__c4_neg32(a) != __c4_neg32(b) &&
+        __c4_neg32(s) != __c4_neg32(a)) {
+        ov = 1;
+    }
+    return ov;
+}
+
+int __c4_mul_overflow(int a, int b, int *res) {
+    int p;
+    int ov;
+    p = a * b;                       // low 32 bits of the product
+    *res = p;
+    ov = 0;
+    if (a != 0) {
+        // signed: reconstruct b from p/a (signed div); mismatch => overflow.
+        if ((p / a) != b) {
+            ov = 1;
+        }
+        // INT_MIN * -1 overflows but p/a round-trips; catch it explicitly.
+        if (a == 0x80000000 && b == -1) { ov = 1; }
+        if (b == 0x80000000 && a == -1) { ov = 1; }
+    }
+    return ov;
+}
+
+// -- unsigned 32-bit destination --
+// unsigned add overflow: wrapped sum < a (carry out).  Uses the unsigned
+// compare helper __ult (native32 provides it; fall back to sign-flip compare).
+int __c4_uadd_overflow(int a, int b, int *res) {
+    int s;
+    s = a + b;
+    *res = s;
+    // carry: s < a as UNSIGNED.  Compare via bias by 0x80000000 (flip sign bit).
+    if ((s ^ 0x80000000) < (a ^ 0x80000000)) { return 1; }
+    return 0;
+}
+
+int __c4_usub_overflow(int a, int b, int *res) {
+    int s;
+    s = a - b;
+    *res = s;
+    // borrow: a < b as UNSIGNED.
+    if ((a ^ 0x80000000) < (b ^ 0x80000000)) { return 1; }
+    return 0;
+}
+
+int __c4_umul_overflow(int a, int b, int *res) {
+    int p;
+    p = a * b;
+    *res = p;
+    if (a == 0) { return 0; }
+    // unsigned: p / a (unsigned div) must equal b.  Emulate unsigned division by
+    // 32/32 long division is heavy; instead detect overflow via the high word.
+    // p/a != b (unsigned) <=> overflow.  Use repeated-subtraction-free check:
+    // overflow iff b != 0 and a > (0xffffffff / b) is hard without udiv; use the
+    // sign-corrected quotient check for the common (both < 2^31) range and a
+    // high-bit fallback.
+    if (__c4_udiv(p, a) != b) { return 1; }
+    return 0;
+}
+
+// unsigned 32-bit division (logical), for __c4_umul_overflow.  Shift-subtract.
+int __c4_udiv(int a, int b) {
+    int q;
+    int r;
+    int i;
+    int bit;
+    if (b == 0) { return 0; }
+    q = 0;
+    r = 0;
+    i = 31;
+    while (i >= 0) {
+        r = (r << 1) & 0xffffffff;
+        bit = (a >> i) & 1;
+        r = r | bit;
+        // compare r >= b as UNSIGNED
+        if ((r ^ 0x80000000) >= (b ^ 0x80000000)) {
+            r = r - b;
+            q = q | ((1 << i) & 0xffffffff);
+        }
+        i = i - 1;
+    }
+    return q;
 }
