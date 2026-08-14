@@ -510,3 +510,62 @@ def test_kv_heads_default_to_gqa_kv_head_count():
     assert con2.kv_heads(S.QWEN2_5_ARCH) == 14
     r = S.solve_opconfig(OC.min_params_config(), con2)
     assert r.kv_bytes == S.kv_cache_bytes(20, 14, 64, 128, 1, "fp64")
+
+
+# ===========================================================================
+# #913 fp32-fit levers (pack_memcam / overlap_scratch / bit_level_bitwise).
+# Each lever DEFAULTS OFF, so the base accounting is byte-identical to before;
+# ON, it applies a MEASURED residual/depth reduction from the real layout.
+# ===========================================================================
+STOCK = S.STOCK_TARGETS["stock-0.5b"]
+
+
+def _fits_05b(a):
+    return (a.hidden <= STOCK.hidden and a.intermediate <= STOCK.intermediate
+            and a.stored_layers <= STOCK.layers)
+
+
+def test_levers_default_off_is_byte_identical():
+    # levers OFF -> the prior accounting (subroutine 1152/896/31, ALU 3008/7920).
+    sub = S.account(S.FitConfig(ops=S.FULL, muldiv_strategy="subroutine"))
+    assert (sub.hidden, sub.intermediate, sub.stored_layers) == (1152, 896, 31)
+    alu = S.account(S.FitConfig(ops=S.FULL, muldiv_strategy="efficient-ALU-recurrent"))
+    assert (alu.hidden, alu.intermediate) == (3008, 7920)
+
+
+def test_pack_memcam_drops_the_dead_pad_to_896():
+    # dropping the dead §Memory head pad collapses the subroutine hidden 1152 -> 896.
+    a = S.account(S.FitConfig(ops=S.FULL, muldiv_strategy="subroutine", pack_memcam=True))
+    assert a.hidden == 896 and a.hidden < 1152
+
+
+def test_bit_level_bitwise_retires_the_barrel_shifter_depth():
+    # the #911 depth-1 bitwise + SHL/SHR-as-subroutine retires the ~17 barrel-shift
+    # blocks: subroutine stored 31 -> ~14.
+    off = S.account(S.FitConfig(ops=S.FULL, muldiv_strategy="subroutine"))
+    on = S.account(S.FitConfig(ops=S.FULL, muldiv_strategy="subroutine",
+                               bit_level_bitwise=True))
+    assert on.stored_layers < off.stored_layers
+    assert off.stored_layers - on.stored_layers >= 15
+
+
+def test_full_fp32_isa_FITS_stock_0_5b_with_all_levers():
+    # THE #913 result: subroutine muldiv + pack_memcam + bit-level bitwise FITS the
+    # stock Qwen2.5-0.5B box (hidden<=896, inter<=4864, stored<=24) at fp32.
+    a = S.account(S.FitConfig(ops=S.FULL, muldiv_strategy="subroutine", precision=32,
+                              pack_memcam=True, bit_level_bitwise=True))
+    assert a.hidden <= 896 and a.intermediate <= 4864 and a.stored_layers <= 24
+    assert _fits_05b(a)
+
+
+def test_overlap_scratch_reduces_inline_alu_but_divmod_still_binds():
+    # op-overlap replaces the SUM of the per-op ALU scratch with operand + MAX-family;
+    # it narrows the inline-ALU residual but divmod's own scratch still exceeds 896,
+    # so the inline ALU does NOT fit even fully overlapped (subroutine is the lever).
+    off = S.account(S.FitConfig(ops=S.FULL, muldiv_strategy="efficient-ALU-recurrent",
+                                pack_memcam=True))
+    on = S.account(S.FitConfig(ops=S.FULL, muldiv_strategy="efficient-ALU-recurrent",
+                               pack_memcam=True, overlap_scratch=True))
+    assert on.hidden <= off.hidden          # overlap narrows the residual
+    assert on.hidden > 896                  # ...but divmod scratch still binds
+    assert not _fits_05b(on)

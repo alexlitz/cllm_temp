@@ -33,6 +33,29 @@ Lever ↔ cost axis
     muldiv-strategy = subroutine              -> STEPS  (per-op program steps)  [EST]
     precision 8/16/32                          -> scales all three
 
+#913 fp32-FIT levers (FitConfig.pack_memcam / overlap_scratch / bit_level_bitwise)
+-----------------------------------------------------------------------------------
+Three MEASURED reductions of the residual-width / depth floor, each DEFAULT OFF (so
+the base accounting is byte-identical to before) and each a delta read from the REAL
+layout (``_packmemcam_saving`` / ``_alu_scratch_overlap`` / ``_bitwise_barrel_saving``):
+
+  * **pack_memcam** — drop the ~330-780 DEAD head-dim pad dims the pure-forward
+    §Memory head allocated but this Qwen build (re-bakes attention on Qwen geometry)
+    never uses (``C4_PACK_MEMCAM``).  Collapses the subroutine hidden 1152 -> 896.
+  * **overlap_scratch** — THE op-overlap lever: the inline-ALU scratch bands are
+    stored side-by-side (SUM) but only ONE op fires per step, so under an opcode-gated
+    parallel-scratch mux the residual holds operand + MAX-over-families, not the SUM.
+    Measured: sum 1335 -> operand(12)+MAX(divmod 1165) = 1177.  It NARROWS the inline
+    ALU but divmod's own 1165-dim scratch still exceeds 896, so the inline ALU does
+    NOT fit even fully overlapped — subroutine (ALU out of the residual) is the lever.
+  * **bit_level_bitwise** — #911 per-bit polynomial AND/OR/XOR (depth-1 combine, no
+    attention) replaces the 256-entry nibble-LUT, and SHL/SHR leave the persistent
+    stack (routed to subroutine / native MUL-DIV), retiring the ~17 barrel-shifter
+    blocks: subroutine stored 31 -> 14.
+
+  RESULT (#913): subroutine + pack_memcam + bit_level_bitwise FITS stock Qwen2.5-0.5B
+  at fp32 — hidden 896 (<=896), intermediate 896 (<=4864), stored 14 (<=24).
+
 Honesty (verified vs estimated)
 -------------------------------
   * **lookup-table** width, **efficient-ALU** unrolled/recurrent depth+width — VERIFIED:
@@ -200,6 +223,24 @@ class FitConfig:
     granularity: str = "nibble"
     code_size: int = 24
     arch: QwenArch = field(default_factory=lambda: QWEN2_5_ARCH)
+    # ---- #913 fp32-fit levers (all default OFF -> byte-identical to the prior
+    #      accounting; each is a MEASURED reduction of the residual/depth) --------
+    pack_memcam: bool = False        # drop the ~800 dead head-dim pad dims that this
+                                     #   Qwen build never uses (C4_PACK_MEMCAM). The
+                                     #   pure-forward layout pads up to n_heads*MEM_HEAD
+                                     #   CHANNELS for its OWN §Memory head, but this build
+                                     #   re-bakes attention on the Qwen geometry, so those
+                                     #   dims are dead weight. OFF -> byte-identical wider.
+    overlap_scratch: bool = False    # THE op-overlap lever: the inline-ALU scratch bands
+                                     #   are allocated side-by-side (SUM) but only ONE op
+                                     #   fires per step. Under an opcode-gated parallel-
+                                     #   scratch mux the residual holds base + operand +
+                                     #   MAX-over-families(private scratch), not the SUM.
+    bit_level_bitwise: bool = False  # #911 bit-level (per-bit polynomial) AND/OR/XOR:
+                                     #   depth-1-combine, no attention, ~narrow; replaces
+                                     #   the 256-entry nibble-LUT. SHL/SHR leave the
+                                     #   persistent stack (routed to subroutine/MUL-DIV),
+                                     #   dropping the ~17 barrel-shifter blocks.
 
     @property
     def subset(self) -> Subset:
@@ -312,21 +353,172 @@ def _raw_spec_sizes(code_size: int, memory: bool, cmp: bool, bitwise: bool,
     return QL.D_used, inter, n_stored, n_applied
 
 
+# ===========================================================================
+# #913 fp32-fit levers — MEASURED reductions of the residual width + depth.
+# Each helper reads the REAL layout/blocks (no model built), so the reductions
+# are numbers the build path could actually realize, not hand-waves.
+# ===========================================================================
+
+# The dead head-dim pad the pure-forward §Memory head allocated but this Qwen build
+# never uses.  Measured directly as D_used(pad-off) - D_used(pad-on).  See
+# QwenFullLayout._compact_layout_drop_pad + the C4_PACK_MEMCAM comment (qwen_full_vm).
+@lru_cache(maxsize=None)
+def _packmemcam_saving(code_size: int, memory: bool, cmp: bool, bitwise: bool,
+                       muldiv: bool, efficient_alu: bool, recurrent_divmod: bool) -> int:
+    """D_used dims removed by dropping the dead §Memory head pad (C4_PACK_MEMCAM).
+    Measured as the difference between the pad-off and pad-on layouts of the SAME
+    subset — a genuine layout collapse the build already supports."""
+    import os as _os
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=memory, cmp=cmp, bitwise=bitwise, muldiv=muldiv)
+    prev = _os.environ.get("C4_PACK_MEMCAM")
+    try:
+        _os.environ["C4_PACK_MEMCAM"] = "0"
+        _Q._pack_memcam.cache_clear() if hasattr(_Q._pack_memcam, "cache_clear") else None
+        off = _Q.QwenFullLayout(code_size, sub, efficient_alu=efficient_alu,
+                                recurrent_divmod=recurrent_divmod).D_used
+        _os.environ["C4_PACK_MEMCAM"] = "1"
+        _Q._pack_memcam.cache_clear() if hasattr(_Q._pack_memcam, "cache_clear") else None
+        on = _Q.QwenFullLayout(code_size, sub, efficient_alu=efficient_alu,
+                               recurrent_divmod=recurrent_divmod).D_used
+    finally:
+        if prev is None:
+            _os.environ.pop("C4_PACK_MEMCAM", None)
+        else:
+            _os.environ["C4_PACK_MEMCAM"] = prev
+        _Q._pack_memcam.cache_clear() if hasattr(_Q._pack_memcam, "cache_clear") else None
+    return max(0, off - on)
+
+
+# The inline-ALU scratch bands, tallied per machinery FAMILY from the LIVE layout.
+# Op-overlap replaces the SUM of the private per-family scratch with operand(shared)
+# + MAX-over-families, because only ONE op fires per step (an opcode-gated parallel-
+# scratch mux, the nibble_alu32 pattern).  Returned as (sum, overlapped, families).
+_ALU_FAMILY = {  # ALU_<name> -> machinery family (operand bands are SHARED across ops)
+    "A": "operand", "B": "operand", "NOTB": "operand",
+    "ADD_C": "addsub", "SUB_C": "addsub", "ADD_RES": "addsub", "SUB_RES": "addsub",
+    "PP": "mul", "MCOL": "mul", "MC1": "mul", "MUL_RES": "mul",
+    "MUL_T": "mul", "MUL_G0": "mul", "MUL_G1": "mul", "MUL_P0": "mul", "MUL_P1": "mul",
+    "R": "divmod", "R2": "divmod", "KB": "divmod", "GT": "divmod", "EQ_N": "divmod",
+    "QD": "divmod", "QB": "divmod", "SUBB": "divmod", "DIV_RES": "divmod",
+    "MOD_RES": "divmod", "BZ": "divmod", "IT": "divmod", "IT_OH": "divmod",
+    "KB_T": "divmod", "KB_G0": "divmod", "KB_G1": "divmod", "KB_P0": "divmod",
+    "KB_P1": "divmod", "SGN_A": "divmod", "SGN_B": "divmod", "RES_SGN": "divmod",
+    "ZCUM": "divmod", "SH_N_OH": "shift",
+}
+
+
+@lru_cache(maxsize=None)
+def _alu_scratch_overlap(code_size: int, recurrent_divmod: bool) -> Tuple[int, int, dict]:
+    """(sum_scratch, overlapped_scratch, per_family) for the inline-ALU scratch bands,
+    read from the LIVE layout's named ALU_ bands.  overlapped = operand + MAX(family)
+    (one op active per step); sum = every family's scratch side-by-side (the SUM the
+    current build stores)."""
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=True)
+    QL = _Q.QwenFullLayout(code_size, sub, efficient_alu=True,
+                           recurrent_divmod=recurrent_divmod)
+    names = getattr(QL.L, "_names", {})
+    from collections import defaultdict
+    fw: Dict[str, int] = defaultdict(int)
+    for k, (off, w) in names.items():
+        if k.startswith("ALU_"):
+            base = k[len("ALU_"):]
+            fam = _ALU_FAMILY.get(base)
+            if fam:
+                fw[fam] += w
+    total = sum(fw.values())
+    op_families = [v for f, v in fw.items() if f != "operand"]
+    overlapped = fw.get("operand", 0) + (max(op_families) if op_families else 0)
+    return total, overlapped, dict(fw)
+
+
+# The barrel-shifter blocks + residual the #911 bit-level bitwise retires (SHL/SHR
+# leave the persistent stack; only the depth-1 OR/XOR/AND combine remains).  Measured
+# as the block/residual delta between the barrel-shift-on and barrel-shift-off (shift_
+# via_mul) bitwise builds of the same subset.
+@lru_cache(maxsize=None)
+def _bitwise_barrel_saving(code_size: int, pack_memcam: bool) -> Tuple[int, int]:
+    """(blocks_removed, residual_dims_removed) when the 17 barrel-shifter blocks leave
+    the bitwise stack (SHL/SHR routed to subroutine / native MUL-DIV, keeping only the
+    depth-1 #911 per-bit OR/XOR/AND combine).
+
+    ``pack_memcam`` selects the residual regime: with the dead §Memory pad PRESENT
+    (pad-on) the barrel-shifter bands sit INSIDE the dead pad so removing them frees
+    NO net residual (the pad already dominates the floor); with the pad DROPPED
+    (pack_memcam, the fit regime) the barrel shifter's SH_KEEP band is REAL residual
+    that the bit-level construction retires.  The block count is pad-invariant."""
+    import os as _os
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=False)
+    sub_nobit = Subset(memory=True, cmp=True, bitwise=False, muldiv=False)
+    prev = _os.environ.get("C4_PACK_MEMCAM")
+    try:
+        _os.environ["C4_PACK_MEMCAM"] = "1" if pack_memcam else "0"
+        QL_full = _Q.QwenFullLayout(code_size, sub, efficient_alu=False)
+        specs_full = _block_specs(QL_full.L, code_size, sub, efficient_alu=False)
+        # bit-level combine keeps only the non-tshift bitwise blocks.
+        shift_blocks = sum(1 for n, _ in specs_full if "tshift" in n)
+        d_bit = QL_full.D_used
+        d_nobit = _Q.QwenFullLayout(code_size, sub_nobit, efficient_alu=False).D_used
+    finally:
+        if prev is None:
+            _os.environ.pop("C4_PACK_MEMCAM", None)
+        else:
+            _os.environ["C4_PACK_MEMCAM"] = prev
+    # residual freed = the bitwise residual delta minus the bit-level combine floor.
+    # The bit-level combine (A_BIT/B_BIT planes + recompose) still needs its bit-plane
+    # bands; the SH_KEEP barrel-shift keep-band is the removable part.  In the pad-on
+    # regime the bitwise residual delta is 0 (bands absorbed by the pad) -> 0 freed.
+    bitwise_residual = d_bit - d_nobit
+    L = QL_full.L
+    bands = sorted((getattr(L, nm), nm) for nm in dir(L)
+                   if not nm.startswith("_") and isinstance(getattr(L, nm, None), int))
+    sh_keep_w = 0
+    for i, (o, nm) in enumerate(bands):
+        if nm == "SH_KEEP":
+            nxt = bands[i + 1][0] if i + 1 < len(bands) else o
+            sh_keep_w = nxt - o
+            break
+    residual_removed = min(sh_keep_w, max(0, bitwise_residual))
+    return shift_blocks, residual_removed
+
+
 def _spec_sizes(config: FitConfig,
                 subset: Optional[Subset] = None) -> Tuple[int, int, int, int]:
     """(hidden, intermediate, stored_layers, applied_depth) at the config's op-subset
     + efficient/recurrent flags (32-bit, the baked path), arch-rescaled.  ``subset``
     overrides ``config.subset`` (used by the subroutine lever, which accounts the
-    stack WITHOUT muldiv baked in)."""
+    stack WITHOUT muldiv baked in).
+
+    The #913 fit levers (``pack_memcam`` / ``overlap_scratch`` / ``bit_level_bitwise``)
+    apply MEASURED reductions to ``d_used`` (and ``bit_level_bitwise`` to the depth):
+    each is a delta computed from the real layout, so the reported geometry is one the
+    build path could realize."""
     sub = subset if subset is not None else config.subset
     eff = config.efficient_alu and (subset is None)   # subroutine drops the baked ALU
     rec = config.recurrent_divmod and (subset is None)
     d_used, inter, n_stored, n_applied = _raw_spec_sizes(
         config.code_size, sub.memory, sub.cmp, sub.bitwise, sub.muldiv, eff, rec)
+
+    # ---- #913 measured residual/depth reductions -----------------------------
+    if config.pack_memcam:
+        d_used -= _packmemcam_saving(config.code_size, sub.memory, sub.cmp,
+                                     sub.bitwise, sub.muldiv, eff, rec)
+    if config.overlap_scratch and eff:
+        total, overlapped, _ = _alu_scratch_overlap(config.code_size, rec)
+        d_used -= max(0, total - overlapped)
+    if config.bit_level_bitwise and sub.bitwise:
+        blocks_removed, res_removed = _bitwise_barrel_saving(
+            config.code_size, config.pack_memcam)
+        d_used -= res_removed
+        n_stored -= blocks_removed
+        n_applied -= blocks_removed
+
     arch = config.arch
     inter = max(inter, arch.num_attention_heads * arch.head_dim, 8)
     hidden = arch.hidden_for(d_used + 1)
-    return hidden, inter, n_stored, n_applied
+    return hidden, inter, max(1, n_stored), max(1, n_applied)
 
 
 def account(config: FitConfig) -> Accounting:
