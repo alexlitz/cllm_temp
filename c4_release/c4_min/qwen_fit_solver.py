@@ -241,6 +241,24 @@ class FitConfig:
                                      #   the 256-entry nibble-LUT. SHL/SHR leave the
                                      #   persistent stack (routed to subroutine/MUL-DIV),
                                      #   dropping the ~17 barrel-shifter blocks.
+    # ---- #916 INLINE-fit lever (attention-CAM DIV, #908) — DEFAULT OFF -----------
+    attn_cam_div: bool = False       # #908 monotone-GE threshold-CAM DIV/MOD: the wide
+                                     #   radix-16 KB-lookahead / GE-threshold quotient-
+                                     #   estimate bank (8 ALU_ bands == 1089 of the 1165
+                                     #   divmod RESIDUAL dims + the 4x 7920-wide lean-kb
+                                     #   FFN estimate blocks) moves OUT of FFN/residual and
+                                     #   INTO ONE softmax1 attention head with 255 SHARED,
+                                     #   divisor-INDEPENDENT KV rows.  Measured (#908
+                                     #   div_radix256_est / attn_radix_div @ 43b5cd74):
+                                     #   the divmod residual scratch drops 1165 -> 277
+                                     #   (the R256E running remainder/divisor/digit/result/
+                                     #   SRT-lane state, NOT the bank), and the max FFN
+                                     #   intermediate the divmod family drives drops from
+                                     #   7920 (lean-kb-c*) to the radix-256 SRT lane
+                                     #   multiplies.  This is the INLINE (in-weights, feed-
+                                     #   forward) muldiv fit lever — DIV/MOD stay on the
+                                     #   persistent stack (UNLIKE subroutine, which exports
+                                     #   them to program STEPS).
 
     @property
     def subset(self) -> Subset:
@@ -484,6 +502,104 @@ def _bitwise_barrel_saving(code_size: int, pack_memcam: bool) -> Tuple[int, int]
     return shift_blocks, residual_removed
 
 
+# ===========================================================================
+# #916 INLINE-fit lever — attention-CAM DIV/MOD (#908).  The wide radix-16
+# KB-lookahead / GE-threshold quotient-estimate BANK moves OUT of FFN/residual
+# and INTO ONE softmax1 attention head with 255 SHARED, divisor-independent KV
+# rows.  Every number below is MEASURED from the real layouts (no model built):
+#
+#   * the removed divmod THRESHOLD bank + the KEPT running state, from the
+#     production nibble_alu32 ALU_ bands (``_alu_scratch_overlap`` families);
+#   * the replacement residual + FFN + depth, from the on-branch #908 SRT
+#     pipeline ``div_radix256_est`` (the estimate block is what the attention
+#     head replaces; the rest of the R256E pipeline is byte-exact-validated).
+# ===========================================================================
+
+# The 8 wide radix-16 divmod bands that ARE the GE-threshold / KB-lookahead
+# quotient-estimate bank (moved to the 255 shared attention KV rows).  The
+# REMAINING divmod ALU_ bands are the running remainder/divisor/digit/result/
+# sign state, which stays in the residual.  (Measured split: bank 1089, running
+# 76, of the 1165 recurrent divmod scratch — see docs/INLINE_FEEDFORWARD_FIT_916.md.)
+_DIVMOD_THRESHOLD_BANK_BANDS = frozenset(
+    {"KB", "GT", "EQ_N", "KB_T", "KB_G0", "KB_P0", "KB_G1", "KB_P1"})
+
+
+@lru_cache(maxsize=None)
+def _attn_cam_div_geometry(code_size: int, recurrent_divmod: bool) -> dict:
+    """MEASURED geometry of the attention-CAM DIV/MOD swap (#908), all read live:
+
+      * ``divmod_residual_before`` — the production radix-16 divmod family
+        residual scratch (the ALU_ divmod bands: 1165 recurrent / 1156 unrolled).
+      * ``divmod_bank`` / ``divmod_running`` — that scratch split into the wide
+        GE-threshold/KB bank (moved to attention KV) and the kept running state.
+      * ``divmod_residual_after`` — the #908 R256E residual scratch (the running
+        remainder/divisor/digit/result/SRT-lane state) that REPLACES it: 277.
+      * ``kv_rows`` — the shared, divisor-independent GE-threshold KV rows (255).
+      * ``r256e_stored`` / ``r256e_applied`` — the R256E SRT pipeline's block
+        count (36 unique / 90 applied at radix-256, 4 digit iterations).
+      * ``r256e_ffn_max`` — the widest FFN block the R256E pipeline keeps (the
+        radix-256 qhat*divisor lane multiply, 9710 — this is the honest INTER
+        tension the radix-256 estimate-CAM trades the wide threshold bank for).
+      * ``inter_without_leankb`` — the inline-ALU max FFN intermediate once the
+        radix-16 lean-kb estimate FFN blocks (7920) leave (the next-widest block).
+      * ``leankb_blocks`` — the radix-16 estimate FFN blocks removed (lean-kb*).
+    """
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=True)
+    QL = _Q.QwenFullLayout(code_size, sub, efficient_alu=True,
+                           recurrent_divmod=recurrent_divmod)
+    names = getattr(QL.L, "_names", {})
+    bank = running = 0
+    for k, (off, w) in names.items():
+        if not k.startswith("ALU_"):
+            continue
+        base = k[len("ALU_"):]
+        if _ALU_FAMILY.get(base) != "divmod":
+            continue
+        if base in _DIVMOD_THRESHOLD_BANK_BANDS:
+            bank += w
+        else:
+            running += w
+    divmod_residual_before = bank + running
+
+    # inline-ALU max FFN intermediate with the radix-16 lean-kb estimate FFN gone.
+    specs = _block_specs(QL.L, code_size, sub, efficient_alu=True,
+                         recurrent_divmod=recurrent_divmod)
+    leankb_blocks = [n for n, _ in specs if n.startswith("lean-kb")]
+    non_kb = [int(s["W_up"].shape[0]) for n, s in specs if not n.startswith("lean-kb")]
+    inter_without_leankb = max(non_kb) if non_kb else 0
+
+    # the #908 R256E replacement geometry (residual + depth + widest FFN), read
+    # live from the on-branch div_radix256_est SRT pipeline (byte-exact validated).
+    from . import div_radix256_est as _E
+    L2 = _E._new_layout()
+    a = L2.R256E
+    RN, NLANE, NITERS = _E._RN, _E._NLANE, _E._NITERS
+    r256e_residual = (32 + 9 + RN + RN + 1 + 1 + RN + RN + RN + 1 + 1 + RN + RN
+                      + NLANE * RN + NLANE * RN + NLANE + NLANE + NLANE + NLANE
+                      + NLANE * RN + NLANE * RN + 1 + 8 + 8 + 8 + 1 + NITERS)
+    unique, apply_names = _E.compile_blocks_recurrent(L2, L2.D)
+    r256e_ffn_max = max((int(s["W_up"].shape[0]) for n, s in unique
+                         if isinstance(s, dict) and "W_up" in s), default=0)
+    est_units = next((int(s["W_up"].shape[0]) for n, s in unique
+                      if n == "r256e-est" and isinstance(s, dict) and "W_up" in s), 0)
+    kv_rows = 255                        # R-1 shared GE-threshold rows (radix 256)
+
+    return {
+        "divmod_residual_before": divmod_residual_before,
+        "divmod_bank": bank,
+        "divmod_running": running,
+        "divmod_residual_after": r256e_residual,      # 277 (the R256E running state)
+        "kv_rows": kv_rows,
+        "est_units_replaced": est_units,              # the FFN GE bank -> KV rows
+        "r256e_stored": len(unique),
+        "r256e_applied": len(apply_names),
+        "r256e_ffn_max": r256e_ffn_max,
+        "inter_without_leankb": inter_without_leankb,
+        "leankb_blocks": len(leankb_blocks),
+    }
+
+
 def _spec_sizes(config: FitConfig,
                 subset: Optional[Subset] = None) -> Tuple[int, int, int, int]:
     """(hidden, intermediate, stored_layers, applied_depth) at the config's op-subset
@@ -494,7 +610,13 @@ def _spec_sizes(config: FitConfig,
     The #913 fit levers (``pack_memcam`` / ``overlap_scratch`` / ``bit_level_bitwise``)
     apply MEASURED reductions to ``d_used`` (and ``bit_level_bitwise`` to the depth):
     each is a delta computed from the real layout, so the reported geometry is one the
-    build path could realize."""
+    build path could realize.
+
+    The #916 fit lever (``attn_cam_div``) is the INLINE DIV/MOD one: it swaps the wide
+    radix-16 GE-threshold BANK for the #908 attention-CAM head (255 shared KV rows), so
+    the divmod residual scratch drops 1165 -> 277, the lean-kb estimate FFN (7920) leaves
+    the intermediate, and the radix-16 long-division blocks are replaced by the R256E SRT
+    pipeline's blocks — all MEASURED from the on-branch layouts."""
     sub = subset if subset is not None else config.subset
     eff = config.efficient_alu and (subset is None)   # subroutine drops the baked ALU
     rec = config.recurrent_divmod and (subset is None)
@@ -515,10 +637,56 @@ def _spec_sizes(config: FitConfig,
         n_stored -= blocks_removed
         n_applied -= blocks_removed
 
+    # ---- #916 INLINE attention-CAM DIV/MOD lever (only for a baked inline ALU) --
+    #   The divmod family's residual scratch drops from its production width to the
+    #   #908 R256E running-state width (1165 -> 277: -888), the radix-16 lean-kb
+    #   estimate FFN (7920) leaves the intermediate, and the radix-16 long-division
+    #   depth is replaced by the R256E SRT pipeline's depth.  All MEASURED live.
+    if config.attn_cam_div and eff and (sub.muldiv):
+        g = _attn_cam_div_geometry(config.code_size, rec)
+        # RESIDUAL: divmod scratch was the MAX-over-families term (overlap) and a SUM
+        #   summand (non-overlap); either way the divmod family shrinks by the same
+        #   (before - after) delta (277 stays the widest op-family, so it is still the
+        #   overlap MAX) -> a single measured d_used reduction.
+        d_used -= max(0, g["divmod_residual_before"] - g["divmod_residual_after"])
+        # INTERMEDIATE: the radix-16 lean-kb GE bank (7920) leaves FFN -> the next
+        #   widest inline block, BUT the radix-256 R256E SRT keeps its own widest FFN
+        #   (the qhat*divisor lane multiply, r256e_ffn_max) — the honest intermediate is
+        #   the wider of the two (the radix-256 estimate-CAM trades the threshold bank
+        #   for a wide per-digit multiply; see the report's intermediate caveat).
+        inter = max(g["inter_without_leankb"], g["r256e_ffn_max"])
+        # DEPTH: the radix-16 long-division blocks (lean-*) are replaced by the R256E
+        #   SRT pipeline blocks.  Recurrent divmod stores the SRT cell once (r256e_stored
+        #   == 36); unrolled feed-forward stores every applied step (r256e_applied == 90).
+        d_before, r256e = _divmod_block_delta(
+            config.code_size, rec, (g["r256e_stored"], g["r256e_applied"]))
+        n_stored += r256e - d_before
+        n_applied += r256e - d_before
+
     arch = config.arch
     inter = max(inter, arch.num_attention_heads * arch.head_dim, 8)
     hidden = arch.hidden_for(d_used + 1)
     return hidden, inter, max(1, n_stored), max(1, n_applied)
+
+
+@lru_cache(maxsize=None)
+def _divmod_block_delta(code_size: int, recurrent_divmod: bool, g_key) -> Tuple[int, int]:
+    """(radix16_divmod_blocks, r256e_replacement_blocks) — the #stored/applied block
+    swap for the attention-CAM DIV/MOD lever.  ``radix16_divmod_blocks`` is the count
+    of the production nibble long-division blocks (``lean-*``, MEASURED live), replaced
+    by the R256E SRT pipeline (recurrent -> its 36 unique cells; unrolled -> its 90
+    applied steps).  ``g_key`` is the #908 geometry dict's (stored, applied) tuple so the
+    lru_cache stays hashable (dicts aren't)."""
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=True)
+    QL = _Q.QwenFullLayout(code_size, sub, efficient_alu=True,
+                           recurrent_divmod=recurrent_divmod)
+    specs = _block_specs(QL.L, code_size, sub, efficient_alu=True,
+                         recurrent_divmod=recurrent_divmod)
+    radix16_divmod_blocks = sum(1 for n, _ in specs if n.startswith("lean-"))
+    r256e_stored, r256e_applied = g_key
+    r256e_blocks = r256e_stored if recurrent_divmod else r256e_applied
+    return radix16_divmod_blocks, r256e_blocks
 
 
 def account(config: FitConfig) -> Accounting:
