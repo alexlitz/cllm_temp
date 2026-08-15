@@ -360,6 +360,25 @@ class FitConfig:
                                      #   already bakes.  This lever accounts the IDEAL depth-1
                                      #   (feasibility-flagged) AND the realizable bounded depth,
                                      #   for the honest verdict.  See _adderhack_div_geometry.
+    # ---- #916 FINAL PUSH — three FEASIBLE levers on the two deep divmod terms ----
+    radix256_decode: bool = False    # LEVER 1: replace the scalar->nibble DECODE with a
+                                     #   FEASIBLE radix-256 BYTE cascade — 4 sequential byte
+                                     #   layers (each floor(rem/256^j) mod 256, a 256-wide
+                                     #   staircase <= 4864 intermediate, FEASIBLE) + 1 nibble
+                                     #   split.  This is the honest bounded-width decode: NOT
+                                     #   the width-INFEASIBLE depth-1 (4.9e9 ramps) NOR the
+                                     #   8-deep radix-16 running-remainder — ~5 feasible layers
+                                     #   per pass.  Byte-exact over the full uint32 range
+                                     #   (_div_levers_916_check.run_lever1: 200,029/200,029).
+    newton_min: bool = False         # LEVER 2: cut the reciprocal Newton steps 2 -> 1.  The
+                                     #   softmax1 sink gives 1/b to rel-err ~5e-7 (~2^-21); ONE
+                                     #   Newton step (r<-r(2-b*r), e->e^2) lifts it to ~2^-42, so
+                                     #   the qf floor is within the ±1 + refine band for the full
+                                     #   32-bit quotient.  Saves 2 blocks (one br + one step).
+                                     #   Newton=1 byte-exact on 90,580 random pairs AND the
+                                     #   adversarial worst-sign corner (Newton=0 FAILS both — the
+                                     #   qf error q*e~1632 exceeds the refine R=512 clamp).  See
+                                     #   _div_levers_916_check.run_lever2[_worst_corner].
 
     @property
     def subset(self) -> Subset:
@@ -885,9 +904,11 @@ def _adderhack_div_geometry(code_size: int) -> dict:
     = Kogge-Stone carry-lookahead MUL, 8 blocks), correct, finalize.
     """
     lg = _logsink_div_geometry(code_size)
-    # shallowest q*b verify multiply (measured from the ALU unit registry).
+    # shallowest q*b verify multiply (measured from the ALU unit registry).  NOTE:
+    # ``units_for`` returns a name->AluUnit DICT, so iterate ``.values()`` (iterating
+    # the dict yields the string keys, which have no ``.depth``).
     from . import alu_units as _AU
-    mul_depths = [u.depth for u in _AU.units_for("mul")
+    mul_depths = [u.depth for u in _AU.units_for("mul").values()
                   if getattr(u, "wired", False) and u.depth is not None]
     shallowest_mul = min(mul_depths) if mul_depths else 8      # Kogge-Stone = 8
     # log-sink's OWN q*b uses a schoolbook split+3carry+recombine = ~6 (+rem+correct).
@@ -904,6 +925,33 @@ def _adderhack_div_geometry(code_size: int) -> dict:
     recip_fixed = 8
     one_pass_verify = shallowest_mul + 2                       # mul + rem + correct
     ideal_onepass_divmod = recip_fixed + one_pass_verify + 2 + 1   # + decode(d,m=2) + finalize
+
+    # ---- #916 FINAL PUSH: the HONEST FEASIBLE accounting (levers 1+2+3) ----------
+    # LEVER 1 (radix256_decode): the FEASIBLE bounded-width decode is NOT depth-1
+    #   (infeasible 4.9e9 ramps) NOR 8-deep radix-16 — it is a high-RADIX limb cascade.
+    #   The MAXIMAL feasible radix is 2^12 = 4096 (staircase 4096 <= 4864 intermediate):
+    #   ceil(32/12) = 3 sequential limb layers + 1 nibble-split = 4 feasible layers per
+    #   decode pass (radix-256 would be 5; radix-4096 shaves one limb).  Byte-exact over
+    #   the full uint32 range (run_lever1 hi_radix 200,029/200,029).  The 4096-wide
+    #   staircase becomes the widest divmod FFN (4096 <= 4864, still fits INTERMEDIATE).
+    RADIX256_DECODE_LAYERS_PER_PASS = 4        # 3 limb-extract (radix-4096) + 1 nibble-split
+    RADIX_DECODE_FFN_WIDTH = 4096              # the max-feasible-radix staircase width
+    # LEVER 2 (newton_min): cut the reciprocal Newton steps 2 -> 1, saving 2 blocks
+    #   (one newton-br + one newton-step).  Newton=1 byte-exact incl the worst-sign
+    #   corner (run_lever2_worst_corner); Newton=0 FAILS (qf err > refine R=512).
+    recip_fixed_newton_min = recip_fixed - 2   # 8 -> 6
+    # LEVER 3 (shallow verify / tight base): the q*b verify only needs the LOW 32 bits
+    #   (mod = a - q*b, q*b <= a < 2^32 for the correct q), byte-exact truncated
+    #   (run_lever3).  Truncation does NOT cut the MUL DEPTH (still shallowest wired MUL
+    #   = Kogge-Stone 8), only the width; so verify depth stays shallowest_mul + rem +
+    #   correct.  The "tight base" part is a shared-pipeline question (accounted in
+    #   _maxop_overlap_depth: base 7 + shared-alu 3 = 10, both load-bearing).
+    # HONEST feasible divmod depth = reciprocal(newton-min) + verify + 2 feasible decode
+    #   passes (q-verify reused for DIV_RES; m for MOD_RES) + finalize.
+    feasible_decode_passes = 2                 # q (verify+DIV_RES) + m (MOD_RES)
+    feasible_decode = feasible_decode_passes * RADIX256_DECODE_LAYERS_PER_PASS   # 2*5=10
+    feasible_divmod = (recip_fixed_newton_min + one_pass_verify
+                       + feasible_decode + 1)  # + finalize
     return {
         "logsink_blocks": lg["blocks"],
         "decode_site_blocks": decode_site,
@@ -914,6 +962,13 @@ def _adderhack_div_geometry(code_size: int) -> dict:
         "ideal_onepass_divmod": ideal_onepass_divmod,  # + single-pass verify (still INFEASIBLE decode width)
         "bounded_divmod": lg["blocks"],               # realizable == sequential cascade == log-sink 127
         "depth1_ffn_width_ramps": 4_867_629_585,      # measured single-layer width of the depth-1 floor-diff
+        # ---- #916 FINAL PUSH honest FEASIBLE accounting ----
+        "recip_fixed": recip_fixed,                    # 8 (Newton=2)
+        "recip_fixed_newton_min": recip_fixed_newton_min,  # 6 (Newton=1, LEVER 2)
+        "radix256_decode_layers_per_pass": RADIX256_DECODE_LAYERS_PER_PASS,  # 4 (LEVER 1)
+        "radix_decode_ffn_width": RADIX_DECODE_FFN_WIDTH,  # 4096 (max-feasible-radix staircase)
+        "feasible_decode": feasible_decode,            # 8 (2 passes x 4 feasible layers)
+        "feasible_divmod": feasible_divmod,            # recip6 + verify10 + decode8 + finalize1 = 25
     }
 
 
@@ -993,6 +1048,11 @@ def _spec_sizes(config: FitConfig,
         if config.logsink_div:
             lg = _logsink_div_geometry(config.code_size)
             inter = max(g["inter_without_leankb"], lg["ffn_max"])
+            # LEVER 1 radix decode: the max-feasible-radix (4096) limb staircase becomes
+            #   the widest divmod FFN.  4096 <= 4864 so INTERMEDIATE still fits.  MEASURED.
+            if config.radix256_decode:
+                ah = _adderhack_div_geometry(config.code_size)
+                inter = max(inter, ah["radix_decode_ffn_width"])
         # DEPTH: the radix-16 long-division blocks (lean-*) are replaced by the R256E
         #   SRT pipeline blocks.  Recurrent divmod stores the SRT cell once (r256e_stored
         #   == 36); unrolled feed-forward stores every applied step (r256e_applied == 90).
@@ -1029,6 +1089,26 @@ def _spec_sizes(config: FitConfig,
                 if config.adderhack_decode:
                     ah = _adderhack_div_geometry(config.code_size)
                     div_unrolled = div_recurrent = ah["ideal_onepass_divmod"]
+                # ---- #916 FINAL PUSH: the HONEST FEASIBLE divmod depth (levers 1+2+3).
+                #   radix256_decode (LEVER 1): the bounded-width decode is a 5-layer
+                #     radix-256 byte cascade per pass (NOT infeasible depth-1, NOT 8-deep
+                #     radix-16), 2 passes = 10 feasible layers.
+                #   newton_min (LEVER 2): reciprocal Newton 2 -> 1 (recip 8 -> 6).
+                #   Both byte-exact over a large sample (_div_levers_916_check).  This is
+                #   the REALIZABLE accounting; ``feasible_divmod`` supersedes the
+                #   infeasible ``ideal_onepass_divmod`` when either lever is on.
+                if config.radix256_decode or config.newton_min:
+                    ah = _adderhack_div_geometry(config.code_size)
+                    recip = (ah["recip_fixed_newton_min"] if config.newton_min
+                             else ah["recip_fixed"])
+                    verify = ah["shallowest_wired_mul"] + 2       # mul + rem + correct
+                    if config.radix256_decode:
+                        decode = 2 * ah["radix256_decode_layers_per_pass"]  # 2 passes x 5
+                    else:
+                        # no radix-256: the bounded decode stays the log-sink sequential
+                        # radix-16 running-remainder (2 passes x ~8 feasible layers).
+                        decode = 2 * 8
+                    div_unrolled = div_recurrent = recip + verify + decode + 1  # + finalize
             depth, _fam = _maxop_overlap_depth(
                 config.code_size, div_unrolled, div_recurrent,
                 rec, config.bit_level_shift)

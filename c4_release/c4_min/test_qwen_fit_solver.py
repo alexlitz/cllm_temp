@@ -758,3 +758,122 @@ def test_adderhack_decode_default_off_is_byte_identical():
     base = _inline_ff()
     assert (on_nolog.hidden, on_nolog.intermediate, on_nolog.stored_layers) == \
            (base.hidden, base.intermediate, base.stored_layers) == (3008, 7920, 123)
+
+
+# ===========================================================================
+# #916 FINAL PUSH — the three FEASIBLE levers on the two deep divmod terms.
+# LEVER 1 (radix256_decode): the bounded-width decode is a max-feasible-radix
+#   (radix-4096, 3-limb) cascade = 4 feasible layers/pass (NOT the infeasible
+#   depth-1, NOT 8-deep radix-16).  LEVER 2 (newton_min): reciprocal Newton 2->1.
+#   LEVER 3 (shallow-verify/tight-base): the q*b product is structurally required
+#   for MOD and already the shallowest wired MUL; base is already 7 (no depth cut).
+# MEASURED feasible result: divmod 25 + shared 10 = inline+FF 35 — WIDTH still fits
+#   (896 / 4096 <= 4864) but DEPTH 35 > 28 (1.5B) > 24 (0.5B): does NOT close.
+#   Every changed div sub-block is byte-exact over a large sample
+#   (_div_levers_916_check).  All levers DEFAULT OFF.
+# ===========================================================================
+def test_final_push_geometry_is_measured_feasible():
+    g = S._adderhack_div_geometry(24)
+    assert g["recip_fixed"] == 8                  # Newton=2 reciprocal
+    assert g["recip_fixed_newton_min"] == 6       # Newton=1 (LEVER 2) saves 2 blocks
+    assert g["radix256_decode_layers_per_pass"] == 4   # max-feasible-radix (4096, 3-limb)+split
+    assert g["radix_decode_ffn_width"] == 4096    # staircase width, <= 4864 INTERMEDIATE
+    assert g["feasible_decode"] == 8              # 2 passes x 4 feasible layers
+    # feasible divmod = recip6 + verify10 + decode8 + finalize1 = 25 (byte-exact bounded)
+    assert g["feasible_divmod"] == 25
+    # honest: the feasible bounded divmod (25) is BETWEEN the infeasible depth-1 ideal
+    # (21) and the un-levered radix-16 log-sink (127).
+    assert g["ideal_onepass_divmod"] < g["feasible_divmod"] < g["bounded_divmod"]
+
+
+def test_final_push_radix_decode_lever():
+    # LEVER 1: the max-feasible-radix decode cuts the divmod cascade from the log-sink
+    # 127 to a bounded-width feasible depth; the 4096-wide staircase becomes the widest
+    # divmod FFN (4096 <= 4864, INTERMEDIATE still fits).
+    logsink = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                         bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+                         logsink_div=True)
+    radix = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                       bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+                       logsink_div=True, radix256_decode=True)
+    assert radix.stored_layers < logsink.stored_layers      # feasible decode is shallower
+    assert radix.stored_layers == 37                        # shared 10 + divmod 27 (Newton=2)
+    assert radix.intermediate == 4096                       # max-radix staircase FFN width
+    assert radix.intermediate <= 4864                       # still fits INTERMEDIATE
+    assert radix.hidden <= 896                              # WIDTH fits
+
+
+def test_final_push_newton_min_lever():
+    # LEVER 2: Newton 2 -> 1 saves 2 reciprocal blocks (byte-exact incl the adversarial
+    # worst-sign corner; Newton=0 FAILS the refine R=512 clamp).
+    radix = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                       bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+                       logsink_div=True, radix256_decode=True)
+    both = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                      bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+                      logsink_div=True, radix256_decode=True, newton_min=True)
+    assert both.stored_layers == radix.stored_layers - 2    # 2 fewer reciprocal blocks
+    assert both.stored_layers == 35                         # shared 10 + divmod 25
+
+
+def test_final_push_does_not_close_depth_for_any_stock_model():
+    # THE GOAL VERDICT (feasible, byte-exact): all three levers applied, the inline +
+    # feed-forward depth is 35 — WIDTH fits (896 / 4096 <= 4864) but DEPTH 35 exceeds
+    # EVERY stock cap: 0.5B (24), 1.5B (28), 7B (28).  The divmod residual (reciprocal
+    # + the structurally-required q*b product + the 2 decode passes) is the irreducible
+    # feed-forward binder; no stock model closes on DEPTH.
+    both = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                      bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+                      logsink_div=True, radix256_decode=True, newton_min=True)
+    assert both.hidden <= 896 and both.intermediate <= 4864     # WIDTH fits
+    assert both.stored_layers == 35
+    for tgt in ("stock-0.5b", "stock-1.5b", "stock-7b"):
+        assert both.stored_layers > S.STOCK_TARGETS[tgt].layers  # DEPTH binds everywhere
+
+
+def test_final_push_levers_default_off_are_byte_identical():
+    # radix256_decode + newton_min DEFAULT OFF -> the accounting is the prior-pass one.
+    off = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                     bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+                     logsink_div=True)
+    assert off.stored_layers == 137              # both levers OFF -> log-sink schoolbook
+    # the levers are no-ops WITHOUT logsink_div (they only rewrite the log-sink divmod).
+    base = _inline_ff()
+    r_nolog = _inline_ff(radix256_decode=True)
+    n_nolog = _inline_ff(newton_min=True)
+    for a in (r_nolog, n_nolog):
+        assert (a.hidden, a.intermediate, a.stored_layers) == \
+               (base.hidden, base.intermediate, base.stored_layers) == (3008, 7920, 123)
+
+
+# ===========================================================================
+# #916 FINAL PUSH — BYTE-EXACTNESS of every changed div sub-block (a small,
+# fast sample; the full 200k-value stress is in _div_levers_916_check.__main__).
+# Confirms the depth accounting above is GROUNDED: the radix-256/-4096 decode,
+# the reduced-Newton reciprocal, and the truncated q*b verify are all byte-exact.
+# ===========================================================================
+def test_final_push_radix_decode_is_byte_exact():
+    from c4_min import _div_levers_916_check as C
+    r = C.run_lever1(20000)                       # 20k values (fast)
+    assert r["byte_ok"] == r["total"]             # radix-256 byte decode
+    assert r["nib_ok"] == r["total"]              # radix-256 -> 8 nibbles
+    assert r["hi_radix_ok"] == r["total"]         # radix-4096 (3-limb) decode
+
+
+def test_final_push_newton_min_is_byte_exact():
+    from c4_min import _div_levers_916_check as C
+    # Newton=1 byte-exact on the random sample AND the adversarial worst-sign corner;
+    # Newton=0 FAILS both (the honest minimum is 1).
+    r = C.run_lever2(8000, worst_relerr=5e-7)
+    assert r[1]["ok"] == r[1]["total"]            # Newton=1 exact
+    assert r[2]["ok"] == r[2]["total"]            # Newton=2 exact
+    assert r[0]["ok"] < r[0]["total"]             # Newton=0 NOT exact (needs >=1)
+    c = C.run_lever2_worst_corner(worst_relerr=5e-7, refine_R=512)
+    assert c[1]["ok"] == c[1]["total"]            # Newton=1 exact at the corner
+    assert c[0]["ok"] < c[0]["total"]             # Newton=0 fails the R=512 refine clamp
+
+
+def test_final_push_truncated_verify_is_byte_exact():
+    from c4_min import _div_levers_916_check as C
+    r = C.run_lever3(8000, newton_steps=1)
+    assert r["ok"] == r["total"]                  # truncated-to-32-bit q*b byte-exact
