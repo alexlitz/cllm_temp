@@ -569,3 +569,71 @@ def test_overlap_scratch_reduces_inline_alu_but_divmod_still_binds():
     assert on.hidden <= off.hidden          # overlap narrows the residual
     assert on.hidden > 896                  # ...but divmod scratch still binds
     assert not _fits_05b(on)
+
+
+# ===========================================================================
+# #916 continued — INLINE + FEED-FORWARD fit levers (attn-CAM DIV LR-dup removal,
+# bit-level SHIFT, op-overlap max-op DEPTH).  All default OFF (byte-identical base).
+# ===========================================================================
+def _inline_ff(**kw):
+    base = dict(ops=S.FULL, muldiv_strategy="efficient-ALU-unrolled", precision=32,
+                code_size=24)
+    base.update(kw)
+    return S.account(S.FitConfig(**base))
+
+
+def test_attn_cam_div_removes_the_duplicate_LR_lean_radix_residual():
+    # attn_cam_div swaps the radix-16 lean-radix DIV for the R256E attention-CAM head,
+    # so BOTH the ALU_* divmod scratch (1156) AND the DUPLICATE LR_* lean-radix datapath
+    # (480, touched only by the removed lean-* blocks) leave the residual -> hidden drops
+    # to <=896.  (Without the LR-dup removal the residual would be ~480 too wide.)
+    g = S._attn_cam_div_geometry(24, False)
+    assert g["lr_dup_residual"] > 0                     # the duplicate datapath is real
+    off = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True)
+    on = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                    attn_cam_div=True)
+    assert on.hidden < off.hidden                       # divmod+LR leave the residual
+
+
+def test_bit_level_shift_retires_the_dead_barrel_shifter_residual():
+    # SHL/SHR via native MUL/DIV (shift_via_mul, the fit regime) leaves the barrel-shifter
+    # RESIDUAL (SH_STAGE_* 160 + TS_* 118 = 278) allocated but touched by NO block; the
+    # bit_level_shift lever retires that dead residual -> hidden 960 -> 896.
+    saving = S._bitlevel_shift_saving(24, True)
+    assert saving >= 278
+    off = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                     attn_cam_div=True)
+    on = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                    bit_level_shift=True, attn_cam_div=True)
+    assert on.hidden < off.hidden
+    assert on.hidden <= 896
+
+
+def test_inline_ff_hidden_and_inter_FIT_but_depth_binds():
+    # THE #916-continued result: inline + feed-forward (no subroutine, no loop) FITS the
+    # stock 0.5B WIDTH — hidden <= 896 AND inter <= 4864 — but the DIV/MOD unrolled
+    # digit-recurrence (~98 layers) makes the op-overlap max-op DEPTH ~108 > 24, so it
+    # does NOT fit stock DEPTH as a feed-forward (unrolled) transformer.
+    a = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                   bit_level_shift=True, attn_cam_div=True, overlap_depth=True)
+    assert a.hidden <= 896                               # WIDTH fits
+    assert a.intermediate <= 4864                        # INTERMEDIATE fits
+    assert a.stored_layers > 24                          # DEPTH binds (divmod unrolled)
+
+
+def test_overlap_depth_is_maxop_not_sum():
+    # op-overlap: only one opcode fires per step -> depth = shared pipeline + deepest
+    # single op-family cascade (max-op), strictly LESS than the SUMMED unrolled depth.
+    summed = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                        bit_level_shift=True, attn_cam_div=True)
+    maxop = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                       bit_level_shift=True, attn_cam_div=True, overlap_depth=True)
+    assert maxop.stored_layers < summed.stored_layers   # max-op < sum
+    assert maxop.stored_layers > 24                      # ...still > 24 (divmod unrolled)
+
+
+def test_new_levers_default_off_leave_base_accounting_unchanged():
+    # every #916-continued lever defaults OFF -> the base inline-ALU accounting is
+    # byte-identical to the prior pass (3008 / 7920 / 123).
+    a = _inline_ff()
+    assert (a.hidden, a.intermediate, a.stored_layers) == (3008, 7920, 123)

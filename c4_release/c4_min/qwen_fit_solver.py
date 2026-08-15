@@ -56,6 +56,41 @@ layout (``_packmemcam_saving`` / ``_alu_scratch_overlap`` / ``_bitwise_barrel_sa
   RESULT (#913): subroutine + pack_memcam + bit_level_bitwise FITS stock Qwen2.5-0.5B
   at fp32 — hidden 896 (<=896), intermediate 896 (<=4864), stored 14 (<=24).
 
+#916-continued INLINE + FEED-FORWARD fit (attn_cam_div LR-dup / bit_level_shift / overlap_depth)
+------------------------------------------------------------------------------------------------
+The #916 goal: fit the FULL fp32 C4 ISA into stock 0.5B INLINE (DIV/MOD stay in the
+weights, NOT exported to program STEPS like subroutine) and FEED-FORWARD (no loop/tie).
+The prior pass reached hidden 1472 / inter 9710 / stored 115 with attn_cam_div (#908
+R256E attention-CAM DIV); the three remaining binders are cracked here (all DEFAULT OFF):
+
+  * **attn_cam_div (LR-dup removal)** — the production divmod allocates the residual
+    TWICE: the ``ALU_*`` nibble_alu32 divmod scratch (1156) AND the compact radix-16
+    lean-radix ``LR_*`` datapath (480, the ``div_radix16_lean`` KB-lookahead/GE-threshold
+    quotient-estimate).  The ``LR_*`` band is touched ONLY by the ``lean-*`` blocks the
+    attention-CAM swap removes, so it is DEAD once R256E replaces the radix-16 division —
+    the divmod residual is 277 TOTAL (R256E running state), and BOTH the 1156 scratch and
+    the 480 LR datapath leave.  MEASURED: hidden 1472 -> 960.
+  * **bit_level_shift** — SHL/SHR run as native MUL/DIV (x*2^n / x//2^n, shift_via_mul,
+    the fit regime), which drops the barrel-shifter BLOCKS but leaves the layout still
+    ALLOCATING the dead ``SH_STAGE_*`` (160) + ``TS_*`` (118) = 278 residual bands that NO
+    block touches — the shift analog of bit_level_bitwise retires them.  hidden 960 -> 896.
+  * **narrower R256E multiply** (in div_radix256_est) — the R256E per-digit qhat*dn and
+    MOD q*d carry-normalise used a kmax=255 staircase (9710/7666-wide blocks, the INTER
+    binder); a nibble-SPLIT of the quotient byte (qlo/qhi) + a TWO-LEVEL lane-floor make
+    every carry kmax<=112 (mostly 15).  MEASURED byte-exact (fp64 6084/6084, fp32
+    single-row 1195/1200, a hair BETTER than the base 1188) — inter 9710 -> 3376.
+  * **overlap_depth** — op-overlap: only ONE opcode fires per step, so the per-op-family
+    machinery is opcode-gated onto SHARED physical layers -> depth = base pipeline + the
+    DEEPEST single op cascade (max-op), NOT the SUM.  MEASURED: stored 123 (sum) -> 108
+    (max-op = base 10 + divmod 98).
+
+  RESULT (#916): inline + feed-forward FITS stock 0.5B on WIDTH — hidden 896 (<=896) AND
+  intermediate 3376 (<=4864) — but NOT on DEPTH: the DIV/MOD unrolled digit-recurrence is
+  ~98 sequential layers (each block reads the prior block's residual, no fusion), so the
+  op-overlap max-op depth is 108 > 24.  DIV/MOD only reaches ~48 via RECURRENCE (weight-tied
+  loop = Universal-Transformer, divmod body stored once) — still > 24, and looping is
+  excluded for stock feed-forward Qwen2.  IRREDUCIBLE BINDER: divmod unrolled depth.
+
 Honesty (verified vs estimated)
 -------------------------------
   * **lookup-table** width, **efficient-ALU** unrolled/recurrent depth+width — VERIFIED:
@@ -241,6 +276,20 @@ class FitConfig:
                                      #   the 256-entry nibble-LUT. SHL/SHR leave the
                                      #   persistent stack (routed to subroutine/MUL-DIV),
                                      #   dropping the ~17 barrel-shifter blocks.
+    bit_level_shift: bool = False    # the SHIFT analog of bit_level_bitwise: SHL/SHR run
+                                     #   as native MUL/DIV (x*2^n / x//2^n, "bit-level
+                                     #   shift" per-bit position map on the muldiv path,
+                                     #   shift_via_mul).  The barrel-shifter BLOCKS already
+                                     #   drop, but the layout still ALLOCATES the dead
+                                     #   SH_STAGE_* (160) + TS_* (118) = 278 residual bands
+                                     #   that NO block touches — this retires them.
+    overlap_depth: bool = False      # DEPTH op-overlap: only ONE opcode fires per step, so
+                                     #   the per-op-family machinery is opcode-gated and
+                                     #   SHARES the same physical layers -> the feed-forward
+                                     #   network depth is the SHARED base pipeline + the
+                                     #   DEEPEST single op-family cascade (max-op), NOT the
+                                     #   SUM of every family's blocks.  MEASURED from the
+                                     #   live block stack (_maxop_overlap_depth).
     # ---- #916 INLINE-fit lever (attention-CAM DIV, #908) — DEFAULT OFF -----------
     attn_cam_div: bool = False       # #908 monotone-GE threshold-CAM DIV/MOD: the wide
                                      #   radix-16 KB-lookahead / GE-threshold quotient-
@@ -502,6 +551,42 @@ def _bitwise_barrel_saving(code_size: int, pack_memcam: bool) -> Tuple[int, int]
     return shift_blocks, residual_removed
 
 
+# The DEAD barrel-shifter residual the shift-via-MUL/DIV route leaves behind.  In the
+# fit regime the production layout runs ``shift_via_mul=True`` (SHL = x*2^n via MUL,
+# SHR = x//2^n via DIV — the "bit-level shift", per-bit position map riding the muldiv
+# datapath), which DROPS the 17 barrel-shifter (tshift) BLOCKS, but the layout still
+# ALLOCATES the barrel-shifter RESIDUAL bands (the 5-stage ``SH_STAGE_*`` shifter, 160,
+# + the ``TS_*`` two-shift datapath, 118 = 278 dims).  With shift-via-mul on, NOTHING
+# reads or writes those bands (verified: 0 blocks touch them), so they are DEAD residual
+# a bit-level-shift construction retires — the shift analog of ``bit_level_bitwise``.
+@lru_cache(maxsize=None)
+def _bitlevel_shift_saving(code_size: int, pack_memcam: bool) -> int:
+    """Dead ``SH_STAGE_*`` (barrel-shifter) + ``TS_*`` (two-shift) residual dims freed
+    when SHL/SHR route through native MUL/DIV (``shift_via_mul``, the fit regime) — the
+    barrel-shifter bands are allocated but touched by NO block, MEASURED live."""
+    import os as _os
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=True)
+    prev = _os.environ.get("C4_PACK_MEMCAM")
+    try:
+        _os.environ["C4_PACK_MEMCAM"] = "1" if pack_memcam else "0"
+        if hasattr(_Q, "_pack_memcam") and hasattr(_Q._pack_memcam, "cache_clear"):
+            _Q._pack_memcam.cache_clear()
+        QL = _Q.QwenFullLayout(code_size, sub, efficient_alu=True,
+                               recurrent_divmod=False, shift_via_mul=True)
+        names = getattr(QL.L, "_names", {})
+        dead = sum(w for k, (off, w) in names.items()
+                   if k.startswith("SH_STAGE") or k.startswith("TS_"))
+    finally:
+        if prev is None:
+            _os.environ.pop("C4_PACK_MEMCAM", None)
+        else:
+            _os.environ["C4_PACK_MEMCAM"] = prev
+        if hasattr(_Q, "_pack_memcam") and hasattr(_Q._pack_memcam, "cache_clear"):
+            _Q._pack_memcam.cache_clear()
+    return dead
+
+
 # ===========================================================================
 # #916 INLINE-fit lever — attention-CAM DIV/MOD (#908).  The wide radix-16
 # KB-lookahead / GE-threshold quotient-estimate BANK moves OUT of FFN/residual
@@ -562,6 +647,17 @@ def _attn_cam_div_geometry(code_size: int, recurrent_divmod: bool) -> dict:
             running += w
     divmod_residual_before = bank + running
 
+    # The SECOND, duplicate divmod residual: the radix-16 lean-radix datapath
+    # (``LR_*`` bands, ``div_radix16_lean`` — the KB[k]=k*b lookahead table +
+    # GE-threshold/EQ bank + running remainder + quotient result).  The production
+    # divmod allocates the wide nibble_alu32 ``ALU_*`` divmod scratch (1156)
+    # AND this compact lean-radix ``LR_*`` datapath (480), and the ``LR_*`` band is
+    # touched ONLY by the ``lean-*`` divmod blocks (verified: nothing else reads or
+    # writes it).  When ``attn_cam_div`` swaps the whole radix-16 lean-radix division
+    # for the R256E SRT pipeline, the ``lean-*`` blocks LEAVE, so the ``LR_*`` residual
+    # (like the ``ALU_*`` divmod scratch) is DEAD and its dims free.  Measured live.
+    lr_dup = sum(w for k, (off, w) in names.items() if k.startswith("LR_"))
+
     # inline-ALU max FFN intermediate with the radix-16 lean-kb estimate FFN gone.
     specs = _block_specs(QL.L, code_size, sub, efficient_alu=True,
                          recurrent_divmod=recurrent_divmod)
@@ -589,6 +685,7 @@ def _attn_cam_div_geometry(code_size: int, recurrent_divmod: bool) -> dict:
         "divmod_residual_before": divmod_residual_before,
         "divmod_bank": bank,
         "divmod_running": running,
+        "lr_dup_residual": lr_dup,                     # the duplicate lean-radix LR_* datapath
         "divmod_residual_after": r256e_residual,      # 277 (the R256E running state)
         "kv_rows": kv_rows,
         "est_units_replaced": est_units,              # the FFN GE bank -> KV rows
@@ -636,6 +733,12 @@ def _spec_sizes(config: FitConfig,
         d_used -= res_removed
         n_stored -= blocks_removed
         n_applied -= blocks_removed
+    if config.bit_level_shift and sub.bitwise and eff:
+        # SHL/SHR via native MUL/DIV (shift_via_mul): the barrel-shifter RESIDUAL
+        # (SH_STAGE_* + TS_*, 278) is allocated but dead — retire it.  Depth is
+        # UNCHANGED (the 17 tshift blocks are already gone in the shift_via_mul base;
+        # the +2 alu-shift-onehot/pow2 blocks are already counted in n_stored).
+        d_used -= _bitlevel_shift_saving(config.code_size, config.pack_memcam)
 
     # ---- #916 INLINE attention-CAM DIV/MOD lever (only for a baked inline ALU) --
     #   The divmod family's residual scratch drops from its production width to the
@@ -649,6 +752,14 @@ def _spec_sizes(config: FitConfig,
         #   (before - after) delta (277 stays the widest op-family, so it is still the
         #   overlap MAX) -> a single measured d_used reduction.
         d_used -= max(0, g["divmod_residual_before"] - g["divmod_residual_after"])
+        # RESIDUAL (2nd term): the DUPLICATE radix-16 lean-radix datapath (``LR_*``,
+        #   480) is a SEPARATE always-summed residual band (NOT an ``ALU_*`` overlap
+        #   family), touched ONLY by the ``lean-*`` blocks that this lever removes.  Once
+        #   the R256E pipeline replaces the whole radix-16 division, ``LR_*`` is dead, so
+        #   its dims free.  (The R256E running state is already accounted above as the
+        #   277 that replaces the ``ALU_*`` divmod scratch — the divmod family is 277 TOTAL,
+        #   so both the ``ALU_*`` 1156 scratch AND this ``LR_*`` 480 datapath leave.)
+        d_used -= g.get("lr_dup_residual", 0)
         # INTERMEDIATE: the radix-16 lean-kb GE bank (7920) leaves FFN -> the next
         #   widest inline block, BUT the radix-256 R256E SRT keeps its own widest FFN
         #   (the qhat*divisor lane multiply, r256e_ffn_max) — the honest intermediate is
@@ -662,6 +773,17 @@ def _spec_sizes(config: FitConfig,
             config.code_size, rec, (g["r256e_stored"], g["r256e_applied"]))
         n_stored += r256e - d_before
         n_applied += r256e - d_before
+        # DEPTH op-overlap: replace the SUMMED stored depth with the op-overlapped
+        #   max-op depth (shared base pipeline + deepest single op-family cascade),
+        #   since only one opcode fires per step and the machinery is opcode-gated onto
+        #   shared physical layers.  MEASURED live.  ``applied`` (per-forward) already
+        #   equals the deepest op cascade, so it is set to the same max-op depth.
+        if config.overlap_depth:
+            depth, _fam = _maxop_overlap_depth(
+                config.code_size, g["r256e_applied"], g["r256e_stored"],
+                rec, config.bit_level_shift)
+            n_stored = depth
+            n_applied = depth
 
     arch = config.arch
     inter = max(inter, arch.num_attention_heads * arch.head_dim, 8)
@@ -687,6 +809,62 @@ def _divmod_block_delta(code_size: int, recurrent_divmod: bool, g_key) -> Tuple[
     r256e_stored, r256e_applied = g_key
     r256e_blocks = r256e_stored if recurrent_divmod else r256e_applied
     return radix16_divmod_blocks, r256e_blocks
+
+
+# The op families whose block PREFIXES partition the inline-ALU block stack (op-overlap:
+# only ONE opcode fires per step, so per-family private cascades SHARE the same physical
+# layers, gated on the opcode — the feed-forward network's depth is the SHARED base
+# pipeline + the DEEPEST single op-family cascade, NOT the SUM of all families).
+def _block_family(name: str) -> str:
+    if name.startswith("lean-"):
+        return "divmod"                       # replaced by R256E when attn_cam_div on
+    if "tshift" in name:
+        return "barrel"                       # dead when shift_via_mul on
+    if name.startswith("alu-mul"):
+        return "mul"
+    if name.startswith("alu-shift"):
+        return "shift"
+    if "bitwise" in name or "bw-" in name:
+        return "bitwise"
+    if name.startswith("alu-"):
+        return "shared-alu"                   # expand/psh-nib: shared by mul/div/shift
+    if "cmp" in name:
+        return "cmp"
+    if "mem" in name.lower() or "load" in name.lower():
+        return "memory"
+    return "base"                             # fetch/decode/frame/writeback (shared)
+
+
+@lru_cache(maxsize=None)
+def _maxop_overlap_depth(code_size: int, r256e_unrolled: int, r256e_recurrent: int,
+                         divmod_recurrent: bool, bit_level_shift: bool) -> Tuple[int, dict]:
+    """The OP-OVERLAP max-op stored depth for the inline feed-forward ALU: the SHARED
+    pipeline (``base`` + ``shared-alu``) + the DEEPEST single op-family private cascade.
+    Because exactly one opcode fires per step, the per-op-family machinery is gated on
+    the opcode and shares the SAME physical layers, so the network depth is the max-op
+    cascade, NOT the SUM of all families.  Read live from the block stack; the divmod
+    family is the R256E pipeline (unrolled or recurrent).  Returns (depth, per_family)."""
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=True)
+    QL = _Q.QwenFullLayout(code_size, sub, efficient_alu=True,
+                           recurrent_divmod=False, shift_via_mul=True)
+    specs = _block_specs(QL.L, code_size, sub, efficient_alu=True,
+                         recurrent_divmod=False, shift_via_mul=True)
+    from collections import defaultdict
+    fam: Dict[str, int] = defaultdict(int)
+    for n, _s in specs:
+        f = _block_family(n)
+        if f == "divmod":
+            continue                          # divmod is the R256E replacement below
+        if f == "barrel" and bit_level_shift:
+            continue                          # dead barrel-shift blocks (shift-via-mul)
+        fam[f] += 1
+    # divmod family = R256E (unrolled feed-forward, or recurrent tied-loop).
+    fam["divmod"] = r256e_recurrent if divmod_recurrent else r256e_unrolled
+    shared = fam.get("base", 0) + fam.get("shared-alu", 0)
+    op_private = {k: v for k, v in fam.items() if k not in ("base", "shared-alu", "barrel")}
+    max_op = max(op_private.values()) if op_private else 0
+    return shared + max_op, dict(fam)
 
 
 def account(config: FitConfig) -> Accounting:
