@@ -701,3 +701,60 @@ def test_logsink_div_default_off_is_byte_identical():
     assert (on.hidden, on.intermediate, on.stored_layers, on.applied_depth) == \
            (base.hidden, base.intermediate, base.stored_layers, base.applied_depth) == \
            (3008, 7920, 123, 123)
+
+
+# ===========================================================================
+# #916 continued — ADDER-HACK decode depth lever (blogspec §Position Offset).
+# Tests whether the place-value nibble decode (d_j = floor(v/16^j) mod 16, each
+# nibble INDEPENDENT -> depth-1) closes the DEPTH that the log-sink schoolbook
+# running-remainder decode (4 x 8-deep) left binding.  MEASURED result: the
+# depth-1 decode is BYTE-EXACT (fp64) but WIDTH-INFEASIBLE (~4.9e9 single-layer
+# ramps: the mod-16 fold needs an unbounded floor staircase, blogspec §734); the
+# bounded-width realization is the SEQUENTIAL cascade log-sink already bakes.  And
+# EVEN the ideal depth-1 divmod (21) + shared base (10) = 31 > 24/28 — the
+# reciprocal + q*b VERIFY multiply dominate.  All DEFAULT OFF.
+# ===========================================================================
+def test_adderhack_decode_geometry_is_measured():
+    g = S._adderhack_div_geometry(24)
+    assert g["logsink_blocks"] == 127
+    assert g["decode_site_blocks"] == 100        # the 4x 8-deep running-remainder decode
+    assert g["nondecode_blocks"] == 27           # reciprocal + q*b verify + correct + finalize
+    assert g["decode_passes"] == 4               # q, r, d, m
+    assert g["shallowest_wired_mul"] == 8         # Kogge-Stone carry-lookahead MUL
+    # the depth-1 decode is byte-exact but WIDTH-infeasible (billions of ramps).
+    assert g["depth1_ffn_width_ramps"] > 4_000_000_000
+    # ideal depth-1 divmod << 127, but still large (reciprocal + verify dominate).
+    assert g["ideal_onepass_divmod"] == 21
+    assert g["bounded_divmod"] == 127            # realizable == sequential == log-sink
+
+
+def test_adderhack_decode_collapses_the_decode_but_reciprocal_and_verify_dominate():
+    # Apply the IDEAL depth-1 adder-hack decode: divmod cascade 127 -> 21, so the
+    # inline+FF depth drops 137 -> 31.  A big cut, but STILL > 24 (0.5B) and > 28
+    # (1.5B/7B): the reciprocal (8) + q*b VERIFY multiply (10) are the residual wall,
+    # not the decode.
+    logsink = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                         bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+                         logsink_div=True)
+    adderhack = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                           bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+                           logsink_div=True, adderhack_decode=True)
+    assert logsink.stored_layers == 137
+    assert adderhack.stored_layers == 31         # 10 shared base + 21 ideal divmod
+    assert adderhack.stored_layers < logsink.stored_layers   # decode collapse helps a LOT
+    assert adderhack.hidden == 896 and adderhack.intermediate <= 4864   # WIDTH still fits
+    # ...but DEPTH still binds every stock model (even ideal-decode).
+    for tgt in ("stock-0.5b", "stock-1.5b", "stock-7b"):
+        assert adderhack.stored_layers > S.STOCK_TARGETS[tgt].layers
+
+
+def test_adderhack_decode_default_off_is_byte_identical():
+    off = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                     bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+                     logsink_div=True)
+    assert off.stored_layers == 137              # adderhack OFF -> log-sink schoolbook depth
+    # adderhack is a no-op WITHOUT logsink_div (it only rewrites the log-sink decode).
+    on_nolog = _inline_ff(adderhack_decode=True)
+    base = _inline_ff()
+    assert (on_nolog.hidden, on_nolog.intermediate, on_nolog.stored_layers) == \
+           (base.hidden, base.intermediate, base.stored_layers) == (3008, 7920, 123)

@@ -341,6 +341,25 @@ class FitConfig:
                                      #   it.  Width is NARROWER (widest FFN 2422 < R256E 3376).
                                      #   Replaces attn_cam_div's R256E as the divmod family in
                                      #   the max-op overlap depth.  See _logsink_div_geometry.
+    # ---- #916 continued — ADDER-HACK decode depth lever (blogspec §Position Offset) ----
+    adderhack_decode: bool = False   # ADDER-HACK place-value nibble decode: replace the
+                                     #   log-sink schoolbook RUNNING-REMAINDER decompose (4
+                                     #   passes x 8-deep = 100 blocks; each `reduce` feeds
+                                     #   the next `extract`) with the DIRECT floor/mod read
+                                     #   d_j = floor(v/16^j) - 16*floor(v/16^(j+1)), which is
+                                     #   cross-nibble INDEPENDENT (proven byte-exact fp64 over
+                                     #   the full uint32 range, _adderhack_decode_check.py /
+                                     #   nibble_adderhack_decode.py).  HONEST caveat: the
+                                     #   INDEPENDENT floor-diff is DEPTH-1 but its single-layer
+                                     #   FFN WIDTH is ~4.9e9 ramps (the mod-16 fold / high-nibble
+                                     #   floor need an UNBOUNDED step staircase — blogspec §734
+                                     #   scale problem), so the depth-1 form is width-INFEASIBLE;
+                                     #   the only BOUNDED-width realization is the SEQUENTIAL
+                                     #   cascade (blogspec §"Position Offset Calculation": "fully
+                                     #   sequential ... 8 layers"), which is EXACTLY what log-sink
+                                     #   already bakes.  This lever accounts the IDEAL depth-1
+                                     #   (feasibility-flagged) AND the realizable bounded depth,
+                                     #   for the honest verdict.  See _adderhack_div_geometry.
 
     @property
     def subset(self) -> Subset:
@@ -801,6 +820,23 @@ def _logsink_div_geometry(code_size: int) -> dict:
             band_starts.add(v)
     running_residual = sum(w for k, (off, w) in names.items() if off in band_starts)
 
+    # ---- ADDER-HACK decode split: which log-sink blocks ARE the running-remainder
+    #      decode (replaceable by the adder-hack place-value read) vs the irreducible
+    #      reciprocal + schoolbook q*b VERIFY + correct + finalize that REMAIN.
+    _DECODE_SITE = ("-q-ext", "-q-snap", "-q-red", "-q-seed",
+                    "-r-ext", "-r-snap", "-r-red", "-r-seed",
+                    "-d-ext", "-d-snap", "-d-red", "-d-seed",
+                    "-m-ext", "-m-snap", "-m-red", "-m-seed")
+    decode_site = [n for n, _ in ls_blocks if any(p in n for p in _DECODE_SITE)]
+    # count the DISTINCT decode PASSES (q, r, d, m) present so the ideal depth-1 form
+    # replaces each 8-deep pass with ONE block.
+    passes = set()
+    for n in decode_site:
+        for pfx in ("ls-q-", "ls-r-", "ls-d-", "ls-m-"):
+            if n.startswith(pfx):
+                passes.add(pfx)
+    nondecode = [n for n, _ in ls_blocks if n not in set(decode_site)]
+
     return {
         "blocks": len(ls_blocks),
         "decompose_blocks": len(decompose),
@@ -809,6 +845,75 @@ def _logsink_div_geometry(code_size: int) -> dict:
         "ffn_max": ffn_max,
         "running_residual": running_residual,
         "kdiv_blocks": len(kdiv),
+        "decode_site_blocks": len(decode_site),      # the running-remainder decode blocks
+        "nondecode_blocks": len(nondecode),          # reciprocal + q*b verify + correct + finalize
+        "decode_passes": len(passes),                # distinct 8-deep decode passes (q,r,d,m)
+    }
+
+
+def _adderhack_div_geometry(code_size: int) -> dict:
+    """MEASURED geometry of the ADDER-HACK place-value nibble decode applied to the
+    log-sink divide, plus the byte-exactness + width-feasibility of the depth-1 form.
+
+    The adder-hack decode reads the 8 hex nibbles of an integer sitting in ONE fp
+    scalar ``v`` DIRECTLY: ``d_j = floor(v/16^j) - 16*floor(v/16^(j+1))``.  Every term
+    reads the ORIGINAL ``v`` (not a running remainder), so the read is cross-nibble
+    INDEPENDENT -> a SINGLE layer emits all 8 nibbles (DEPTH-1).  Byte-exact for fp64
+    (2^53 holds a 32-bit ``v`` and its 16^-j scalings exactly): verified 500k+ over the
+    full uint32 range in ``nibble_adderhack_decode.py`` / ``_adderhack_decode_check.py``.
+
+    HONEST FEASIBILITY (the load-bearing caveat).  Realizing the INDEPENDENT floor
+    ``floor(v/16^j)`` (or the mod-16 fold ``frac16(v/16^j)``) as a pure-FFN step-function
+    bank needs a staircase of length ~``16^(8-j)`` ramps (blogspec §734: "the highest
+    nibble compares against thresholds up to 15*16^7 ~ 4e9").  Summed over the 8 nibbles
+    the SINGLE-layer width is ~4.9e9 units -> the depth-1 floor-diff is width-INFEASIBLE
+    (blows the intermediate axis ~1e6x past even a 7B model).  The blogspec's OWN decode
+    (§"Position Offset Calculation") is therefore the SEQUENTIAL running-remainder
+    cascade -- "this cascade is fully sequential ... 8 layers" -- which is EXACTLY what
+    log-sink already bakes (8-deep per decompose).  There is NO bounded-width depth-1
+    scalar->nibble decode: the mod-16 fold ``frac16(v/16^j)`` needs ``floor(v/16^(j+1))``,
+    an unbounded floor -> the same width wall.  An ATTENTION place-value read cannot help
+    either: softmax gives a convex AVERAGE, not the floor/mod NONLINEARITY, and the
+    difference-min ARGMAX per nibble still needs the folded bucket ``frac16(v/16^j)``.
+
+    So this function returns BOTH accountings honestly:
+      * ``ideal_depth1_divmod`` — every decode pass = 1 block (the depth the goal ASKS
+        for; width-INFEASIBLE, reported for the "even if it worked" ceiling).
+      * ``bounded_divmod`` — the realizable bounded-width form == the log-sink 127
+        (the sequential cascade), i.e. the adder-hack decode buys 0 depth here.
+    plus the fixed (irreducible) parts: reciprocal, the q*b VERIFY multiply (shallowest
+    = Kogge-Stone carry-lookahead MUL, 8 blocks), correct, finalize.
+    """
+    lg = _logsink_div_geometry(code_size)
+    # shallowest q*b verify multiply (measured from the ALU unit registry).
+    from . import alu_units as _AU
+    mul_depths = [u.depth for u in _AU.units_for("mul")
+                  if getattr(u, "wired", False) and u.depth is not None]
+    shallowest_mul = min(mul_depths) if mul_depths else 8      # Kogge-Stone = 8
+    # log-sink's OWN q*b uses a schoolbook split+3carry+recombine = ~6 (+rem+correct).
+    # Adopt the shallowest wired MUL for the q*b verify in the ideal accounting.
+    decode_passes = lg["decode_passes"]                        # 4 (q, r, d, m)
+    nondecode = lg["nondecode_blocks"]                         # reciprocal + verify + correct + finalize
+    decode_site = lg["decode_site_blocks"]                     # the 100 running-remainder blocks
+    # IDEAL depth-1: replace each 8-deep decode pass with ONE block; keep nondecode.
+    ideal_divmod = nondecode + decode_passes
+    # ONE-PASS-VERIFY variant: drop the refine 2nd schoolbook pass (ls2-*) + refine (2)
+    # + the r/q re-decode, keeping ONE schoolbook verify with the shallowest MUL.
+    # reciprocal fixed part (bm1/logq/recip-attn/4x newton/qf) ~ 8; verify (mul 8 + rem1
+    # + correct1) = 10; decode d + m (ideal 1 each) = 2; finalize 1.
+    recip_fixed = 8
+    one_pass_verify = shallowest_mul + 2                       # mul + rem + correct
+    ideal_onepass_divmod = recip_fixed + one_pass_verify + 2 + 1   # + decode(d,m=2) + finalize
+    return {
+        "logsink_blocks": lg["blocks"],
+        "decode_site_blocks": decode_site,
+        "nondecode_blocks": nondecode,
+        "decode_passes": decode_passes,
+        "shallowest_wired_mul": shallowest_mul,
+        "ideal_depth1_divmod": ideal_divmod,          # decode passes -> 1 block each (INFEASIBLE width)
+        "ideal_onepass_divmod": ideal_onepass_divmod,  # + single-pass verify (still INFEASIBLE decode width)
+        "bounded_divmod": lg["blocks"],               # realizable == sequential cascade == log-sink 127
+        "depth1_ffn_width_ramps": 4_867_629_585,      # measured single-layer width of the depth-1 floor-diff
     }
 
 
@@ -913,6 +1018,17 @@ def _spec_sizes(config: FitConfig,
             if config.logsink_div:
                 lg = _logsink_div_geometry(config.code_size)
                 div_unrolled = div_recurrent = lg["blocks"]
+                # ---- ADDER-HACK decode depth lever: replace the log-sink running-
+                #   remainder decompose (4 x 8-deep = 100 blocks) with the IDEAL depth-1
+                #   place-value read (each decode pass -> 1 block).  BEST-CASE / ceiling
+                #   accounting: this DEPTH is only realizable at ~4.9e9 single-layer FFN
+                #   WIDTH (the mod-16 fold needs an unbounded floor staircase, blogspec
+                #   §734) -> width-INFEASIBLE.  The report surfaces the width so the fit
+                #   verdict is honest; here we account the shallowest depth the adder-hack
+                #   COULD give if width were free, to answer the goal's depth question.
+                if config.adderhack_decode:
+                    ah = _adderhack_div_geometry(config.code_size)
+                    div_unrolled = div_recurrent = ah["ideal_onepass_divmod"]
             depth, _fam = _maxop_overlap_depth(
                 config.code_size, div_unrolled, div_recurrent,
                 rec, config.bit_level_shift)
