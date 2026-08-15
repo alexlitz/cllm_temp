@@ -877,3 +877,97 @@ def test_final_push_truncated_verify_is_byte_exact():
     from c4_min import _div_levers_916_check as C
     r = C.run_lever3(8000, newton_steps=1)
     assert r["ok"] == r["total"]                  # truncated-to-32-bit q*b byte-exact
+
+
+# ===========================================================================
+# #916 fp64 INLINE+FF divmod — the levers that FAIL at fp32 are byte-exact at fp64
+# (2^53 mantissa clears fp32's 2^24 wall).  Precision is a FREE bake choice, so an
+# fp64 fit IS goal-met.  fp64 divmod = recip5 + verify7 + decode8 + finalize1 = 21
+# (vs fp32 feasible 25), inline+FF 31 (vs 35).  1.5B FITS with the decode-overlap.
+# ===========================================================================
+def _inline_ff_fp64(**kw):
+    return _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                      bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+                      logsink_div=True, radix256_decode=True, newton_min=True, **kw)
+
+
+def test_fp64_divmod_geometry_is_measured():
+    g = S._fp64_divmod_geometry(24)
+    assert g["fp64_recip"] == 5                   # case-split, ZERO Newton (WALL 2 clears)
+    assert g["fp64_11bit_mul_depth"] == 5         # 11-bit product replaces Kogge-Stone 8 (WALL 1)
+    assert g["fp64_verify"] == 7                  # mul 5 + rem 1 + correct 1
+    assert g["fp64_decode"] == 8                  # 2 passes x radix-4096 4 layers
+    assert g["fp64_divmod"] == 21                 # recip5 + verify7 + decode8 + finalize1
+    assert g["fp64_divmod_overlap"] == 17         # decode-overlap (1.5B-only width)
+    assert g["fp64_decode_ffn_width"] == 4096     # <= 4864 (2-pass fits 0.5B intermediate)
+    assert g["fp64_decode_ffn_width_overlap"] == 8192   # 1.5B-only (> 4864, <= 8960)
+    # fp64 is STRICTLY shallower than the fp32 feasible floor (25).
+    fp32 = S._adderhack_div_geometry(24)
+    assert g["fp64_divmod"] < fp32["feasible_divmod"] == 25
+
+
+def test_fp64_divmod_shaves_depth_vs_fp32():
+    fp32 = _inline_ff_fp64()
+    fp64 = _inline_ff_fp64(fp64_divmod=True)
+    assert fp32.stored_layers == 35               # shared 10 + fp32 feasible divmod 25
+    assert fp64.stored_layers == 31               # shared 10 + fp64 divmod 21
+    assert fp64.stored_layers == fp32.stored_layers - 4    # 4 layers (recip -1, verify -3)
+    assert fp64.hidden <= 896 and fp64.intermediate <= 4864    # WIDTH still fits
+
+
+def test_fp64_divmod_does_not_fit_0_5b_but_fits_1_5b():
+    # 0.5B (24): fp64 divmod is 31 > 24 (conservative) and the decode-overlap that would
+    # reach 27 blows the 0.5B intermediate (8192 > 4864) -> 0.5B NO FIT on either axis.
+    fp64 = _inline_ff_fp64(fp64_divmod=True)
+    assert fp64.stored_layers == 31 > S.STOCK_TARGETS["stock-0.5b"].layers   # 31 > 24
+    fp64_ov = _inline_ff_fp64(fp64_divmod=True, fp64_decode_overlap=True)
+    assert fp64_ov.stored_layers == 27            # decode-overlap floor
+    assert fp64_ov.intermediate == 8192 > S.STOCK_TARGETS["stock-0.5b"].intermediate  # 8192 > 4864
+    # 1.5B (28): fp64 divmod + decode-overlap = inline+FF 27 <= 28, width 8192 <= 8960 -> FITS.
+    st15 = S.STOCK_TARGETS["stock-1.5b"]
+    cfg = S.FitConfig(ops=S.FULL, muldiv_strategy="efficient-ALU-unrolled", precision=32,
+                      code_size=24, pack_memcam=True, overlap_scratch=True,
+                      bit_level_bitwise=True, bit_level_shift=True, attn_cam_div=True,
+                      overlap_depth=True, logsink_div=True, radix256_decode=True,
+                      newton_min=True, fp64_divmod=True, fp64_decode_overlap=True,
+                      arch=st15.arch)
+    a = S.account(cfg)
+    assert a.hidden <= st15.hidden                # 1536 <= 1536
+    assert a.intermediate <= st15.intermediate    # 8192 <= 8960
+    assert a.stored_layers <= st15.layers         # 27 <= 28  -> 1.5B FITS at fp64
+
+
+def test_fp64_divmod_default_off_is_byte_identical():
+    # fp64_divmod + fp64_decode_overlap DEFAULT OFF -> accounting is the fp32 feasible one.
+    off = _inline_ff_fp64()
+    assert off.stored_layers == 35
+    # the fp64 lever is a no-op WITHOUT logsink_div (it only rewrites the log-sink divmod).
+    base = _inline_ff()
+    fp64_nolog = _inline_ff(fp64_divmod=True)
+    assert (fp64_nolog.hidden, fp64_nolog.intermediate, fp64_nolog.stored_layers) == \
+           (base.hidden, base.intermediate, base.stored_layers) == (3008, 7920, 123)
+
+
+def test_fp64_levers_are_byte_exact():
+    from c4_min import _fp64_div_levers_916_check as F
+    # LEVER A: 11-bit-chunk q*b low-32 verify (replaces Kogge-Stone 8).
+    ra = F.run_lever_a(20000)
+    assert ra["ok"] == ra["total"]
+    # LEVER C: radix-4096 fp64 decode.
+    rc = F.run_lever_c(20000)
+    assert rc["ok"] == rc["total"]
+    # standalone MUL (same 11-bit low-32 product).
+    rm = F.run_standalone_mul(20000)
+    assert rm["ok"] == rm["total"]
+    # decode-overlap (q,rem in shared layers).
+    ro = F.run_decode_overlap(20000)
+    assert ro["ok"] == ro["total"]
+
+
+def test_fp64_whole_div_gate_is_byte_exact():
+    from c4_min import _fp64_div_levers_916_check as F
+    # THE GATE: whole fp64 case-split div byte-exact END-TO-END with ZERO Newton
+    # (recip + 11-bit verify + radix-4096 decode + correct) over a sample + boundaries.
+    rg = F.run_whole_div_gate(15000, newton_steps=0, use_11bit_verify=True)
+    assert rg["ok"] == rg["total"]                # div byte-exact
+    assert rg["decode_ok"] == rg["total"]         # q,rem nibble decode byte-exact

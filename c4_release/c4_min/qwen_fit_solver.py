@@ -379,6 +379,31 @@ class FitConfig:
                                      #   adversarial worst-sign corner (Newton=0 FAILS both — the
                                      #   qf error q*e~1632 exceeds the refine R=512 clamp).  See
                                      #   _div_levers_916_check.run_lever2[_worst_corner].
+    # ---- #916 fp64 INLINE+FF divmod — the levers that FAIL at fp32, byte-exact at fp64 ----
+    fp64_divmod: bool = False        # DTYPE=fp64 bake (§Basic-Arithmetic sanctions doubles for
+                                     #   the 32-bit ALU): fp64's 2^53 mantissa clears the two fp32
+                                     #   walls that pin the FEASIBLE fp32 divmod at 25.  BYTE-EXACT
+                                     #   at fp64 (_fp64_div_levers_916_check, 200k+ + boundaries):
+                                     #     * 11-bit-chunk q*b VERIFY (recompose 2^46 < 2^53) is a
+                                     #       DEPTH-5 multiply (3 chunk-products + 2 recompose adds),
+                                     #       REPLACING the fp32 8-deep Kogge-Stone carry cascade
+                                     #       (fp32's 2^24 breaks the 11-bit recompose -> 300289 fp32
+                                     #       vs 300289/300289 fp64 — LEVER A here 200,010/200,010).
+                                     #     * CASE-SPLIT reciprocal quotient (large-b whole-recip
+                                     #       round; small-b<=256 256-entry recip table) is BYTE-EXACT
+                                     #       with ZERO Newton (fp32 case-split div 46245/50586 vs
+                                     #       201350/201350 fp64), so recip drops to the sink +
+                                     #       case-split select (~5), no Newton refine.
+                                     #     * radix-4096 DECODE (v<2^32 exact in fp64) = 3 limbs + 1
+                                     #       split = 4 layers/pass, 2 passes = 8 (LEVER C 200,027).
+                                     #   fp64 divmod depth = recip5 + verify7 + decode8 + finalize1
+                                     #   = 21 (vs fp32 feasible 25).  See _fp64_divmod_geometry.
+    fp64_decode_overlap: bool = False  # AGGRESSIVE 1.5B-only lever (requires fp64_divmod): q and
+                                     #   rem decode in the SAME 4 radix-4096 layers (side-by-side
+                                     #   lanes), collapsing the 2 decode passes 8 -> 4.  BYTE-EXACT
+                                     #   at fp64 (150,006/150,006).  WIDTH 2x4096 = 8192 lanes
+                                     #   EXCEEDS 0.5B's 4864 but FITS 1.5B's 8960 -> 1.5B-ONLY.
+                                     #   fp64 divmod 21 -> 17, inline+FF 31 -> 27.
 
     @property
     def subset(self) -> Subset:
@@ -972,6 +997,86 @@ def _adderhack_div_geometry(code_size: int) -> dict:
     }
 
 
+def _fp64_divmod_geometry(code_size: int) -> dict:
+    """#916 fp64 inline+feed-forward divmod depth — the levers that FAIL at fp32 but
+    are BYTE-EXACT at fp64 (2^53 mantissa vs fp32's 2^24 exact-integer ceiling).
+
+    Precision is a FREE bake choice (BLOG_SPEC §Basic-Arithmetic sanctions fp64 for
+    the 32-bit ALU), so an fp64 fit IS goal-met.  fp64 clears the two fp32 walls that
+    pin the FEASIBLE fp32 divmod at 25 (``_adderhack_div_geometry.feasible_divmod``):
+
+      WALL 1 (verify) — fp32's 2^24 exact-integer ceiling BREAKS the shallow 11-bit
+        chunk recompose (a 2-chunk product recompose reaches ~2^46 >> 2^24), so the
+        fp32 q*b verify is stuck at the 8-deep Kogge-Stone nibble carry-lookahead.
+        At fp64 the 11-bit-chunk q*b product recomposes EXACTLY (max partial ~2^46 <
+        2^53), so the VERIFY is a DEPTH-5 multiply: 3 parallel 11-bit chunk-products
+        (a single FFN-lane multiply layer each; feasible <=2^22 staircase) + 2 sequential
+        recompose/carry adds — NOT the 8-deep carry cascade.  BYTE-EXACT: LEVER A
+        (_fp64_div_levers_916_check.run_lever_a) 200,010/200,010; the prior agent's
+        cross-check measured 11-bit MUL 300289/300289 fp64 (vs 221/300289 fp32).
+
+      WALL 2 (reciprocal) — the fp32 whole-value case-split quotient (round(a*recip))
+        cannot be verified exactly (a*recip and the q*b re-check both exceed 2^24), so
+        fp32 needs a Newton refine (recip 6, LEVER 2).  At fp64 the whole-value
+        reciprocal a*(1/b) is exact enough that the CASE-SPLIT quotient is BYTE-EXACT
+        with ZERO Newton: large b -> round(a*recip) from the softmax1 sink (sink rel-err
+        after the exact log-key recompose < 2^-40); small b<=256 -> a 256-entry
+        reciprocal-table byte read.  So recip = sink(~3) + case-split-select(~1) +
+        finalize-recip(~1) = 5, NO Newton br/step.  BYTE-EXACT: THE GATE
+        (run_whole_div_gate Newton=0) end-to-end (recip+verify+decode+correct)
+        361,577/361,577; the prior agent's cross-check measured case-split div
+        201350/201350 fp64 (vs 46245/50586 fp32).
+
+      DECODE — radix-4096 (v<2^32 exact in fp64): 3 limb-extract layers + 1 nibble
+        split = 4 layers/pass, 2 passes (q, rem) = 8.  BYTE-EXACT: LEVER C
+        (run_lever_c) 200,027/200,027 (same as the fp32 radix256_decode LEVER 1 —
+        the radix decode already holds v exactly, so it is the SAME 8 layers).
+
+    fp64 divmod depth = recip 5 + verify 7 (mul 5 + rem 1 + correct 1) + decode 8 +
+    finalize 1 = 21.  (The fp32 FEASIBLE floor is 25: recip 6 + verify 10 + decode 8 +
+    finalize 1.)  The +-1 correct + the q*b re-verify (LEVER A) close any residual
+    off-by-one from the whole-recip quotient.
+    """
+    ah = _adderhack_div_geometry(code_size)      # reuse the measured shallowest MUL etc.
+    # WALL 2: fp64 case-split reciprocal, ZERO Newton.  sink (softmax1 1/b) + case-split
+    #   select (large-b whole-recip vs small-b 256-table) + reciprocal finalize.  This is
+    #   SHALLOWER than the fp32 Newton-min recip (6) because there is no newton br/step.
+    fp64_recip = 5                               # sink(~3) + case-split-select(1) + finalize(1)
+    # WALL 1: fp64 11-bit-chunk q*b VERIFY.  3 parallel chunk-products (one FFN multiply
+    #   layer each — but INDEPENDENT, so a single wide layer) + 2 recompose/carry adds.
+    #   The shallowest-wired-MUL (Kogge-Stone 8) is REPLACED by this 5-deep 11-bit form.
+    FP64_11BIT_MUL_DEPTH = 5                      # 3 chunk-products + 2 recompose adds
+    fp64_verify = FP64_11BIT_MUL_DEPTH + 2       # mul(5) + rem(1) + correct(1) = 7
+    # DECODE: radix-4096, 2 passes x 4 layers = 8 (same as the fp32 radix256_decode).
+    fp64_decode_layers_per_pass = ah["radix256_decode_layers_per_pass"]   # 4
+    fp64_decode = 2 * fp64_decode_layers_per_pass                         # 8 (q + rem passes)
+    fp64_finalize = 1
+    fp64_divmod = fp64_recip + fp64_verify + fp64_decode + fp64_finalize   # 5+7+8+1 = 21
+    # DECODE-OVERLAP (aggressive, 1.5B-only): q and rem are two DIFFERENT scalars but
+    #   their radix-4096 limb-extraction is the SAME op sequence -> both decode in the
+    #   SAME 4 physical layers, side-by-side lanes (a WIDTH-for-depth trade).  BYTE-EXACT
+    #   at fp64 (150,006/150,006, _fp64_div_levers_916_check decode-overlap).  The width
+    #   is 2 x 4096 = 8192 lanes: EXCEEDS the 0.5B intermediate 4864 but FITS 1.5B's 8960,
+    #   so this floor is 1.5B-ONLY (honest width caveat).
+    fp64_decode_overlap = fp64_decode_layers_per_pass                     # 4 (shared)
+    fp64_divmod_overlap = fp64_recip + fp64_verify + fp64_decode_overlap + fp64_finalize  # 17
+    # the 11-bit-chunk product staircase width: each chunk product q_i*b_j <= (2^11-1)^2
+    #   ~ 2^22, so the widest verify FFN is a ~2^22-domain multiply lane; the radix-4096
+    #   decode staircase (4096) is the widest divmod FFN (4096 <= 4864 for the 2-pass form;
+    #   8192 for the overlapped form, 1.5B-only).
+    return {
+        "fp64_recip": fp64_recip,                # 5 (case-split, ZERO Newton)
+        "fp64_11bit_mul_depth": FP64_11BIT_MUL_DEPTH,  # 5 (replaces Kogge-Stone 8)
+        "fp64_verify": fp64_verify,              # 7 (mul 5 + rem + correct)
+        "fp64_decode": fp64_decode,              # 8 (2 passes x radix-4096 4 layers)
+        "fp64_finalize": fp64_finalize,          # 1
+        "fp64_divmod": fp64_divmod,              # 21 (fp32 feasible was 25)
+        "fp64_divmod_overlap": fp64_divmod_overlap,   # 17 (decode-overlap, 1.5B-only width)
+        "fp64_decode_ffn_width": ah["radix_decode_ffn_width"],       # 4096 (2-pass, <= 4864)
+        "fp64_decode_ffn_width_overlap": 2 * ah["radix_decode_ffn_width"],  # 8192 (1.5B-only)
+    }
+
+
 def _spec_sizes(config: FitConfig,
                 subset: Optional[Subset] = None) -> Tuple[int, int, int, int]:
     """(hidden, intermediate, stored_layers, applied_depth) at the config's op-subset
@@ -1109,6 +1214,23 @@ def _spec_sizes(config: FitConfig,
                         # radix-16 running-remainder (2 passes x ~8 feasible layers).
                         decode = 2 * 8
                     div_unrolled = div_recurrent = recip + verify + decode + 1  # + finalize
+                # ---- #916 fp64 divmod: the fp32 walls (WALL 1 verify Kogge-Stone 8;
+                #   WALL 2 reciprocal Newton refine) both clear at fp64.  fp64_divmod
+                #   SUPERSEDES the fp32 feasible accounting (recip 5 + verify 7 + decode
+                #   8 + finalize 1 = 21).  BYTE-EXACT end-to-end at fp64 over 200k+ +
+                #   boundaries (_fp64_div_levers_916_check THE GATE 361,577/361,577).
+                #   Precision is a free bake choice (§Basic-Arithmetic sanctions fp64).
+                if config.fp64_divmod:
+                    fp = _fp64_divmod_geometry(config.code_size)
+                    if config.fp64_decode_overlap:
+                        # 1.5B-only: q,rem share the 4 decode layers (WIDTH 8192).
+                        div_unrolled = div_recurrent = fp["fp64_divmod_overlap"]  # 17
+                        inter = max(inter, fp["fp64_decode_ffn_width_overlap"])   # 8192
+                    else:
+                        div_unrolled = div_recurrent = fp["fp64_divmod"]  # 21
+                        # the radix-4096 decode staircase stays the widest divmod FFN
+                        #   (4096 <= 4864); the 11-bit verify chunk-products are narrower.
+                        inter = max(inter, fp["fp64_decode_ffn_width"])
             depth, _fam = _maxop_overlap_depth(
                 config.code_size, div_unrolled, div_recurrent,
                 rec, config.bit_level_shift)
