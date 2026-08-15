@@ -124,8 +124,24 @@ def test_no_muldiv_subset_is_feasible_and_verified():
     assert res.ok and res.best.verified and res.best.steps_per_op == 1
 
 
-def test_full_does_not_fit_stock_0_5b_hidden():
+def test_full_fits_stock_0_5b_at_the_honest_subroutine_floor():
+    # THE FALSELY-DEEP-DEFAULT FIX: the DEFAULT fit() now accounts each strategy at its
+    # MEASURED feasible floor, so stock-0.5b FITS the full fp32 ISA at the subroutine
+    # floor (14 stored, 896/896) — NOT the falsely-deep summed radix geometry that made
+    # the old default report INFEASIBLE (hidden 1152 / stored 31).
     res = S.fit("stock-0.5b", ops=S.FULL, minimize="depth")
+    assert res.ok
+    assert res.best.stored_layers == 14
+    assert res.best.hidden <= 896 and res.best.intermediate <= 4864
+    assert res.best.config.muldiv_strategy == "subroutine"
+    assert res.best.config._is_floor_bundle()
+
+
+def test_legacy_deep_default_still_reports_the_falsely_deep_infeasibility():
+    # feasible_floor=False restores the LEGACY all-levers-OFF (deep) enumeration — the
+    # falsely-deep default that summed the radix-16 digit-recurrence.  Kept SELECTABLE
+    # for byte-identity comparison; it reports stock-0.5b INFEASIBLE on hidden as before.
+    res = S.fit("stock-0.5b", ops=S.FULL, minimize="depth", feasible_floor=False)
     assert not res.ok
     assert res.binding == "hidden"
     assert res.relaxation and "hidden" in res.relaxation
@@ -168,7 +184,9 @@ def test_tradeoff_table_and_summary_render():
     tbl = S.tradeoff_table(res)
     assert "hidden" in tbl and "stored" in tbl and "stp/op" in tbl
     assert "BEST" in S.best_summary(res)
-    inf = S.fit("stock-0.5b", ops=S.FULL, minimize="depth")
+    # a genuinely-infeasible box (max_depth 10 < the shallowest floor 14) renders the
+    # INFEASIBLE / Binding lines (stock-0.5b now FITS at the honest floor, so use a cap).
+    inf = S.fit(ops=S.FULL, max_depth=10, minimize="depth")
     assert "INFEASIBLE" in S.tradeoff_table(inf)
     assert "Binding" in S.best_summary(inf)
 
@@ -971,3 +989,155 @@ def test_fp64_whole_div_gate_is_byte_exact():
     rg = F.run_whole_div_gate(15000, newton_steps=0, use_11bit_verify=True)
     assert rg["ok"] == rg["total"]                # div byte-exact
     assert rg["decode_ok"] == rg["total"]         # q,rem nibble decode byte-exact
+
+
+# ===========================================================================
+# THE FALSELY-DEEP-DEFAULT FIX — regression LOCK on the corrected defaults.
+#
+# The bare all-levers-OFF FitConfig reports the falsely-deep summed radix geometry
+# (subroutine 1152/896/31, inline-ALU unrolled 3008/7920/123, recurrent 60/123).  The
+# DEFAULT enumerator now accounts each strategy at its MEASURED, byte-exact feasible
+# floor.  These tests LOCK the honest floors so they can never re-inflate — the numbers
+# MATCH the two reference branches (fp32 @eed17a92, fp64 @ae22dd03) and #913.
+# ===========================================================================
+def _floor(strat, prec=32, ovl=False, arch=None):
+    a = STOCK.arch if arch is None else arch
+    return S.account(S.feasible_floor_config(S.FULL, strat, precision=prec,
+                                             decode_overlap=ovl, arch=a))
+
+
+def test_feasible_floor_bundles_match_the_measured_branch_floors():
+    # subroutine fp32 = 14 (0.5B FIT, #913 pack_memcam + bit_level_bitwise).
+    assert _floor("subroutine").stored_layers == 14
+    # inline+FF fp32 = 35 (shared base 10 + feasible divmod 25), @eed17a92.
+    assert _floor("efficient-ALU-unrolled").stored_layers == 35
+    # inline+FF fp64 = 31 (shared base 10 + fp64 divmod 21), @ae22dd03.
+    assert _floor("efficient-ALU-unrolled", prec=64).stored_layers == 31
+    # inline+FF fp64 + decode-overlap = 27 (divmod 17, WIDTH 8192), @ae22dd03.
+    ov = _floor("efficient-ALU-unrolled", prec=64, ovl=True)
+    assert ov.stored_layers == 27 and ov.intermediate == 8192
+
+
+def test_feasible_floor_bundles_reproduce_the_measured_divmod_arithmetic():
+    # the floor depths are shared-base 10 + the MEASURED divmod cascade — grounded in
+    # the branch geometry helpers, not asserted constants.
+    fp32 = S._adderhack_div_geometry(24)
+    fp64 = S._fp64_divmod_geometry(24)
+    assert fp32["feasible_divmod"] == 25            # recip6 + verify10 + decode8 + fin1
+    assert fp64["fp64_divmod"] == 21                # recip5 + verify7 + decode8 + fin1
+    assert fp64["fp64_divmod_overlap"] == 17        # decode-overlap
+    # shared base pipeline (base 7 + shared-alu 3) = 10; floor = shared + divmod.
+    assert _floor("efficient-ALU-unrolled").stored_layers == 10 + fp32["feasible_divmod"]
+    assert _floor("efficient-ALU-unrolled", prec=64).stored_layers == 10 + fp64["fp64_divmod"]
+
+
+def test_fp64_floor_bundle_keeps_a_32bit_integer_datapath():
+    # fp64 is a DTYPE choice, not a 64-bit integer width: the config precision stays 32
+    # (so the linear-in-nibble P8/P16 projection never fires) and the fp64 divmod levers
+    # are on.
+    cfg = S.feasible_floor_config(S.FULL, "efficient-ALU-unrolled", precision=64)
+    assert cfg.precision == 32 and cfg.fp64_divmod is True
+    cfg_ov = S.feasible_floor_config(S.FULL, "efficient-ALU-unrolled", precision=64,
+                                     decode_overlap=True)
+    assert cfg_ov.fp64_divmod is True and cfg_ov.fp64_decode_overlap is True
+
+
+def test_default_fit_reports_the_honest_floor_not_the_falsely_deep_sum():
+    # DEFAULT fit() (feasible_floor=True) picks the honest floor; the bare deep config
+    # still reports the falsely-deep 123 — the levers stay SELECTABLE, just not silent.
+    res = S.fit("stock-0.5b", ops=S.FULL, minimize="depth")
+    assert res.ok and res.best.stored_layers == 14
+    deep = S.account(S.FitConfig(ops=S.FULL, muldiv_strategy="efficient-ALU-unrolled"))
+    assert deep.stored_layers == 123               # bare deep radix still selectable
+    rec = S.account(S.FitConfig(ops=S.FULL, muldiv_strategy="efficient-ALU-recurrent"))
+    assert rec.stored_layers == 60                 # bare recurrent still selectable
+
+
+def test_precision_projection_does_not_corrupt_the_floor_depth():
+    # the pre-existing linear-in-nibble P8/P16 projection was designed for the DEEP
+    # radix ALU depth; applying it on top of the FINAL overlap_depth floor drove P8 to
+    # the max(1,...) clamp (a nonsense stored=1).  The floor bundles are a 32-bit
+    # datapath by construction and the enumerator never emits a P8/P16 floor, so the
+    # default fit's best is never the corrupted stored=1 artifact.
+    res = S.fit("stock-7b", ops=S.FULL, minimize="depth")
+    assert res.ok and res.best.stored_layers >= 14   # NOT the stored=1 P8 artifact
+    # a P8 inline-ALU config with overlap_depth is NOT precision-projected (guarded).
+    a = S.account(S.FitConfig(ops=S.FULL, muldiv_strategy="efficient-ALU-unrolled",
+                              precision=8, **S._INLINE_FF_FLOOR_LEVERS))
+    assert a.stored_layers == 35                     # overlap depth, NOT projected to 1
+
+
+# ---- THE FIT MATRIX: {0.5B, 1.5B, 7B} x {fp32, fp64} x {subroutine, inline+FF} ------
+def _fits_target(a, st):
+    return (a.hidden <= st.hidden and a.intermediate <= st.intermediate
+            and a.stored_layers <= st.layers)
+
+
+def test_fit_matrix_subroutine_fp32_floor_fits_every_stock():
+    # subroutine fp32 floor = 14 layers, hidden/inter = arch geometry -> fits all three.
+    for tname in ("stock-0.5b", "stock-1.5b", "stock-7b"):
+        st = S.STOCK_TARGETS[tname]
+        a = _floor("subroutine", arch=st.arch)
+        assert a.stored_layers == 14
+        assert _fits_target(a, st), tname
+
+
+def test_fit_matrix_inline_ff_fp32_fits_no_stock_on_depth():
+    # inline+FF fp32 = 35 > every stock depth cap (24 / 28 / 28) -> NO stock fits fp32.
+    for tname in ("stock-0.5b", "stock-1.5b", "stock-7b"):
+        st = S.STOCK_TARGETS[tname]
+        a = _floor("efficient-ALU-unrolled", arch=st.arch)
+        assert a.stored_layers == 35
+        assert not _fits_target(a, st), tname       # depth binds everywhere
+        assert a.stored_layers > st.layers
+
+
+def test_fit_matrix_inline_ff_fp64_0_5b_no_but_1_5b_yes_with_overlap():
+    # THE #917 RE-VERIFICATION.  inline+FF at fp64-with-overlap = 27 layers:
+    #   * 0.5B: NO (fp64 31 > 24; and the 27-overlap blows inter 8192 > 4864).
+    #   * 1.5B: YES (27 <= 28 AND inter 8192 <= 8960 AND hidden 1536 <= 1536).
+    #   * 7B:   YES (27 <= 28, inter 8192 <= 18944).
+    st05, st15, st7 = (S.STOCK_TARGETS[n] for n in ("stock-0.5b", "stock-1.5b", "stock-7b"))
+    # 0.5B fp64 (31) and fp64-overlap (27 but width 8192) both fail.
+    a05 = _floor("efficient-ALU-unrolled", prec=64, arch=st05.arch)
+    assert a05.stored_layers == 31 and not _fits_target(a05, st05)
+    a05_ov = _floor("efficient-ALU-unrolled", prec=64, ovl=True, arch=st05.arch)
+    assert a05_ov.stored_layers == 27 and a05_ov.intermediate == 8192
+    assert not _fits_target(a05_ov, st05)           # 8192 > 4864 AND 27 > 24
+    # 1.5B fp64 (31 > 28) NO; fp64-overlap (27 <= 28, 8192 <= 8960) YES.
+    a15 = _floor("efficient-ALU-unrolled", prec=64, arch=st15.arch)
+    assert a15.stored_layers == 31 and not _fits_target(a15, st15)   # 31 > 28
+    a15_ov = _floor("efficient-ALU-unrolled", prec=64, ovl=True, arch=st15.arch)
+    assert a15_ov.stored_layers == 27 and a15_ov.intermediate == 8192
+    assert _fits_target(a15_ov, st15)               # 27 <= 28, 8192 <= 8960 -> FITS
+    # 7B fp64-overlap also fits.
+    a7_ov = _floor("efficient-ALU-unrolled", prec=64, ovl=True, arch=st7.arch)
+    assert _fits_target(a7_ov, st7)
+
+
+def test_1_5b_inline_ff_verdict_via_the_default_solver():
+    # THE #917 verdict through the FRONT DOOR: cap depth at the inline+FF (efficient-ALU)
+    # strategy and confirm the solver reports the honest inline+FF floor for 1.5B — the
+    # fp64+overlap floor (27) fits 1.5B's 28-layer / 8960-inter budget, fp32 (35) does not.
+    inline_ops = S.FULL
+    a_fp32 = _floor("efficient-ALU-unrolled", arch=S.STOCK_TARGETS["stock-1.5b"].arch)
+    a_ovl = _floor("efficient-ALU-unrolled", prec=64, ovl=True,
+                   arch=S.STOCK_TARGETS["stock-1.5b"].arch)
+    st15 = S.STOCK_TARGETS["stock-1.5b"]
+    assert a_fp32.stored_layers == 35 > st15.layers                  # fp32 does NOT fit
+    assert a_ovl.stored_layers == 27 <= st15.layers                  # fp64+overlap FITS
+    assert a_ovl.intermediate <= st15.intermediate
+
+
+def test_include_deep_surfaces_both_floor_and_deep_rows():
+    # include_deep=True keeps the deep tradeoff rows visible (they are never the silent
+    # default best, but stay in the ranked table for the honest width/depth tradeoff).
+    res = S.fit(ops=S.FULL, minimize="depth", max_hidden=4096,
+                max_intermediate=200000, max_depth=300, include_deep=True)
+    labels = [a.config.label for a in res.feasible]
+    assert any("FLOOR" in l for l in labels)         # honest floors present
+    assert any("FLOOR" not in l for l in labels)     # deep tradeoff rows present
+    # the default (no include_deep) best is a FLOOR bundle, not a deep row.
+    res_floor = S.fit(ops=S.FULL, minimize="depth", max_hidden=4096,
+                      max_intermediate=200000, max_depth=300)
+    assert res_floor.best.config._is_floor_bundle()

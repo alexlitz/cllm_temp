@@ -432,7 +432,96 @@ class FitConfig:
     @property
     def label(self) -> str:
         strat = self.muldiv_strategy if self.has_muldiv else "n/a"
-        return f"[{self.subset.name}] muldiv={strat} P{self.precision} {self.granularity}"
+        floor = " FLOOR" if self._is_floor_bundle() else ""
+        return (f"[{self.subset.name}] muldiv={strat} P{self.precision} "
+                f"{self.granularity}{floor}")
+
+    def _is_floor_bundle(self) -> bool:
+        """True when THIS config carries a feasible-floor lever bundle (any #913/#916
+        MEASURED width/depth reduction is on) — used only to tag the label."""
+        return any((self.pack_memcam, self.overlap_scratch, self.bit_level_bitwise,
+                    self.bit_level_shift, self.overlap_depth, self.attn_cam_div,
+                    self.logsink_div, self.radix256_decode, self.newton_min,
+                    self.fp64_divmod, self.fp64_decode_overlap))
+
+
+# ===========================================================================
+# FEASIBLE-FLOOR LEVER BUNDLES — the HONEST floor per (strategy, precision).
+#
+# THE FALSELY-DEEP-DEFAULT FIX.  A bare ``FitConfig`` has every #913/#916 fit lever
+# OFF, so ``account()`` reports the deep SUMMED digit-recurrence geometry (subroutine
+# 1152/896/31, inline-ALU 3008/7920/123-unrolled / 60-recurrent).  Those are the
+# "falsely deep" numbers: they SUM every op-family's private cascade and use the deep
+# radix-16 digit-recurrence, when the MEASURED, byte-exact feasible floor is far
+# shallower.  The bundles below are the exact lever sets that reach each measured
+# floor (all bundled levers are MEASURED reductions read live from the real layout /
+# validated byte-exact on the reference branches — see the per-lever docstrings):
+#
+#   * subroutine (fp32)      -> 14  (0.5B FIT)  #913 pack_memcam + bit_level_bitwise
+#   * inline+FF (fp32)       -> 35              #916 @eed17a92 (feasible radix256+newton_min)
+#   * inline+FF (fp64)       -> 31              #916 @ae22dd03 (fp64 divmod, gate 361577/361577)
+#   * inline+FF (fp64,ovlap) -> 27  (1.5B FIT)  #916 @ae22dd03 (decode-overlap, WIDTH 8192)
+#
+# The DEEP strategies stay fully SELECTABLE (bare configs, ``include_deep=`` in the
+# enumerator, every per-lever test) — they are just no longer the SILENT default the
+# front-door ``fit()`` / ``solve()`` reports.
+# ===========================================================================
+
+# The #913 subroutine fp32 FIT levers: drop the dead §Memory pad (1152->896) + retire
+# the barrel-shifter (stored 31->14).  Both MEASURED live (_packmemcam_saving /
+# _bitwise_barrel_saving).  Reaches the 14-layer 0.5B fit.
+_SUBROUTINE_FLOOR_LEVERS = dict(pack_memcam=True, bit_level_bitwise=True)
+
+# The #916 inline + feed-forward FEASIBLE floor levers (all MEASURED / byte-exact):
+#   pack_memcam + overlap_scratch + bit_level_bitwise + bit_level_shift + attn_cam_div
+#   (WIDTH -> 896) ; overlap_depth (max-op not SUM) ; logsink_div + radix256_decode +
+#   newton_min (the feasible bounded divmod = 25 -> inline+FF 35).
+_INLINE_FF_FLOOR_LEVERS = dict(
+    pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+    bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+    logsink_div=True, radix256_decode=True, newton_min=True)
+
+
+def feasible_floor_levers(strategy: str, precision: int,
+                          decode_overlap: bool = False) -> dict:
+    """The MEASURED feasible-floor lever bundle for ``(strategy, precision)``.
+
+    Returns the kwargs dict that, applied to a ``FitConfig``, makes ``account()``
+    report the HONEST byte-exact floor (NOT the falsely-deep summed radix geometry):
+
+      * ``subroutine``       -> #913 fit levers (fp32 0.5B fit at 14 stored layers).
+      * ``efficient-ALU-*``  -> #916 inline+FF feasible floor (fp32 35 / fp64 31 /
+        fp64+decode-overlap 27).  ``fp64_divmod`` on for precision-64 bakes (a FREE
+        dtype choice; BLOG_SPEC §Basic-Arithmetic sanctions fp64 for the 32-bit ALU);
+        ``fp64_decode_overlap`` on when ``decode_overlap`` (the aggressive 1.5B-only
+        WIDTH-8192 lever).  Empty for ``lookup-table`` (already width-not-depth).
+    """
+    if strategy == "subroutine":
+        return dict(_SUBROUTINE_FLOOR_LEVERS)
+    if strategy.startswith("efficient-ALU"):
+        levers = dict(_INLINE_FF_FLOOR_LEVERS)
+        if precision >= 64:
+            levers["fp64_divmod"] = True
+            if decode_overlap:
+                levers["fp64_decode_overlap"] = True
+        return levers
+    return {}
+
+
+def feasible_floor_config(ops, strategy: str, precision: int = 32, *,
+                          decode_overlap: bool = False, code_size: int = 24,
+                          arch: QwenArch = QWEN2_5_ARCH,
+                          granularity: str = "nibble") -> "FitConfig":
+    """Build the ``FitConfig`` that reaches the HONEST feasible floor for ``(strategy,
+    precision)``.  The floor levers are all MEASURED / byte-exact (see
+    ``feasible_floor_levers``).  fp64 bakes clamp the config precision to 32 (the ALU
+    is a 32-bit datapath; ``precision=64`` selects the fp64 *dtype*, not a 64-bit
+    integer width) so the P8/P16/P32 depth-projection does not double-count."""
+    levers = feasible_floor_levers(strategy, precision, decode_overlap=decode_overlap)
+    cfg_precision = 32 if precision >= 64 else precision
+    return FitConfig(ops=frozenset(ops), muldiv_strategy=strategy,
+                     precision=cfg_precision, granularity=granularity,
+                     code_size=code_size, arch=arch, **levers)
 
 
 # ===========================================================================
@@ -1340,8 +1429,15 @@ def account(config: FitConfig) -> Accounting:
         hidden, inter, n_stored, n_applied = _spec_sizes(config)
 
     # ---- PRECISION scaling.  The baked ALU is 32-bit; other precisions are a
-    #      linear-in-nibble PROJECTION of the DIV/MOD iteration depth.
-    if config.efficient_alu and config.precision != 32 and config.has_divmod:
+    #      linear-in-nibble PROJECTION of the DIV/MOD iteration depth (of the DEEP
+    #      radix digit-recurrence).  It MUST NOT fire on a feasible-floor bundle whose
+    #      ``overlap_depth`` already computed the FINAL max-op depth from the measured
+    #      shallow divmod cascade — projecting the linear-in-nibble delta onto that
+    #      final depth is invalid (it would drive P8 to the ``max(1, ...)`` clamp of 1,
+    #      a nonsense number).  The feasible-floor bundles are a 32-bit integer datapath
+    #      by construction (the whole #916 story), so they are never precision-projected.
+    if (config.efficient_alu and config.precision != 32 and config.has_divmod
+            and not config.overlap_depth):
         delta_iters = _div_iters(config.precision) - _DIV_ITERS_32
         n_applied = max(1, n_applied + delta_iters * _DIV_LAYERS_PER_ITER)
         if not config.recurrent_divmod:
@@ -1461,22 +1557,82 @@ def _candidate_strategies(ops) -> List[str]:
     return list(MULDIV_STRATEGIES)
 
 
+# fp64 is a FREE bake dtype (BLOG_SPEC §Basic-Arithmetic sanctions doubles for the
+# 32-bit ALU), and it is the ONLY way to reach the inline+FF 31/27 floors — so the
+# solver considers it as a "precision" candidate for the feasible-floor bundles.  The
+# fp64 config keeps a 32-bit integer datapath (the config.precision stays 32); the 64
+# here selects the fp64 divmod levers, not a 64-bit integer width.
+_FP64_DTYPE = 64
+FLOOR_PRECISIONS = (32, _FP64_DTYPE)
+
+
 def _candidate_precisions(box: ConstraintBox) -> List[int]:
     box = box.effective()
     ps = [p for p in PRECISIONS if (box.max_precision is None or p <= box.max_precision)]
     return ps or [min(PRECISIONS)]
 
 
-def enumerate_configs(ops, box: ConstraintBox, code_size: int = 24) -> List[FitConfig]:
+def enumerate_configs(ops, box: ConstraintBox, code_size: int = 24, *,
+                      feasible_floor: bool = True,
+                      include_deep: bool = False) -> List[FitConfig]:
+    """Enumerate the candidate ``FitConfig``s for ``ops`` in ``box``.
+
+    THE FALSELY-DEEP-DEFAULT FIX.  By default (``feasible_floor=True``) each strategy
+    is enumerated with its MEASURED feasible-floor lever bundle (``feasible_floor_config``)
+    so ``solve()`` / ``fit()`` report the HONEST byte-exact floor per (strategy,
+    precision) — subroutine fp32 14, inline+FF fp32 35, inline+FF fp64 31, fp64 +
+    decode-overlap 27 — NOT the falsely-deep summed radix-16 geometry (subroutine 31,
+    inline-ALU 123/60) a bare all-levers-OFF config reports.
+
+    ``include_deep`` ALSO enumerates the bare all-levers-OFF (deep) configs, so the
+    deep radix tradeoff rows stay visible in the ranked table; they are just never the
+    silent-default best.  ``feasible_floor=False`` restores the legacy bare-only
+    enumeration (deep default) for byte-identity comparison.
+    """
     ops = frozenset(ops)
     arch = box.resolved_arch()
-    cfgs = []
+    cfgs: List[FitConfig] = []
+    seen = set()
+
+    def _add(cfg: FitConfig):
+        key = (cfg.muldiv_strategy, cfg.precision, cfg.pack_memcam,
+               cfg.overlap_scratch, cfg.bit_level_bitwise, cfg.bit_level_shift,
+               cfg.overlap_depth, cfg.attn_cam_div, cfg.logsink_div,
+               cfg.radix256_decode, cfg.newton_min, cfg.fp64_divmod,
+               cfg.fp64_decode_overlap)
+        if key not in seen:
+            seen.add(key)
+            cfgs.append(cfg)
+
+    max_prec = box.effective().max_precision
     for strat in _candidate_strategies(ops):
-        for prec in _candidate_precisions(box):
-            cfgs.append(FitConfig(
-                ops=ops,
-                muldiv_strategy=(strat if strat != "n/a" else "efficient-ALU-recurrent"),
-                precision=prec, granularity="nibble", code_size=code_size, arch=arch))
+        real_strat = strat if strat != "n/a" else "efficient-ALU-recurrent"
+        if feasible_floor:
+            # the MEASURED feasible-floor bundles are a 32-bit INTEGER datapath by
+            # construction (the whole #913/#916 story) — P8/P16 have no measured floor,
+            # only the invalid linear-in-nibble projection.  So the floor is enumerated
+            # at precision 32 (fp32 integer) and, for the inline+FF strategies, the fp64
+            # DTYPE (a FREE bake choice that reaches the 31/27 depth floors, plus the
+            # aggressive 1.5B-only decode-overlap at WIDTH 8192).
+            floor_precs = [32]
+            if strat.startswith("efficient-ALU"):
+                floor_precs.append(_FP64_DTYPE)
+            for prec in floor_precs:
+                # honor an explicit max_precision cap (fp64 DTYPE bakes a 32-bit
+                # datapath, so it passes any cap >= 32).
+                if max_prec is not None and min(prec, 32) > max_prec:
+                    continue
+                _add(feasible_floor_config(
+                    ops, real_strat, precision=prec, code_size=code_size, arch=arch))
+                if prec >= _FP64_DTYPE and strat.startswith("efficient-ALU"):
+                    # the aggressive 1.5B-only decode-overlap floor (WIDTH 8192).
+                    _add(feasible_floor_config(
+                        ops, real_strat, precision=prec, decode_overlap=True,
+                        code_size=code_size, arch=arch))
+        if include_deep or not feasible_floor:
+            for prec in _candidate_precisions(box):
+                _add(FitConfig(ops=ops, muldiv_strategy=real_strat, precision=prec,
+                               granularity="nibble", code_size=code_size, arch=arch))
     return cfgs
 
 
@@ -1516,14 +1672,22 @@ class SolveResult:
 
 
 def solve(ops, box: ConstraintBox, objective: str = "depth",
-          code_size: int = 24) -> SolveResult:
+          code_size: int = 24, *, feasible_floor: bool = True,
+          include_deep: bool = False) -> SolveResult:
     """Enumerate feasible configs for ``ops`` in ``box``, rank by ``objective``.
+
+    By default (``feasible_floor=True``) each strategy is accounted at its MEASURED
+    feasible floor (the honest byte-exact depth), NOT the falsely-deep summed radix
+    geometry — so the reported best is the honest floor.  ``include_deep=True`` also
+    surfaces the bare deep tradeoff rows.  ``feasible_floor=False`` restores the legacy
+    deep-default enumeration.
 
     Returns the best fit + the ranked feasible table; if INFEASIBLE, the binding
     constraint + the closest relaxation."""
     if objective not in OBJECTIVES:
         raise ValueError(f"objective {objective!r} not in {OBJECTIVES}")
-    cfgs = enumerate_configs(ops, box, code_size=code_size)
+    cfgs = enumerate_configs(ops, box, code_size=code_size,
+                             feasible_floor=feasible_floor, include_deep=include_deep)
     feasible, infeasible = [], []
     for cfg in cfgs:
         acc = account(cfg)
@@ -1608,7 +1772,8 @@ def fit(target: Optional[str] = None, *, ops=FULL, max_depth: Optional[int] = No
         max_width: Optional[int] = None, max_hidden: Optional[int] = None,
         max_intermediate: Optional[int] = None, precision: Optional[int] = None,
         max_steps_per_op: Optional[int] = None, minimize: str = "depth",
-        require_buildable: bool = False, code_size: int = 24) -> SolveResult:
+        require_buildable: bool = False, code_size: int = 24,
+        feasible_floor: bool = True, include_deep: bool = False) -> SolveResult:
     """Configurator front door.
 
     ``target``  — a named stock ('stock-0.5b'/'stock-1.5b'/'stock-7b') fixes the
@@ -1618,6 +1783,10 @@ def fit(target: Optional[str] = None, *, ops=FULL, max_depth: Optional[int] = No
     ``max_width`` — caps BOTH hidden and intermediate (the brief's ``max_width``).
     ``precision`` — max precision bits (8/16/32).
     ``minimize`` — objective: 'depth' | 'width' | 'steps' | 'params' | 'fits-named'.
+    ``feasible_floor`` — (DEFAULT True) account each strategy at its MEASURED honest
+                  floor (subroutine fp32 14 / inline+FF fp32 35 / fp64 31 / fp64+overlap
+                  27), NOT the falsely-deep summed radix geometry.  ``include_deep``
+                  additionally surfaces the bare deep tradeoff rows.
     """
     mh = max_hidden if max_hidden is not None else max_width
     mi = max_intermediate if max_intermediate is not None else max_width
@@ -1627,7 +1796,8 @@ def fit(target: Optional[str] = None, *, ops=FULL, max_depth: Optional[int] = No
         target=target, require_buildable=require_buildable)
     if minimize == "fits-named" and target is None:
         raise ValueError("minimize='fits-named' needs a target=")
-    return solve(ops, box, objective=minimize, code_size=code_size)
+    return solve(ops, box, objective=minimize, code_size=code_size,
+                 feasible_floor=feasible_floor, include_deep=include_deep)
 
 
 # ===========================================================================
