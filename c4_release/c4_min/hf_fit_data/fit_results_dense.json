@@ -1,0 +1,136 @@
+{
+  "fp32-radix|feedforward-unrolled": {
+    "rh": 3008,
+    "ri": 7920,
+    "rs": 123,
+    "applied": 123,
+    "n_fit": 3,
+    "bakeable": true,
+    "dtype": "fp32",
+    "winner": {
+      "id": "meta-llama/Llama-3.1-405B-FP8",
+      "hidden": 16384,
+      "inter": 53248,
+      "layers": 126,
+      "model_type": "llama",
+      "tie": false,
+      "vocab": null,
+      "total_params": 467557875712
+    }
+  },
+  "fp32-radix|looped-tied": {
+    "rh": 3008,
+    "ri": 7920,
+    "rs": 60,
+    "applied": 123,
+    "n_fit": 269,
+    "bakeable": true,
+    "dtype": "fp32",
+    "winner": {
+      "id": "Model-SafeTensors/L3-Aethora-15B",
+      "hidden": 4096,
+      "inter": 14336,
+      "layers": 64,
+      "model_type": "llama",
+      "tie": false,
+      "vocab": null,
+      "total_params": 16192110592
+    }
+  },
+  "fp64-radix|feedforward-unrolled": {
+    "rh": 3008,
+    "ri": 7920,
+    "rs": 123,
+    "applied": 123,
+    "n_fit": 3,
+    "bakeable": true,
+    "dtype": "fp64",
+    "winner": {
+      "id": "meta-llama/Llama-3.1-405B-FP8",
+      "hidden": 16384,
+      "inter": 53248,
+      "layers": 126,
+      "model_type": "llama",
+      "tie": false,
+      "vocab": null,
+      "total_params": 467557875712
+    }
+  },
+  "fp64-radix|looped-tied": {
+    "rh": 3008,
+    "ri": 7920,
+    "rs": 60,
+    "applied": 123,
+    "n_fit": 269,
+    "bakeable": true,
+    "dtype": "fp64",
+    "winner": {
+      "id": "Model-SafeTensors/L3-Aethora-15B",
+      "hidden": 4096,
+      "inter": 14336,
+      "layers": 64,
+      "model_type": "llama",
+      "tie": false,
+      "vocab": null,
+      "total_params": 16192110592
+    }
+  },
+  "fp32-logsink|feedforward-unrolled": {
+    "rh": 2624,
+    "ri": 4320,
+    "rs": 221,
+    "applied": 221,
+    "n_fit": 0,
+    "bakeable": false,
+    "dtype": "fp32",
+    "winner": null
+  },
+  "fp32-logsink|looped-tied": {
+    "rh": 2624,
+    "ri": 4320,
+    "rs": 74,
+    "applied": 221,
+    "n_fit": 95,
+    "bakeable": false,
+    "dtype": "fp32",
+    "winner": {
+      "id": "OpenBuddy/openbuddy-zero-14b-v22.3-32k",
+      "hidden": 4096,
+      "inter": 11008,
+      "layers": 78,
+      "model_type": "llama",
+      "tie": false,
+      "vocab": null,
+      "total_params": 16408231936
+    }
+  },
+  "fp64-logsink|feedforward-unrolled": {
+    "rh": 2624,
+    "ri": 4320,
+    "rs": 221,
+    "applied": 221,
+    "n_fit": 0,
+    "bakeable": true,
+    "dtype": "fp64",
+    "winner": null
+  },
+  "fp64-logsink|looped-tied": {
+    "rh": 2624,
+    "ri": 4320,
+    "rs": 74,
+    "applied": 221,
+    "n_fit": 95,
+    "bakeable": true,
+    "dtype": "fp64",
+    "winner": {
+      "id": "OpenBuddy/openbuddy-zero-14b-v22.3-32k",
+      "hidden": 4096,
+      "inter": 11008,
+      "layers": 78,
+      "model_type": "llama",
+      "tie": false,
+      "vocab": null,
+      "total_params": 16408231936
+    }
+  }
+}
