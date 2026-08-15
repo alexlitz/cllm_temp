@@ -49,11 +49,23 @@ _RE_VA      = re.compile(r'\bva_(list|start|arg|end)\b')
 _RE_TYPEDEF_FNPTR = re.compile(r'typedef\b[^;]*\(\s*\*\s*[A-Za-z_]\w*\s*\)\s*\(')
 
 
+# long-long is NOW ADDRESSABLE (#920): the transpiler's softint64 pass
+# (id_port/softint64.py) lowers `long long`/`unsigned long long`/`int64_t`/
+# `uint64_t` to TWO 32-bit words on the native-32-bit machine (add/sub-carry,
+# schoolbook mul, binary long-division, word-boundary shifts, per-word bitwise,
+# hi-first signed+unsigned compares, int<->ll conversions).  So `longlong` is no
+# longer an auto-OUT-OF-SUBSET boundary -- it counts IN-SUBSET.  Set
+# ``C4_LONGLONG_OOB=1`` to restore the legacy (pre-softint64) classification for a
+# before/after A-B comparison.
+_LONGLONG_IS_OOB = bool(os.environ.get("C4_LONGLONG_OOB"))
+
+
 def out_of_subset_reason(src: str) -> Optional[str]:
-    """Return a short OUT-OF-SUBSET reason (B3/B9/float/longlong) or None.
+    """Return a short OUT-OF-SUBSET reason (B3/B9/float) or None.
 
     These are the constructs Doom deliberately sidesteps; a failure on them is
-    a documented subset-boundary, NOT a transpiler bug."""
+    a documented subset-boundary, NOT a transpiler bug.  ``long long`` is NO
+    LONGER here -- softint64 makes it addressable (see the module note)."""
     if _RE_FNPTR.search(src) or _RE_FNPTR2.search(src) or _RE_TYPEDEF_FNPTR.search(src):
         # function pointers -> B3 (Doom uses the FN_ID __actions__ dispatch)
         return "B3_fnptr"
@@ -64,9 +76,8 @@ def out_of_subset_reason(src: str) -> Optional[str]:
         return "B9_varargs"
     if _RE_FLOAT.search(src):
         return "float"          # c4 is an integer word VM; floats unsupported
-    if _RE_LONGLONG.search(src):
-        # long-long: c4 word is 64-bit so `long long` semantics MOSTLY coincide,
-        # but explicit LL literals / >32-bit intent is out-of-subset by the task.
+    if _LONGLONG_IS_OOB and _RE_LONGLONG.search(src):
+        # legacy A-B mode only (C4_LONGLONG_OOB=1): pre-softint64 classification.
         return "longlong"
     return None
 
