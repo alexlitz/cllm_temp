@@ -91,6 +91,22 @@ R256E attention-CAM DIV); the three remaining binders are cracked here (all DEFA
   loop = Universal-Transformer, divmod body stored once) — still > 24, and looping is
   excluded for stock feed-forward Qwen2.  IRREDUCIBLE BINDER: divmod unrolled depth.
 
+  * **logsink_div** (this pass) — the §653 LOG-SINK divide was PROPOSED to close DEPTH:
+    it computes ``1/b`` via the softmax1 sink (NOT a digit-loop) + Newton + schoolbook
+    ``q·b`` verify + ±1, byte-exact (Python ref 56,514/56,514 fp64; fp32-refine also
+    byte-exact).  MEASURED from ``compile_logsink_blocks``, the compiled feed-forward
+    block count is **127**, DEEPER than R256E's 98 — the "~14 blocks" in the docstring is
+    the 15-block SHALLOW stage part; the quotient DECODE (``floor(QF)`` → 8 nibbles) and
+    the schoolbook ``q·b`` VERIFY are each an 8-nibble MSB-first digit-recurrence (4× ~24 +
+    2 schoolbook = 112 blocks), the SAME sequential dependency the radix loop has.  So
+    log-sink MOVES the recurrence (estimate → decode+verify), it does NOT remove it:
+    max-op depth 108 → 137.  It DOES relax INTERMEDIATE (widest FFN 2422 < R256E 3376).
+    VERDICT (both fp32 and fp64): inline + feed-forward does NOT fit stock 0.5B/1.5B/7B on
+    DEPTH under EITHER div strategy — the divmod digit-recurrence depth is the irreducible
+    binder, and it is deeper (not shallower) with the reciprocal divide.  fp64 vs fp32 is a
+    bake-dtype choice, not a depth change (the fp64-native log-sink and the fp32-refine
+    variant both need the schoolbook nibble decode).
+
 Honesty (verified vs estimated)
 -------------------------------
   * **lookup-table** width, **efficient-ALU** unrolled/recurrent depth+width — VERIFIED:
@@ -308,6 +324,23 @@ class FitConfig:
                                      #   forward) muldiv fit lever — DIV/MOD stay on the
                                      #   persistent stack (UNLIKE subroutine, which exports
                                      #   them to program STEPS).
+    # ---- #916 continued — LOG-SINK DIV depth lever (§653) — DEFAULT OFF ----------
+    logsink_div: bool = False        # LOG-SINK DIV/MOD (§653 nibble_logsink_blocks): the
+                                     #   softmax1 reciprocal sink (1/b over 8 log-key KV
+                                     #   rows) + Newton + schoolbook q*b + ±1 correction,
+                                     #   INLINE + feed-forward, byte-exact (Python ref
+                                     #   56,514/56,514 fp64; fp32-refine also byte-exact).
+                                     #   Proposed as the DEPTH lever to replace the radix
+                                     #   digit-recurrence (the ~98-block R256E cascade).
+                                     #   MEASURED live from compile_logsink_blocks: the
+                                     #   compiled feed-forward block count is 127 (NOT the
+                                     #   docstring's "~14 stages") — the quotient DECODE +
+                                     #   schoolbook VERIFY are themselves 8-nibble MSB-first
+                                     #   digit-recurrences (4 decompose x ~24 + 2 schoolbook),
+                                     #   so log-sink MOVES the recurrence, it does not remove
+                                     #   it.  Width is NARROWER (widest FFN 2422 < R256E 3376).
+                                     #   Replaces attn_cam_div's R256E as the divmod family in
+                                     #   the max-op overlap depth.  See _logsink_div_geometry.
 
     @property
     def subset(self) -> Subset:
@@ -697,6 +730,88 @@ def _attn_cam_div_geometry(code_size: int, recurrent_divmod: bool) -> dict:
     }
 
 
+@lru_cache(maxsize=None)
+def _logsink_div_geometry(code_size: int) -> dict:
+    """MEASURED geometry of the §653 LOG-SINK DIV/MOD swap, all read live from
+    ``nibble_logsink_blocks.compile_logsink_blocks`` (byte-exact: Python ref
+    56,514/56,514 fp64 DIV+MOD; fp32-refine reference also byte-exact — see
+    ``test_logsink_div.py``).
+
+    The log-sink divide computes ``1/b`` via the softmax1 sink (NOT a digit-loop)
+    + Newton + ``q = floor(a·r)`` + schoolbook ``q·b`` verify + ±1 correction.  The
+    HOPE (this pass tests it) is that its shallow reciprocal replaces the radix
+    digit-recurrence and closes DEPTH.  The HONEST MEASURED result:
+
+      * ``blocks`` — the COMPILED feed-forward block count.  The module docstring's
+        "~14 blocks" is the STAGE count (bm1/logq/recip-attn/newton/qf/.../finalize);
+        the compiled feed-forward chain is FAR larger because the quotient DECODE
+        (``floor(QF)`` → 8 nibbles, MSB-first) and the schoolbook ``q·b`` VERIFY are
+        each an 8-nibble sequential digit-recurrence (each ``reduce`` feeds the next
+        ``extract``).  MEASURED: 127 blocks at code_size=24.
+      * ``decompose_blocks`` — the digit-recurrence part (4× 8-nibble MSB-first
+        decompose: quotient q, refine r, div-result d, mod-result m).
+      * ``schoolbook_blocks`` — the two ``q·b`` product/carry/recombine + rem passes.
+      * ``fixed_blocks`` — the genuinely SHALLOW part (bm1, logq, recip-attn, 4×
+        newton, qf, the seeds, finalize): ~15, the docstring's "~14".
+      * ``ffn_max`` — the widest FFN intermediate (the ``q·b`` split, 2422 — NARROWER
+        than the R256E qhat·divisor 3376, so log-sink RELAXES intermediate).
+      * ``running_residual`` — the LOGSINK band-group running scratch width.
+
+    Log-sink is fp64 native (the reciprocal precision + the ``q·b < 2^34`` compare
+    exceed fp32's 2^24).  A genuinely-fp32 variant (``nibble_logsink_fp32``,
+    approximate-then-refine) is byte-exact too but has NO block compiler — its
+    algorithm is the SAME schoolbook decode, so it is at least as deep.
+    """
+    import os
+    from . import qwen_full_vm as _Q
+    from . import nibble_logsink_blocks as _LS
+    prev = os.environ.get("C4_LOGSINK_DIV")
+    os.environ["C4_LOGSINK_DIV"] = "1"
+    try:
+        sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=True)
+        QL = _Q.QwenFullLayout(code_size, sub, efficient_alu=True,
+                               recurrent_divmod=False, div_logsink=True)
+        L = QL.L
+        ls_blocks, kdiv = _LS.compile_logsink_blocks(L, L.D)
+    finally:
+        if prev is None:
+            os.environ.pop("C4_LOGSINK_DIV", None)
+        else:
+            os.environ["C4_LOGSINK_DIV"] = prev
+
+    ffn_max = max((int(s["W_up"].shape[0]) for n, s in ls_blocks
+                   if isinstance(s, dict) and "W_up" in s), default=0)
+    _DEC = ("-q-ext", "-q-snap", "-q-red", "-r-ext", "-r-snap", "-r-red",
+            "-d-ext", "-d-snap", "-d-red", "-m-ext", "-m-snap", "-m-red")
+    decompose = [n for n, _ in ls_blocks if any(p in n for p in _DEC)]
+    schoolbook = [n for n, _ in ls_blocks
+                  if "-qb-" in n or n.endswith("-rem") or n.endswith("-correct")]
+    fixed = [n for n, _ in ls_blocks
+             if n not in set(decompose) and n not in set(schoolbook)]
+
+    # the LOGSINK band-group running-scratch width (measured from the layout _names).
+    names = getattr(L, "_names", {})
+    a = L.LOGSINK
+    band_starts = set()
+    for bn in dir(a):
+        if bn.startswith("_"):
+            continue
+        v = getattr(a, bn)
+        if isinstance(v, int):
+            band_starts.add(v)
+    running_residual = sum(w for k, (off, w) in names.items() if off in band_starts)
+
+    return {
+        "blocks": len(ls_blocks),
+        "decompose_blocks": len(decompose),
+        "schoolbook_blocks": len(schoolbook),
+        "fixed_blocks": len(fixed),
+        "ffn_max": ffn_max,
+        "running_residual": running_residual,
+        "kdiv_blocks": len(kdiv),
+    }
+
+
 def _spec_sizes(config: FitConfig,
                 subset: Optional[Subset] = None) -> Tuple[int, int, int, int]:
     """(hidden, intermediate, stored_layers, applied_depth) at the config's op-subset
@@ -766,6 +881,13 @@ def _spec_sizes(config: FitConfig,
         #   the wider of the two (the radix-256 estimate-CAM trades the threshold bank
         #   for a wide per-digit multiply; see the report's intermediate caveat).
         inter = max(g["inter_without_leankb"], g["r256e_ffn_max"])
+        # ---- LOG-SINK DIV lever: the §653 shallow-reciprocal divide replaces the R256E
+        #   digit-recurrence.  Its widest FFN (the schoolbook q*b split, 2422) is NARROWER
+        #   than the R256E qhat*divisor lane multiply (3376), so it RELAXES intermediate.
+        #   MEASURED live.  (Depth is handled in the overlap_depth branch below.)
+        if config.logsink_div:
+            lg = _logsink_div_geometry(config.code_size)
+            inter = max(g["inter_without_leankb"], lg["ffn_max"])
         # DEPTH: the radix-16 long-division blocks (lean-*) are replaced by the R256E
         #   SRT pipeline blocks.  Recurrent divmod stores the SRT cell once (r256e_stored
         #   == 36); unrolled feed-forward stores every applied step (r256e_applied == 90).
@@ -779,8 +901,20 @@ def _spec_sizes(config: FitConfig,
         #   shared physical layers.  MEASURED live.  ``applied`` (per-forward) already
         #   equals the deepest op cascade, so it is set to the same max-op depth.
         if config.overlap_depth:
+            div_unrolled = g["r256e_applied"]
+            div_recurrent = g["r256e_stored"]
+            # ---- LOG-SINK DIV depth lever: replace the R256E digit-recurrence with the
+            #   §653 log-sink divide (softmax1 reciprocal + Newton + schoolbook + ±1).
+            #   MEASURED live: the log-sink COMPILED feed-forward block count (127) is the
+            #   divmod family cascade.  Log-sink has no recurrent block-compiler (it is
+            #   the UNROLLED shallow-reciprocal divide), so the tied form is accounted at
+            #   the same block count.  The DEPTH does NOT shrink — the quotient DECODE +
+            #   schoolbook VERIFY are themselves 8-nibble digit-recurrences.
+            if config.logsink_div:
+                lg = _logsink_div_geometry(config.code_size)
+                div_unrolled = div_recurrent = lg["blocks"]
             depth, _fam = _maxop_overlap_depth(
-                config.code_size, g["r256e_applied"], g["r256e_stored"],
+                config.code_size, div_unrolled, div_recurrent,
                 rec, config.bit_level_shift)
             n_stored = depth
             n_applied = depth

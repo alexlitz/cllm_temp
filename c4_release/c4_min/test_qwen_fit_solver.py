@@ -637,3 +637,67 @@ def test_new_levers_default_off_leave_base_accounting_unchanged():
     # byte-identical to the prior pass (3008 / 7920 / 123).
     a = _inline_ff()
     assert (a.hidden, a.intermediate, a.stored_layers) == (3008, 7920, 123)
+
+
+# ===========================================================================
+# #916 continued — LOG-SINK DIV depth lever (§653).  Tests whether the shallow
+# softmax1-reciprocal divide closes the DEPTH axis that the radix-256 R256E div
+# left binding (108 > 24).  MEASURED result: it does NOT — the log-sink compiled
+# feed-forward block count (127) is DEEPER than R256E (98), because the quotient
+# DECODE + schoolbook VERIFY are themselves 8-nibble digit-recurrences.  Log-sink
+# does RELAX intermediate (its widest FFN 2422 < R256E 3376).  All DEFAULT OFF.
+# ===========================================================================
+def test_logsink_geometry_is_measured_and_deeper_than_the_stage_count():
+    # The §653 docstring's "~14 blocks" is the STAGE count; the compiled feed-forward
+    # chain is MEASURED far deeper — the quotient decode + schoolbook verify unroll into
+    # four 8-nibble MSB-first digit-recurrences (+ two schoolbook passes).
+    g = S._logsink_div_geometry(24)
+    assert g["blocks"] == 127                            # measured compiled block count
+    assert g["fixed_blocks"] == 15                       # the genuinely-shallow ~14 stages
+    assert g["decompose_blocks"] == 96                   # 4x 8-nibble digit-recurrence
+    assert g["schoolbook_blocks"] == 16                  # 2x q*b product/carry/rem
+    # the shallow "~14" part is a small MINORITY of the honest depth.
+    assert g["fixed_blocks"] < g["decompose_blocks"]
+    assert g["blocks"] > g["fixed_blocks"] * 8
+
+
+def test_logsink_div_relaxes_intermediate_but_deepens_depth():
+    # Swap the R256E radix-256 div for the §653 log-sink div in the inline+FF fit:
+    #   * INTERMEDIATE RELAXES (widest FFN 2422 < R256E 3376) — still <= 4864.
+    #   * DEPTH WORSENS (127-block log-sink cascade > 98-block R256E) — 108 -> 137.
+    # Log-sink MOVES the digit-recurrence (estimate -> decode+verify); it does not remove it.
+    r256e = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                       bit_level_shift=True, attn_cam_div=True, overlap_depth=True)
+    logsink = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                         bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+                         logsink_div=True)
+    assert logsink.intermediate < r256e.intermediate     # log-sink narrower FFN
+    assert logsink.intermediate <= 4864                  # still fits INTERMEDIATE
+    assert logsink.hidden == r256e.hidden == 896         # hidden unchanged (fits)
+    assert logsink.stored_layers > r256e.stored_layers   # ...but DEEPER
+    assert logsink.stored_layers == 137 and r256e.stored_layers == 108
+
+
+def test_logsink_div_does_not_close_depth_for_any_stock_model():
+    # THE GOAL VERDICT: log-sink div does NOT make inline + feed-forward fit stock
+    # DEPTH — not 0.5B (24), not 1.5B (28), not 7B (28).  Depth 137 > all caps.
+    logsink = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                         bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+                         logsink_div=True)
+    assert logsink.hidden <= 896 and logsink.intermediate <= 4864     # WIDTH fits
+    for tgt in ("stock-0.5b", "stock-1.5b", "stock-7b"):
+        assert logsink.stored_layers > S.STOCK_TARGETS[tgt].layers    # DEPTH binds everywhere
+
+
+def test_logsink_div_default_off_is_byte_identical():
+    # logsink_div DEFAULT OFF -> the inline+FF accounting is the prior-pass R256E one.
+    off = _inline_ff(pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+                     bit_level_shift=True, attn_cam_div=True, overlap_depth=True)
+    assert (off.hidden, off.intermediate, off.stored_layers) == (896, 3376, 108)
+    # logsink_div is a no-op WITHOUT the attn_cam_div divmod-swap it modifies: the bare
+    # base inline-ALU accounting (no attn_cam_div) is byte-identical with the flag on/off.
+    on = _inline_ff(logsink_div=True)
+    base = _inline_ff()
+    assert (on.hidden, on.intermediate, on.stored_layers, on.applied_depth) == \
+           (base.hidden, base.intermediate, base.stored_layers, base.applied_depth) == \
+           (3008, 7920, 123, 123)
