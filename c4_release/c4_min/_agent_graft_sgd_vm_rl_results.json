@@ -1,0 +1,323 @@
+{
+  "host": "Qwen/Qwen2.5-0.5B-Instruct",
+  "device": "cuda:1",
+  "host_params": 494032768,
+  "graft_params": 65,
+  "temp": 30.0,
+  "margin_m": 0.5,
+  "ref_910": {
+    "basin_static": 0.0003,
+    "basin_recovery": 0.001,
+    "lipschitz": 340.0,
+    "held_steps": 400
+  },
+  "host_byte_identity_graft_off": true,
+  "host_sanity_grafted": [
+    [
+      "What is the capital of France? Reply with exactly: The capital is Paris.",
+      "The capital of France is Paris."
+    ],
+    [
+      "Describe water in one sentence.",
+      "Water is the universal solvent that forms the"
+    ],
+    [
+      "Name a primary color and explain briefly.",
+      "The primary color is typically defined as the"
+    ],
+    [
+      "Give the opposite of hot in a full sentence.",
+      "The opposite of \"hot\" is \""
+    ],
+    [
+      "Which planet is the Red Planet? Answer in a sentence.",
+      "The Red Planet refers to Mars, which"
+    ],
+    [
+      "What language is spoken in Germany? Full sentence.",
+      "The official language of Germany is German."
+    ]
+  ],
+  "graft_byte_exact_before": {
+    "ok": 320,
+    "n": 320,
+    "min_margin": 0.9999999999998128,
+    "per_op": {
+      "ADD": "40/40",
+      "SUB": "40/40",
+      "CMP_LT": "40/40",
+      "CMP_EQ": "40/40",
+      "CMP_GT": "40/40",
+      "LI": "40/40",
+      "SI": "40/40",
+      "DIV": "40/40"
+    }
+  },
+  "use_it_demo": [
+    {
+      "op": "ADD",
+      "a": 173,
+      "b": 42,
+      "expr": "173+42",
+      "graft": 215,
+      "exact": 215,
+      "ok": true
+    },
+    {
+      "op": "SUB",
+      "a": 200,
+      "b": 57,
+      "expr": "200-57",
+      "graft": 143,
+      "exact": 143,
+      "ok": true
+    },
+    {
+      "op": "DIV",
+      "a": 7,
+      "b": 246,
+      "expr": "246//7",
+      "graft": 35,
+      "exact": 35,
+      "ok": true
+    },
+    {
+      "op": "CMP_LT",
+      "a": 12,
+      "b": 99,
+      "expr": "(12<99)",
+      "graft": 1,
+      "exact": 1,
+      "ok": true
+    },
+    {
+      "op": "CMP_GT",
+      "a": 250,
+      "b": 4,
+      "expr": "(250>4)",
+      "graft": 1,
+      "exact": 1,
+      "ok": true
+    }
+  ],
+  "rl_survival": [
+    {
+      "regime": "dormant_graft_lm_only",
+      "desc": "REALISTIC: RL = host LM loss only, graft NOT invoked (off host forward)",
+      "lr": 0.0001,
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.9999999999998128,
+      "graft_plateau_grad_norm": 0.0,
+      "max_rl_grad_into_graft": 0.0,
+      "graft_weight_drift": 0.0,
+      "inside_static_basin": true,
+      "held_by_margin_plateau": false,
+      "lm_loss_before": 1.5122414827346802,
+      "lm_loss_after": 2.815608013406745e-07,
+      "n_steps": 120,
+      "survived": true
+    },
+    {
+      "regime": "active_shared_optim",
+      "desc": "STRESS: RL invokes the graft (VM reward) + host LM, graft in SAME optimizer",
+      "lr": 0.0001,
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.726104736328125,
+      "graft_plateau_grad_norm": 0.0,
+      "max_rl_grad_into_graft": 32.5053596552704,
+      "graft_weight_drift": 0.004929032522950439,
+      "inside_static_basin": false,
+      "held_by_margin_plateau": true,
+      "lm_loss_before": 1.5546668767929077,
+      "lm_loss_after": 5.835573233525793e-07,
+      "n_steps": 120,
+      "survived": true
+    },
+    {
+      "regime": "active_shared_optim_aggressive",
+      "desc": "HARD STRESS: same, 10x lr \u2014 can bare shared-optim be driven off the attractor?",
+      "lr": 0.001,
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.601287841796875,
+      "graft_plateau_grad_norm": 0.0,
+      "max_rl_grad_into_graft": 299.2182327019027,
+      "graft_weight_drift": 0.042878308294536156,
+      "inside_static_basin": false,
+      "held_by_margin_plateau": true,
+      "lm_loss_before": 1.5546668767929077,
+      "lm_loss_after": 0.1586226522922516,
+      "n_steps": 120,
+      "survived": true
+    },
+    {
+      "regime": "active_frozen_graft",
+      "desc": "PROTECTION-FREEZE: graft invoked but requires_grad=False",
+      "lr": 0.0001,
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.9999999999998128,
+      "graft_plateau_grad_norm": 0.0,
+      "max_rl_grad_into_graft": 0.0,
+      "graft_weight_drift": 0.0,
+      "inside_static_basin": true,
+      "held_by_margin_plateau": false,
+      "lm_loss_before": 1.5546668767929077,
+      "lm_loss_after": 6.766538263036637e-07,
+      "n_steps": 120,
+      "survived": true
+    },
+    {
+      "regime": "active_joint_margin",
+      "desc": "PROTECTION-JOINT: graft invoked at 10x lr, + #910 margin-plateau term",
+      "lr": 0.001,
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.537139892578125,
+      "graft_plateau_grad_norm": 0.0,
+      "max_rl_grad_into_graft": 407.1818789184156,
+      "graft_weight_drift": 0.044296899646116675,
+      "inside_static_basin": false,
+      "held_by_margin_plateau": true,
+      "lm_loss_before": 1.5546668767929077,
+      "lm_loss_after": 2.936086416244507,
+      "n_steps": 120,
+      "survived": true
+    }
+  ],
+  "breakpoint_probe": [
+    {
+      "mode": "bare",
+      "lr": 0.001,
+      "steps": 200,
+      "byte_exact": "320/320",
+      "pct": 100.0,
+      "min_margin": 0.525115966796875,
+      "drift": 0.07897276970430397,
+      "broke": false
+    },
+    {
+      "mode": "joint",
+      "lr": 0.001,
+      "steps": 200,
+      "byte_exact": "320/320",
+      "pct": 100.0,
+      "min_margin": 0.9259033203125,
+      "drift": 0.07209356016063669,
+      "broke": false
+    },
+    {
+      "mode": "bare",
+      "lr": 0.003,
+      "steps": 300,
+      "byte_exact": "42/320",
+      "pct": 13.125,
+      "min_margin": -228.1249237060547,
+      "drift": 0.33526919008971195,
+      "broke": true
+    },
+    {
+      "mode": "joint",
+      "lr": 0.003,
+      "steps": 300,
+      "byte_exact": "54/320",
+      "pct": 16.875,
+      "min_margin": -232.20073699951172,
+      "drift": 0.21323142281719284,
+      "broke": true
+    },
+    {
+      "mode": "bare",
+      "lr": 0.01,
+      "steps": 400,
+      "byte_exact": "80/320",
+      "pct": 25.0,
+      "min_margin": -1362.1246032714844,
+      "drift": 0.7515467777380962,
+      "broke": true
+    },
+    {
+      "mode": "joint",
+      "lr": 0.01,
+      "steps": 400,
+      "byte_exact": "39/320",
+      "pct": 12.1875,
+      "min_margin": -9423.433959960938,
+      "drift": 1.4282718133210375,
+      "broke": true
+    },
+    {
+      "mode": "bare",
+      "lr": 0.03,
+      "steps": 400,
+      "byte_exact": "104/320",
+      "pct": 32.5,
+      "min_margin": -6861.960662841797,
+      "drift": 0.8488435867593659,
+      "broke": true
+    },
+    {
+      "mode": "joint",
+      "lr": 0.03,
+      "steps": 400,
+      "byte_exact": "106/320",
+      "pct": 33.125,
+      "min_margin": NaN,
+      "drift": NaN,
+      "broke": true
+    }
+  ],
+  "bare_break_at": [
+    0.003,
+    300,
+    13.125
+  ],
+  "joint_break_at": [
+    0.003,
+    300,
+    16.875
+  ],
+  "verdict": {
+    "a_grafts_byte_exact": true,
+    "host_still_sane": true,
+    "host_byte_identical_graft_off": true,
+    "b_survives_dormant_rl": true,
+    "b_survives_active_shared_optim": true,
+    "b_survives_active_shared_aggressive": true,
+    "b_survives_active_frozen": true,
+    "b_survives_active_joint": true,
+    "rl_grad_reached_graft_in_stress": true,
+    "bare_break_at": [
+      0.003,
+      300,
+      13.125
+    ],
+    "joint_break_at": [
+      0.003,
+      300,
+      16.875
+    ],
+    "needs_protection": true,
+    "c_actually_used": true,
+    "all_three_with_protection": true
+  },
+  "peak_rss_gb": 4.166603088378906,
+  "elapsed_s": 932.0350692272186
+}
