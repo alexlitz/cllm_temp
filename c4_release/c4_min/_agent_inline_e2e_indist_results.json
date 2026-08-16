@@ -1,0 +1,45 @@
+{
+  "in_dist_same_range": {
+    "train": {
+      "n_arith": 360,
+      "n_non": 120,
+      "trigger_recall": "360/360",
+      "trigger_recall_pct": 100.0,
+      "false_trigger": "0/120",
+      "false_trigger_pct": 0.0,
+      "op_exact": "360/360",
+      "operands_exact": "319/360",
+      "full_inline": "319/360",
+      "full_inline_pct": 88.61111111111111,
+      "per_op": {
+        "ADD": "57/60",
+        "SUB": "52/60",
+        "DIV": "54/60",
+        "CMP_LT": "52/60",
+        "CMP_EQ": "50/60",
+        "CMP_GT": "54/60"
+      }
+    },
+    "heldout": {
+      "n_arith": 120,
+      "n_non": 40,
+      "trigger_recall": "120/120",
+      "trigger_recall_pct": 100.0,
+      "false_trigger": "0/40",
+      "false_trigger_pct": 0.0,
+      "op_exact": "56/120",
+      "operands_exact": "31/120",
+      "full_inline": "8/120",
+      "full_inline_pct": 6.666666666666667,
+      "per_op": {
+        "ADD": "1/20",
+        "SUB": "0/20",
+        "DIV": "0/20",
+        "CMP_LT": "0/20",
+        "CMP_EQ": "1/20",
+        "CMP_GT": "6/20"
+      }
+    },
+    "final_loss": 0.3066644072532654
+  }
+}

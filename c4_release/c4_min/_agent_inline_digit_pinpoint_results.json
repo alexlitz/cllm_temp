@@ -1,0 +1,22 @@
+{
+  "host": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dev": "cuda:0",
+  "same-range disjoint pairs": {
+    "train_a": "500/500",
+    "train_b": "500/500",
+    "test_a": "150/150",
+    "test_b": "150/150",
+    "test_a_pct": 100.0,
+    "test_b_pct": 100.0
+  },
+  "disjoint value range (mag shift)": {
+    "train_a": "500/500",
+    "train_b": "500/500",
+    "test_a": "150/150",
+    "test_b": "149/150",
+    "test_a_pct": 100.0,
+    "test_b_pct": 99.33333333333333
+  },
+  "peak_rss_gb": 4.145709991455078,
+  "elapsed_s": 17.73724889755249
+}

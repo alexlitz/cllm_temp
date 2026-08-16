@@ -1,0 +1,62 @@
+{
+  "host": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dev": "cpu",
+  "final_token::in-dist (unseen pairs, seen range+templates)": {
+    "train": {
+      "a": "400/400",
+      "b": "400/400",
+      "both": "400/400",
+      "both_pct": 100.0
+    },
+    "test": {
+      "a": "15/120",
+      "b": "8/120",
+      "both": "1/120",
+      "both_pct": 0.8333333333333334
+    }
+  },
+  "final_token::OOD (disjoint value range + unseen templates)": {
+    "train": {
+      "a": "400/400",
+      "b": "400/400",
+      "both": "400/400",
+      "both_pct": 100.0
+    },
+    "test": {
+      "a": "0/120",
+      "b": "0/120",
+      "both": "0/120",
+      "both_pct": 0.0
+    }
+  },
+  "digit_pointer::in-dist (unseen pairs, seen range+templates)": {
+    "train": {
+      "a": "400/400",
+      "b": "341/400",
+      "both": "341/400",
+      "both_pct": 85.25
+    },
+    "test": {
+      "a": "19/120",
+      "b": "1/120",
+      "both": "0/120",
+      "both_pct": 0.0
+    }
+  },
+  "digit_pointer::OOD (disjoint value range + unseen templates)": {
+    "train": {
+      "a": "400/400",
+      "b": "400/400",
+      "both": "400/400",
+      "both_pct": 100.0
+    },
+    "test": {
+      "a": "0/120",
+      "b": "0/120",
+      "both": "0/120",
+      "both_pct": 0.0
+    }
+  },
+  "peak_rss_gb": 4.1464691162109375,
+  "elapsed_s": 77.34800267219543
+}
