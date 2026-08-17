@@ -1,0 +1,242 @@
+{
+  "host": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dev": "cuda:0",
+  "maxd": 3,
+  "cam_layer": 0,
+  "compose_selfcheck_all_bytes": "256/256",
+  "split_A_indist_heldout": {
+    "digit_cam": {
+      "min_support": 74,
+      "train": {
+        "n": 240,
+        "a_full": 240,
+        "b_full": 240,
+        "place_a": [
+          "240/240",
+          "240/240",
+          "240/240"
+        ],
+        "place_b": [
+          "240/240",
+          "240/240",
+          "240/240"
+        ]
+      },
+      "heldout": {
+        "n": 600,
+        "a_full": 600,
+        "b_full": 600,
+        "place_a": [
+          "600/600",
+          "600/600",
+          "600/600"
+        ],
+        "place_b": [
+          "600/600",
+          "600/600",
+          "600/600"
+        ]
+      },
+      "heldout_place_specific": {
+        "n": 600,
+        "a_full": 600,
+        "b_full": 600,
+        "place_a": [
+          "600/600",
+          "600/600",
+          "600/600"
+        ],
+        "place_b": [
+          "600/600",
+          "600/600",
+          "600/600"
+        ]
+      }
+    },
+    "exact_compose_heldout": {
+      "a": "600/600",
+      "b": "600/600",
+      "both": "600/600",
+      "both_pct": 100.0
+    },
+    "exact_compose_oracle_digits": "600/600",
+    "learned_readout_heldout": {
+      "place_a": [
+        "600/600",
+        "600/600",
+        "600/600"
+      ],
+      "place_b": [
+        "600/600",
+        "600/600",
+        "600/600"
+      ],
+      "a_full": 600,
+      "b_full": 600,
+      "n": 600
+    },
+    "learned_compose_heldout": {
+      "a": "600/600",
+      "b": "600/600",
+      "both": "600/600",
+      "both_pct": 100.0
+    },
+    "e2e_exact_compose": {
+      "n_arith": 600,
+      "trigger_recall": "600/600",
+      "false_trigger": "0/40",
+      "op_exact": "598/600",
+      "operands_exact": "600/600",
+      "full_inline": "598/600",
+      "full_inline_pct": 99.66666666666667,
+      "full_inline_oracle_op": "600/600",
+      "full_inline_oracle_op_pct": 100.0,
+      "per_op": {
+        "ADD": "100/100",
+        "SUB": "100/100",
+        "DIV": "100/100",
+        "CMP_LT": "98/100",
+        "CMP_EQ": "100/100",
+        "CMP_GT": "100/100"
+      }
+    },
+    "e2e_learned": {
+      "n_arith": 600,
+      "trigger_recall": "600/600",
+      "false_trigger": "0/40",
+      "op_exact": "598/600",
+      "operands_exact": "600/600",
+      "full_inline": "598/600",
+      "full_inline_pct": 99.66666666666667,
+      "full_inline_oracle_op": "600/600",
+      "full_inline_oracle_op_pct": 100.0,
+      "per_op": {
+        "ADD": "100/100",
+        "SUB": "100/100",
+        "DIV": "100/100",
+        "CMP_LT": "98/100",
+        "CMP_EQ": "100/100",
+        "CMP_GT": "100/100"
+      }
+    }
+  },
+  "split_B_disjoint_magnitude": {
+    "digit_cam": {
+      "min_support": 74,
+      "train": {
+        "n": 240,
+        "a_full": 240,
+        "b_full": 240,
+        "place_a": [
+          "240/240",
+          "240/240",
+          "240/240"
+        ],
+        "place_b": [
+          "240/240",
+          "240/240",
+          "240/240"
+        ]
+      },
+      "heldout": {
+        "n": 600,
+        "a_full": 600,
+        "b_full": 600,
+        "place_a": [
+          "600/600",
+          "600/600",
+          "600/600"
+        ],
+        "place_b": [
+          "600/600",
+          "600/600",
+          "600/600"
+        ]
+      },
+      "heldout_place_specific": {
+        "n": 600,
+        "a_full": 600,
+        "b_full": 600,
+        "place_a": [
+          "600/600",
+          "600/600",
+          "600/600"
+        ],
+        "place_b": [
+          "600/600",
+          "600/600",
+          "600/600"
+        ]
+      }
+    },
+    "exact_compose_heldout": {
+      "a": "600/600",
+      "b": "600/600",
+      "both": "600/600",
+      "both_pct": 100.0
+    },
+    "exact_compose_oracle_digits": "600/600",
+    "learned_readout_heldout": {
+      "place_a": [
+        "380/600",
+        "600/600",
+        "600/600"
+      ],
+      "place_b": [
+        "364/600",
+        "600/600",
+        "600/600"
+      ],
+      "a_full": 380,
+      "b_full": 364,
+      "n": 600
+    },
+    "learned_compose_heldout": {
+      "a": "380/600",
+      "b": "364/600",
+      "both": "253/600",
+      "both_pct": 42.166666666666664
+    },
+    "e2e_exact_compose": {
+      "n_arith": 600,
+      "trigger_recall": "600/600",
+      "false_trigger": "0/40",
+      "op_exact": "265/600",
+      "operands_exact": "600/600",
+      "full_inline": "265/600",
+      "full_inline_pct": 44.166666666666664,
+      "full_inline_oracle_op": "600/600",
+      "full_inline_oracle_op_pct": 100.0,
+      "per_op": {
+        "ADD": "100/100",
+        "SUB": "0/100",
+        "DIV": "59/100",
+        "CMP_LT": "91/100",
+        "CMP_EQ": "0/100",
+        "CMP_GT": "15/100"
+      }
+    },
+    "e2e_learned": {
+      "n_arith": 600,
+      "trigger_recall": "600/600",
+      "false_trigger": "0/40",
+      "op_exact": "265/600",
+      "operands_exact": "253/600",
+      "full_inline": "147/600",
+      "full_inline_pct": 24.5,
+      "full_inline_oracle_op": "253/600",
+      "full_inline_oracle_op_pct": 42.166666666666664,
+      "per_op": {
+        "ADD": "100/100",
+        "SUB": "0/100",
+        "DIV": "26/100",
+        "CMP_LT": "21/100",
+        "CMP_EQ": "0/100",
+        "CMP_GT": "0/100"
+      }
+    }
+  },
+  "VERDICT": "OPERAND-EXTRACTION WALL CLOSED through the exact circuits. On DISJOINT magnitude (train 0..149 / test 150..255, the exact regime where the learned readout got 0/60): digit-CAM read = 600/600 full-operand (all places incl hundreds), exact-compose operand BOTH = 600/600 vs LEARNED-compose BOTH = 253/600; end-to-end GIVEN CORRECT OP = 600/600 byte-exact (vs learned 253/600); compose self-check = 256/256 byte-exact by construction. The read->compose->ALU->emit operand path is byte-exact and GENERALIZES to unseen magnitudes. The residual end-to-end gap is the ORTHOGONAL op-head phrasing generalization (op_exact 265/600 on unseen phrasings), NOT the operand wall.",
+  "peak_rss_gb": 4.156909942626953,
+  "elapsed_s": 17.689101219177246
+}
