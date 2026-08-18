@@ -148,26 +148,63 @@ def live_head_forward(self, x, past_kv=None, q_positions=None, use_cache=False):
     attn_out = x.new_zeros(B, H, S, HD)
 
     if live_idx.numel() > 0:
-        # Score ONLY the live heads: [B, Hl, S, Sk].
-        Ql = Q[:, live_idx]
-        Kl = K[:, live_idx]
-        Vl = V[:, live_idx]
-        slopes = self.alibi_slopes[live_idx].view(1, -1, 1, 1)
-        scores = torch.matmul(Ql, Kl.transpose(-2, -1)) * self.scale
-        if past_kv is None and q_positions is None:
-            pos = torch.arange(S, device=x.device)
-            dist = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs().float()
-            scores = scores - slopes * dist
-            causal = torch.triu(
-                torch.full((S, S), float("-inf"), device=x.device), diagonal=1)
-            scores = scores + causal
+        # BANDED LOCAL LIVE HEADS (C4_BANDED_LOCAL_ATTN): a live head that is LOCAL
+        # (windowed, ``_global_head_mask[h]==False``) has PROVABLY-ZERO attention
+        # weight past its window ``W`` (blogspec: the frame-ingest heads' true horizon
+        # is <= 28 tok < W), so its context is byte-identical whether scored over the
+        # full [Sq,Sk] key set or only the last-W keys.  Block 0 (the frame-ingest) has
+        # 20 LIVE LOCAL heads — scoring them full-causal is the O(S^2) score-matrix wall
+        # ([1,20,S,S] = ~10GB at S~8k) that CAPS eff_K.  Route them through the O(Sq*W)
+        # banded kernel instead (the SAME kernel ``windowed_forward`` uses); the GLOBAL
+        # live heads (memory/stack/LEV) keep the full-causal matmul (they must reach far
+        # into the past).  Byte-identical to the full-scored path — the dropped keys'
+        # weight is exactly 0 — and turns block 0's attention from O(S^2) to O(S*W),
+        # which is what unlocks a big eff_K.  Falls back to the full scored path when the
+        # flag is off / no window / no gmask (byte-identical golden path).
+        import os as _osb
+        W = getattr(self, "_local_window", None)
+        gmask = getattr(self, "_global_head_mask", None)
+        banded_on = (_osb.environ.get("C4_BANDED_LOCAL_ATTN", "0") == "1"
+                     and W is not None and gmask is not None and x.is_cuda)
+        loc_live = glob_live = None
+        if banded_on:
+            gm = gmask.to(device=x.device)
+            live_loc = live_idx[~gm[live_idx]]        # local (windowed) live heads
+            live_glob = live_idx[gm[live_idx]]        # global (full-causal) live heads
         else:
-            dist = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs().float()
-            scores = scores - slopes * dist.unsqueeze(0)
-            mask = (k_pos.unsqueeze(0) > q_pos.unsqueeze(1))       # [Sq, Sk]
-            scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-        a = softmax1(scores, dim=-1)
-        attn_out[:, live_idx] = torch.matmul(a, Vl)
+            live_loc = live_idx.new_empty(0)
+            live_glob = live_idx
+
+        def _full_scored(idx):
+            """Full-causal softmax1+ALiBi context for heads ``idx`` (the global heads /
+            the flag-off path).  Byte-identical to the original scored block."""
+            if idx.numel() == 0:
+                return
+            Ql = Q[:, idx]; Kl = K[:, idx]; Vl = V[:, idx]
+            slopes = self.alibi_slopes[idx].view(1, -1, 1, 1)
+            scores = torch.matmul(Ql, Kl.transpose(-2, -1)) * self.scale
+            if past_kv is None and q_positions is None:
+                pos = torch.arange(S, device=x.device)
+                dist = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs().float()
+                scores = scores - slopes * dist
+                causal = torch.triu(
+                    torch.full((S, S), float("-inf"), device=x.device), diagonal=1)
+                scores = scores + causal
+            else:
+                dist = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs().float()
+                scores = scores - slopes * dist.unsqueeze(0)
+                mask = (k_pos.unsqueeze(0) > q_pos.unsqueeze(1))   # [Sq, Sk]
+                scores = scores.masked_fill(
+                    mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+            a = softmax1(scores, dim=-1)
+            attn_out[:, idx] = torch.matmul(a, Vl)
+
+        if live_loc.numel() > 0:
+            from .banded_local_attn import banded_local_context
+            attn_out[:, live_loc] = banded_local_context(
+                Q[:, live_loc], K[:, live_loc], V[:, live_loc], q_pos, k_pos,
+                self.alibi_slopes[live_loc], self.scale, int(W))
+        _full_scored(live_glob)
 
     out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
     out = x + self.W_o.linear(out)

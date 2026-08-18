@@ -1,0 +1,35 @@
+{
+  "machine": "compiler32(WORD=4)+c4vm32u(STRIDE=4)+transpile(preprocess,native32,fnptr) FOLD-FULL",
+  "oracle": "gcc -m32 -std=c90",
+  "corpus_total": 1694,
+  "gcc_rejected": 200,
+  "out_of_subset_by_design": 394,
+  "in_subset_total": 1100,
+  "raw_in_subset_pass": 816,
+  "raw_in_subset_rate": 0.7418,
+  "baseline_788_pass": 788,
+  "gain_over_788": 28,
+  "regressions_pass_to_fail": 0,
+  "in_subset_stage_breakdown": {
+    "PASS": 816,
+    "vm_error": 4,
+    "compile_error": 177,
+    "MISMATCH": 102,
+    "transpile_error": 1
+  },
+  "genuine_boundaries_reclassified": 27,
+  "addressable_total": 1073,
+  "addressable_pass": 816,
+  "addressable_rate": 0.7605,
+  "general_c90_gcc_valid": 1494,
+  "general_c90_pass": 973,
+  "general_c90_rate": 0.6513,
+  "per_branch_gains": {
+    "agginit": 9,
+    "cgoto": 8,
+    "complexsimd_complex": 3,
+    "complexsimd_vector": 5,
+    "longwidth": 3,
+    "structtail": 0
+  }
+}

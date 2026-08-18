@@ -137,12 +137,58 @@ def _apply_direct_cam(state, L, resolved):
     return state
 
 
+def _build_dcam_override(L, q_idxs, resolved_by_qpos, D, dev, dtype):
+    """VECTORISED direct-CAM: build a ``[K, D]`` override tensor + boolean mask so the
+    K query rows' resolved-read nibble bands can be scattered on-GPU in ONE op (the
+    per-row Python scalar-write ``_apply_direct_cam`` loop is the host wall).  Returns
+    ``(override[K,D], mask[K,D] bool)`` or ``(None, None)`` if no row has a resolved
+    read.  Byte-identical to the per-row scalar writes (same nibbles, same bands)."""
+    rows, cols, vals = [], [], []
+    for i, q in enumerate(q_idxs):
+        for r in resolved_by_qpos.get(q, []):
+            band = _dest_band(L, r.head)
+            for j, nv in enumerate(V.nibbles_of_value(r.value & 0xFFFFFFFF, NIB_PER_REG)):
+                rows.append(i); cols.append(band + j); vals.append(float(nv))
+    if not rows:
+        return None, None
+    override = torch.zeros(len(q_idxs), D, device=dev, dtype=dtype)
+    mask = torch.zeros(len(q_idxs), D, device=dev, dtype=torch.bool)
+    ri = torch.tensor(rows, device=dev, dtype=torch.long)
+    ci = torch.tensor(cols, device=dev, dtype=torch.long)
+    override[ri, ci] = torch.tensor(vals, device=dev, dtype=dtype)
+    mask[ri, ci] = True
+    return override, mask
+
+
+def _decode_span_batched(x, L, q_idxs, resolved_by_qpos):
+    """GPU-VECTORISED span decode (C4_GPU_VERIFY): gather the K query rows, apply the
+    direct-CAM override as ONE masked scatter, batch-decode AX with the vectorised
+    requant-argmax, and copy the whole [K] AX trace to the host in ONE sync — replacing
+    the per-row ``.cpu()`` + host ``_decode_reg_from_nibbles`` loop (the O(steps) host
+    wall).  Bit-identical to the per-row path (same nibbles, same requant-argmax)."""
+    from .nibble_pure_forward_gpu import _decode_reg_batch
+    dev = x.device
+    D = x.shape[-1]
+    qi = torch.tensor(q_idxs, device=dev, dtype=torch.long)
+    qs = x[0].index_select(0, qi).clone()                 # [K, D]
+    ov, mask = _build_dcam_override(L, q_idxs, resolved_by_qpos, D, dev, x.dtype)
+    if ov is not None:
+        qs = torch.where(mask, ov, qs)                    # apply resolved reads
+    ax = _decode_reg_batch(qs, L.AX) & 0xFF               # [K] long
+    return ax.cpu().tolist()
+
+
 def drive_kbatch(model, L, runner: KBatchBoundedRunner, code, *,
-                 K: int, max_steps=200, seed_mem=None, graph=False):
+                 K: int, max_steps=200, seed_mem=None, graph=False, perrow=False,
+                 perrow_graphed=False, wholestep=False):
     """Verify the whole program K VM steps per forward on the bounded-KV path.
 
     ``graph=True`` routes through the MEGAKERNEL (CUDA-graphed passthrough-FFN
-    tail).  Returns (ax_trace, n_forwards)."""
+    tail); ``perrow=True`` routes through the #874 PER-ROW block-skip forward_span
+    (each block runs only the query rows whose op uses it, not the union of all K);
+    ``perrow_graphed=True`` routes through the GROUPED graphed per-row path (same
+    per-row skip, consecutive same-subset FFN runs compacted + CUDA-graphed).
+    Returns (ax_trace, n_forwards)."""
     from .nibble_pure_forward_complete import make_overlay_complete
     stream, q_positions, ops, resolved_by_qpos, draft_ax, store_log = _prep_stream(
         model, L, code, max_steps=max_steps, seed_mem=seed_mem)
@@ -177,15 +223,28 @@ def drive_kbatch(model, L, runner: KBatchBoundedRunner, code, *,
         q_idxs = q_positions[s:e]
         span_ops = ops[s:e]
         with torch.no_grad():
-            if graph:
+            if wholestep:
+                x = runner.forward_span_perrow_wholestep(x_full, span_ops, q_idxs)
+            elif perrow_graphed:
+                x = runner.forward_span_perrow_graphed(x_full, span_ops, q_idxs)
+            elif perrow:
+                x = runner.forward_span_perrow(x_full, span_ops, q_idxs)
+            elif graph:
                 x = runner.forward_span_graphed(x_full, span_ops, q_idxs)
             else:
                 x = runner.forward_span(x_full, span_ops, q_idxs)
         n_forwards += 1
-        for q in q_idxs:
-            state = x[0, q].clone()
-            state = _apply_direct_cam(state, L, resolved_by_qpos.get(q, []))
-            trace.append(_decode_qrow(state.cpu(), L) & 0xFF)
+        # GPU-VECTORISED DECODE (C4_GPU_VERIFY, default OFF): batch-decode ALL K query
+        # rows on-GPU with ONE host sync, instead of the per-row ``.cpu()`` + host decode
+        # loop (the O(steps) host wall over the ~0.034 ms/step GPU forward).  Byte-exact.
+        from .pf_speculative import _gpu_verify_enabled
+        if _gpu_verify_enabled():
+            trace.extend(_decode_span_batched(x, L, q_idxs, resolved_by_qpos))
+        else:
+            for q in q_idxs:
+                state = x[0, q].clone()
+                state = _apply_direct_cam(state, L, resolved_by_qpos.get(q, []))
+                trace.append(_decode_qrow(state.cpu(), L) & 0xFF)
         s = e
     if dcam_on:
         runner.arm_direct_cam(None)          # disarm (clean state between programs)

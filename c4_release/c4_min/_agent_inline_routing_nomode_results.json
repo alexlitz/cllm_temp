@@ -1,0 +1,143 @@
+{
+  "host": "Qwen/Qwen2.5-0.5B-Instruct",
+  "device": "cuda:0",
+  "hidden": 896,
+  "note": "router trained; host + ALU FROZEN; ALU byte-exact by construction",
+  "inline_no_mode": {
+    "train_losses": {
+      "final_loss": 0.010273855179548264,
+      "loss_trig": 4.408200382499672e-08,
+      "loss_op": 0.0011790632270276546,
+      "loss_a": 0.004802837502211332,
+      "loss_b": 0.004291909746825695
+    },
+    "eval_train": {
+      "n_arith": 180,
+      "n_non": 60,
+      "trigger_recall": "180/180",
+      "trigger_recall_pct": 100.0,
+      "false_trigger": "0/60",
+      "false_trigger_pct": 0.0,
+      "routed_op_exact": "180/180",
+      "routed_operands_exact": "180/180",
+      "full_inline_exact": "180/180",
+      "full_inline_pct": 100.0,
+      "alu_byteexact_given_routed": "180/180",
+      "per_op": {
+        "ADD": "30/30",
+        "SUB": "30/30",
+        "DIV": "30/30",
+        "CMP_LT": "30/30",
+        "CMP_EQ": "30/30",
+        "CMP_GT": "30/30"
+      },
+      "seen_phrasing": "180/180",
+      "heldout_phrasing": "n/a"
+    },
+    "eval_heldout": {
+      "n_arith": 60,
+      "n_non": 20,
+      "trigger_recall": "60/60",
+      "trigger_recall_pct": 100.0,
+      "false_trigger": "0/20",
+      "false_trigger_pct": 0.0,
+      "routed_op_exact": "37/60",
+      "routed_operands_exact": "0/60",
+      "full_inline_exact": "0/60",
+      "full_inline_pct": 0.0,
+      "alu_byteexact_given_routed": "52/60",
+      "per_op": {
+        "ADD": "0/10",
+        "SUB": "0/10",
+        "DIV": "0/10",
+        "CMP_LT": "0/10",
+        "CMP_EQ": "0/10",
+        "CMP_GT": "0/10"
+      },
+      "seen_phrasing": "n/a",
+      "heldout_phrasing": "0/60"
+    }
+  },
+  "explicit_mode": {
+    "train_losses": {
+      "final_loss": 0.010210911743342876,
+      "loss_trig": 1.941467644428485e-07,
+      "loss_op": 0.0007977232453413308,
+      "loss_a": 0.005477972328662872,
+      "loss_b": 0.003935022279620171
+    },
+    "eval_train": {
+      "n_arith": 180,
+      "n_non": 60,
+      "trigger_recall": "180/180",
+      "trigger_recall_pct": 100.0,
+      "false_trigger": "0/60",
+      "false_trigger_pct": 0.0,
+      "routed_op_exact": "180/180",
+      "routed_operands_exact": "180/180",
+      "full_inline_exact": "180/180",
+      "full_inline_pct": 100.0,
+      "alu_byteexact_given_routed": "180/180",
+      "per_op": {
+        "ADD": "30/30",
+        "SUB": "30/30",
+        "DIV": "30/30",
+        "CMP_LT": "30/30",
+        "CMP_EQ": "30/30",
+        "CMP_GT": "30/30"
+      },
+      "seen_phrasing": "180/180",
+      "heldout_phrasing": "n/a"
+    },
+    "eval_heldout": {
+      "n_arith": 60,
+      "n_non": 20,
+      "trigger_recall": "60/60",
+      "trigger_recall_pct": 100.0,
+      "false_trigger": "0/20",
+      "false_trigger_pct": 0.0,
+      "routed_op_exact": "41/60",
+      "routed_operands_exact": "0/60",
+      "full_inline_exact": "0/60",
+      "full_inline_pct": 0.0,
+      "alu_byteexact_given_routed": "59/60",
+      "per_op": {
+        "ADD": "0/10",
+        "SUB": "0/10",
+        "DIV": "0/10",
+        "CMP_LT": "0/10",
+        "CMP_EQ": "0/10",
+        "CMP_GT": "0/10"
+      },
+      "seen_phrasing": "n/a",
+      "heldout_phrasing": "0/60"
+    }
+  },
+  "false_trigger_numbers_no_arith_inline": "0/6",
+  "false_trigger_numbers_no_arith_inline_pct": 0.0,
+  "heldout_nonarith_perplexity": 93.28770870574905,
+  "host_frozen_no_forgetting": true,
+  "verdict": {
+    "inline_full_routing_train_pct": 100.0,
+    "inline_full_routing_heldout_pct": 0.0,
+    "mode_full_routing_train_pct": 100.0,
+    "mode_full_routing_heldout_pct": 0.0,
+    "inline_trigger_recall_pct": 100.0,
+    "inline_trigger_recall_heldout_pct": 100.0,
+    "inline_false_trigger_pct": 0.0,
+    "inline_false_trigger_heldout_pct": 0.0,
+    "inline_false_trigger_numbers_no_arith_pct": 0.0,
+    "heldout_nonarith_perplexity": 93.28770870574905,
+    "language_preservation_delta": 0.0,
+    "inline_full_train": "180/180",
+    "inline_full_heldout": "0/60",
+    "mode_full_train": "180/180",
+    "mode_full_heldout": "0/60",
+    "alu_byteexact_train": "180/180",
+    "native_inline_works": false,
+    "inline_vs_mode_gap_train": 0.0,
+    "inline_vs_mode_gap_heldout": 0.0
+  },
+  "peak_rss_gb": 4.1477813720703125,
+  "elapsed_s": 28.010998487472534
+}

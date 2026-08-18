@@ -1,0 +1,38 @@
+{
+  "host": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dev": "cpu",
+  "maxd": 3,
+  "value_classifier": {
+    "train": {
+      "a": "500/500",
+      "b": "500/500",
+      "both": "500/500",
+      "both_pct": 100.0
+    },
+    "heldout": {
+      "a": "0/150",
+      "b": "0/150",
+      "both": "0/150",
+      "both_pct": 0.0
+    }
+  },
+  "digit_readout": {
+    "train": {
+      "a": "500/500",
+      "b": "500/500",
+      "both": "500/500",
+      "both_pct": 100.0
+    },
+    "heldout": {
+      "a": "0/150",
+      "b": "12/150",
+      "both": "0/150",
+      "both_pct": 0.0
+    }
+  },
+  "full_inline_heldout_byteexact": "1/150",
+  "full_inline_heldout_byteexact_pct": 0.6666666666666666,
+  "alu_byteexact_given_routed_heldout": "108/150",
+  "peak_rss_gb": 4.145790100097656,
+  "elapsed_s": 137.25029110908508
+}

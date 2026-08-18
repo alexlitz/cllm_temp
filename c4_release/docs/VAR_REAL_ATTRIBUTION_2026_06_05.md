@@ -346,7 +346,7 @@ if_var_0). One additional compile for the per-head/per-unit decomposition.
 
 No production code changed. Smoke baseline at HEAD `88c7b68f` is
 **46/52 pass + 11 xpass** per
-[`STATUS_1096_2026_06_05.md`](STATUS_1096_2026_06_05.md). Identical
+[`STATUS_1096_2026_06_05.md`](archive/STATUS_1096_2026_06_05.md). Identical
 baseline expected after this commit (docs-only).
 
 ## Artifacts (off-tree)

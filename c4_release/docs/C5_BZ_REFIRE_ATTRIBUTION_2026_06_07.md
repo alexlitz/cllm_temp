@@ -174,8 +174,8 @@ Expected impact: ~128 rows (28 direct + ~100 Wave J loop family).
 
 ## Cross-references
 
-- [`EDGE_ABSDIFF_BOOL_ATTRIBUTION_2026_06_07.md`](EDGE_ABSDIFF_BOOL_ATTRIBUTION_2026_06_07.md) — H6 cluster attribution; Recommendation 1.
-- [`LOOP_RECUR_ATTRIBUTION_2026_06_07.md`](LOOP_RECUR_ATTRIBUTION_2026_06_07.md) — §Step 4 surface determination; `loop_pow2_0` trace at neural=0xFF0A.
+- [`EDGE_ABSDIFF_BOOL_ATTRIBUTION_2026_06_07.md`](archive/EDGE_ABSDIFF_BOOL_ATTRIBUTION_2026_06_07.md) — H6 cluster attribution; Recommendation 1.
+- [`LOOP_RECUR_ATTRIBUTION_2026_06_07.md`](archive/LOOP_RECUR_ATTRIBUTION_2026_06_07.md) — §Step 4 surface determination; `loop_pow2_0` trace at neural=0xFF0A.
 - [`ABSDIFF_BZ_REDIRECT_BUG.md`](ABSDIFF_BZ_REDIRECT_BUG.md) — canonical
   per-step PC tracking on `absdiff_0`; PC walks past bytecode end.
 - [`L34_FFN_ATTRIBUTION_2026_06_04.md`](L34_FFN_ATTRIBUTION_2026_06_04.md) — origin of the existing `HAS_SE +10` step-0 guard.

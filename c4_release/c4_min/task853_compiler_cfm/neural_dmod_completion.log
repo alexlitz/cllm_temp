@@ -1,0 +1,9 @@
+[mod-chunk] SP_INIT=0xf000 lea_wide=True fine_grained=True window=0 K=64
+[mod-chunk] compiler instrs=2923 module='/home/alexlitz/Documents/misc/c4_release/.claude/worktrees/task853-dmod-neural-completion/c4_release/c4_min/task853_compiler_cfm/dmod.c' (493 bytes)
+[mod-chunk] draft steps=89741 halted=True code_off=2923 divmod_steps=15 n_prtf=137 emitted_words=274 wall=8.05s
+[mod-chunk] built dim=1464 blocks=264 build=11s peakRSS=1.8GB
+[mod-chunk] window 1 steps[0:89741] matched=True accepted=89741/89741 forwards=1403 eff_K=64 peak_vram=2.1GB wall=321.1s
+[mod-chunk] TOTAL accepted=89741/89741 forwards=1403 windows=1 peak_vram=2.1GB wall=330.1s ms/step=3.7
+[mod-chunk] MODEL accepted ALL 89741 steps byte-exact to COMPLETION: True
+[mod-chunk] WHOLE-MODULE COMPILER-ON-32BIT-TRANSFORMER byte-exact to halt: True
+[mod-chunk] emitted bytecode (274 words) sha via native c4 exit-code is the independent oracle.

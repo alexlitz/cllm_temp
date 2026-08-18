@@ -100,6 +100,24 @@ def _div_longdiv() -> bool:
     return os.environ.get("C4_DIV_LONGDIV", "0") == "1"
 
 
+def _cfm_emit_enabled() -> bool:
+    """``C4_CFM_EMIT`` (DEFAULT OFF): the in-transformer JIT on the GOLDEN CFM path.
+
+    ON -> the CFM driver (``run_program`` / ``qwen_lean_forward.run_program_lean``)
+    services the ``isa.EMIT`` opcode (value 45, ABOVE the OP_IS band so the golden
+    069cc32f build is byte-identical) by APPENDING / rewriting a CODE frame into the
+    SAME KV §Memory the fetch@PC CAM (``_bake_code_cam``) reads: the produced
+    instruction word is read from the reconstructed input registers (op<-AX,
+    imm<-STACK0), the target code address is the EMIT immediate, and the new frame
+    joins the runtime code list ``_overlay_code_frames`` writes -> fetchable by PC
+    next step with NO residual-width (D) growth (program-length INDEPENDENT, unlike
+    the bespoke fixed-width ``CODE_WORD`` band).  A same-address re-emit OVERWRITES
+    the slot (latest-write-wins by construction — one code frame per address, so no
+    CAM recency tiebreak is needed).  OFF -> the read-only code path is byte-
+    identical to the historical CFM driver."""
+    return os.environ.get("C4_CFM_EMIT", "0") not in ("0", "", "false", "False")
+
+
 def _div_lean() -> bool:
     """Radix-16 divide VARIANT selector (only takes effect on the radix-16 path,
     i.e. when NOT ``C4_DIV_LONGDIV``).  DEFAULT ON (``C4_DIV_LEAN`` unset or ``1``)
@@ -123,6 +141,36 @@ def _div_lean() -> bool:
     time and builder time (both in ``QwenFullLayout`` and ``build``/``_block_specs``)
     or ``L.D`` and the built blocks disagree."""
     return os.environ.get("C4_DIV_LEAN", "1") != "0"
+
+
+def _div_logsink() -> bool:
+    """LOG-SINK divide toggle (``C4_LOGSINK_DIV``, DEFAULT OFF).
+
+    OFF (default) -> the current fp32 radix-16 / long-division divide (golden
+    069cc32f byte-identical).  ON -> DIV/MOD route through the LOG-SINK reciprocal
+    divide (``nibble_logsink_blocks``: a softmax1 sink ``1/b`` over 8 reserved
+    log-key KV rows + Newton refine + schoolbook ``q·b`` + ±1 correction).  The
+    log-sink blocks carry quotient-scale scalars (``q·b`` up to ``2^34``, beyond
+    fp32's ``2^24``) so the model is built in **fp64** when this flag is on — it is a
+    full-ISA / self-emulation vanillaness lever, NOT the fp32-vanilla default.  For a
+    genuinely fp32-only shallow divide use ``C4_LOGSINK_DIV_FP32`` (see
+    ``_div_logsink_fp32``).
+
+    Resurrected from commit ``c5641182`` (deleted by ``fa6dadea`` for fp32-
+    vanillaness); re-wired behind this default-OFF toggle so the golden flag-OFF
+    build is unchanged."""
+    return os.environ.get("C4_LOGSINK_DIV", "0") == "1"
+
+
+def _div_logsink_fp32() -> bool:
+    """fp32 approximate-then-refine LOG-SINK divide toggle (``C4_LOGSINK_DIV_FP32``,
+    DEFAULT OFF).  ON -> the shallow divide computed ENTIRELY in fp32 via range-
+    reduction: an fp32 log-sink reciprocal (~20 bits correct) gives ``q0``, then ONE
+    refine level (``dq = floor((a-q0·b)·r)``, a TINY quotient the fp32 product is
+    exact for) lands within ±1, and a single integer ±1 band makes it byte-exact.
+    Keeps the fp32-vanillaness the fp64 log-sink sacrificed.  Reference + precision
+    analysis in ``nibble_logsink_fp32``."""
+    return os.environ.get("C4_LOGSINK_DIV_FP32", "0") == "1"
 
 
 def _kb_batched_prefix() -> bool:
@@ -423,25 +471,35 @@ class QwenFullLayout:
         # the RESOLVED flag the block builder reads.
         self.shift_via_mul = bool(shift_via_mul and subset.muldiv and subset.bitwise
                                   and efficient_alu)
-        # DIV/MOD always route through the fp32 base-16 recurrent/unrolled long
-        # division (byte-exact in fp32).  The fp64 log-sink reciprocal divide has been
-        # removed from the production path so the default build is genuinely fp32.
-        # ``div_logsink`` is retained (always resolves False) only so callers passing
-        # the historical kwarg do not error.
-        self.div_logsink = False
+        # DIV/MOD default = the fp32 base-16 recurrent/unrolled long division (byte-
+        # exact in fp32) or the radix-16 digit-recurrence divide.  The fp64 LOG-SINK
+        # reciprocal divide is behind ``C4_LOGSINK_DIV`` (default OFF) — a resurrected
+        # toggle (from commit c5641182, deleted by fa6dadea for fp32-vanillaness); it
+        # carries quotient-scale scalars up to ``2^34`` so the model is fp64 when ON.
+        # ``self.div_logsink`` is the RESOLVED flag the layout/builder read; default OFF
+        # keeps the genuinely-fp32 golden build byte-identical.
+        self.div_logsink = bool(efficient_alu and subset.muldiv and _div_logsink())
         # DIV/MOD default = the fp32-byte-exact radix-16 digit-recurrence divide
         # (``div_radix16_lean``, 80 blocks — the DEFAULT since the lean grid was
         # proven byte-exact in-VM; ``C4_DIV_LEAN=0`` selects the 88-block hardened
         # variant); ``C4_DIV_LONGDIV=1`` falls back to the base ALU long division
         # (~262 blocks).  The radix-16 divide reads the SAME operands (AX=B,
         # STACK0=A) and (via a copy block) writes the SAME ``L.ALU32.DIV_RES /
-        # MOD_RES`` the ax-mux reads, so the ax-mux is unchanged.
-        self.div_radix16 = bool(efficient_alu and subset.muldiv and not _div_longdiv())
+        # MOD_RES`` the ax-mux reads, so the ax-mux is unchanged.  The log-sink path
+        # overrides BOTH (it writes the same DIV_RES/MOD_RES via its own scratch bands).
+        self.div_radix16 = bool(efficient_alu and subset.muldiv
+                                and not _div_longdiv() and not self.div_logsink)
         if efficient_alu and subset.muldiv:
             from . import nibble_alu32 as _A
             _A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod,
                                        shift_via_mul=self.shift_via_mul)
-            if self.div_radix16:
+            if self.div_logsink:
+                # LOG-SINK: allocate the log-sink scratch bands and WRITE the quotient/
+                # remainder into the SAME ALU32 DIV_RES/MOD_RES the ax-mux reads.
+                from . import nibble_logsink_blocks as _LS
+                _LS.extend_layout_for_logsink(L, div_res=L.ALU32.DIV_RES,
+                                              mod_res=L.ALU32.MOD_RES)
+            elif self.div_radix16:
                 # LEAN (80 blocks, DEFAULT) vs HARDENED (88 blocks, C4_DIV_LEAN=0).
                 # The two allocate DIFFERENT LEANDIV bands, so the SAME module's
                 # extend_layout must run here AND at builder time (build/_block_specs)
@@ -612,8 +670,16 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
                               div_logsink=QL.div_logsink)
     # The model is genuinely fp32-vanilla — every param is float32, zero fp64.  DIV/MOD
     # are the fp32 base-16 long division (recurrent or unrolled), byte-exact, so no
-    # doubles and no raised K_DIV compensator are needed.
+    # doubles and no raised K_DIV compensator are needed.  EXCEPTION: the log-sink
+    # divide (``C4_LOGSINK_DIV``, default OFF) carries quotient-scale scalars up to
+    # ``2^34`` (beyond fp32's ``2^24``) and amplifies the softmax reciprocal quotient-
+    # fold, so it builds the model in fp64 with the raised ``K_DIV`` RMSNorm compensator.
     model_dtype = torch.float32
+    if QL.div_logsink:
+        # The log-sink divide (reciprocal softmax1 precision + the q·b correction
+        # compare ~2^34) requires fp64 — the whole model runs in doubles when it is
+        # active.  K stays at NORM_K (fp64 has the dynamic range; see c5641182).
+        model_dtype = torch.float64
     block_names = [nm for nm, _ in block_specs]
     apply_order = getattr(L, "_qwen_apply", None)
 
@@ -678,6 +744,14 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
             _bake_memory_cam(qmodel.layers[mem_idx].self_attn, QL, arch, comp, K,
                              mem_addr_bits=mem_addr_bits)
             cam_layers["mem-cam"] = mem_idx
+        if QL.div_logsink:
+            # LOG-SINK: bake the reciprocal softmax1 sink head onto the recip-attn
+            # block (its FFN is a no-op passthrough; the work is this baked head).
+            from . import nibble_logsink_blocks as LS
+            ls_idx = block_names.index("ls-recip-attn")
+            LS.bake_recip_sink_cam(qmodel.layers[ls_idx].self_attn, L, arch,
+                                   head_idx=1)
+            cam_layers["ls-recip-attn"] = ls_idx
 
     # RECURRENCE (recurrent divmod): re-point qmodel.layers through the apply order
     # so the forward applies the reused iteration-body layers 8x.  The STORED set
@@ -804,7 +878,9 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
     #    op's dedicated RES nibble band UNCONDITIONALLY; the ax-mux copies the active
     #    op's result into the AX nibble band gated on OP_IS[op].  The recurrent
     #    divmod stores ONE reused iteration body (repeated 8x by _qwen_apply). ---
-    use_logsink = False   # retired: DIV/MOD are always fp32 long division
+    # LOG-SINK (``C4_LOGSINK_DIV``): route DIV/MOD through the fp64 log-sink reciprocal
+    # blocks instead of the fp32 long/radix-16 division.  Default OFF (golden-identical).
+    use_logsink = bool(eff_mdm and div_logsink)
     if eff_mdm:
         from . import nibble_alu32 as A
         A._ONE = L.ONE
@@ -834,27 +910,45 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
         # the same _div_lean() gate selects the builder module here.  Both write the
         # shared L.ALU32.DIV_RES/MOD_RES the ax-mux reads (via their result-copy
         # block), so the ax-mux + housekeeping are unchanged.
-        if getattr(L, "LEANDIV", None) is not None and not _div_longdiv():
-            if _div_lean():
-                from . import div_radix16_lean as DIVMOD
+        L._logsink_kdiv = None
+        if use_logsink:
+            # LOG-SINK DIV/MOD: the softmax1 reciprocal sink + Newton + schoolbook
+            # blocks (nibble_logsink_blocks).  UNROLLED (no reused body, so identity
+            # apply order).  The block builder returns the K_DIV block names (they
+            # carry quotient-scale scalars up to 2^34); build bakes those at K_DIV.
+            from . import nibble_logsink_blocks as LS
+            div_start = len(specs)
+            div_apply = []
+            ls_blocks, kdiv = LS.compile_logsink_blocks(L, dim)
+            kdiv_set = set(kdiv)
+            L._logsink_kdiv = set()
+            for name, spec in ls_blocks:
+                if name in kdiv_set:
+                    L._logsink_kdiv.add(len(specs))
+                specs.append((name, spec))
+            div_end = len(specs)
+        else:
+            if getattr(L, "LEANDIV", None) is not None and not _div_longdiv():
+                if _div_lean():
+                    from . import div_radix16_lean as DIVMOD
+                else:
+                    from . import div_radix16_hardened as DIVMOD
             else:
-                from . import div_radix16_hardened as DIVMOD
-        else:
-            DIVMOD = A
-        div_start = len(specs)
-        div_apply = []
-        if recurrent_divmod:
-            unique, apply_names = DIVMOD.compile_divmod_blocks_recurrent(L, dim)
-            name_to_idx = {}
-            for name, spec in unique:
-                name_to_idx[name] = len(specs)
-                specs.append((name, spec))
-            div_apply = [name_to_idx[n] for n in apply_names]
-        else:
-            for name, spec in DIVMOD.compile_divmod_blocks(L, dim):
-                div_apply.append(len(specs))
-                specs.append((name, spec))
-        div_end = len(specs)
+                DIVMOD = A
+            div_start = len(specs)
+            div_apply = []
+            if recurrent_divmod:
+                unique, apply_names = DIVMOD.compile_divmod_blocks_recurrent(L, dim)
+                name_to_idx = {}
+                for name, spec in unique:
+                    name_to_idx[name] = len(specs)
+                    specs.append((name, spec))
+                div_apply = [name_to_idx[n] for n in apply_names]
+            else:
+                for name, spec in DIVMOD.compile_divmod_blocks(L, dim):
+                    div_apply.append(len(specs))
+                    specs.append((name, spec))
+            div_end = len(specs)
         specs.append(("alu-ax-mux", A.compile_ax_mux(L, dim, ops=mux_ops)))
     disp = base_dispatch_rules(L) + _call_dispatch_rules(L)
     if subset.memory:
@@ -1583,16 +1677,53 @@ def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
     _POP_OPS = {isa.ADD, isa.SUB, isa.MUL, isa.DIV, isa.MOD, isa.AND, isa.OR,
                 isa.XOR, isa.SHL, isa.SHR, isa.EQ, isa.NE, isa.LT, isa.GT,
                 isa.LE, isa.GE}
+    # RUNTIME code list — the in-transformer JIT's writable code §Memory (a private
+    # mutable copy EMIT rewrites; ``_build_stream_and_overlay`` overlays THIS as the
+    # code frames the fetch@PC CAM reads).  Flag-off it equals ``code`` (byte-exact).
+    emit_on = _cfm_emit_enabled() and vm.code_from_memory
+    run_code = list(code)
 
     for _ in range(max_steps):
-        op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
+        op = run_code[cur_pc].op if 0 <= cur_pc < len(run_code) else None
         prev = dict(reg_state)
         load_addr = None
         if subset.memory and op in (isa.LI, isa.LC):
             load_addr = prev["AX"] & 0xFF            # 8-bit load address (corpus slice)
 
-        x = _build_stream_and_overlay(vm, code, reg_state, store_log, load_addr)
+        x = _build_stream_and_overlay(vm, run_code, reg_state, store_log, load_addr)
         state = _forward(vm, x)
+
+        # EMIT (in-transformer JIT, C4_CFM_EMIT): a driver-serviced control op (like
+        # JSR/ENT/LEV — EMIT has no FFN dispatch rule).  The model FETCHED this EMIT
+        # from the code CAM (proving fetch@PC serves runtime-appended frames) + the
+        # register CAM reconstructed the input state; the driver reads the produced
+        # word from the input registers (op<-AX, imm<-STACK0), writes/overwrites the
+        # code frame at the EMIT immediate, and bumps PC.  Byte-exact vs isa.interpret.
+        if emit_on and op == isa.EMIT:
+            produced_op = prev["AX"] & 0xFF
+            produced_imm = prev["STACK0"] & 0xFF
+            target = run_code[cur_pc].imm
+            while target >= len(run_code):
+                run_code.append(isa.Instr(isa.NOP, 0))
+            run_code[target] = isa.Instr(produced_op, produced_imm)
+            # EMIT pops the immediate it consumed off the KV-backed stack.
+            new_stk = 0
+            if spill_stack_to_kv and stack_kv:
+                _psaddr, _ = stack_kv.pop()
+                store_log = [s for s in store_log
+                             if (s["addr"] & 0xFF) != (_psaddr & 0xFF)]
+                new_stk = stack_kv[-1][1] if stack_kv else 0
+            pc = cur_pc + 1
+            reg_state = {"PC": pc, "AX": prev["AX"], "SP": (prev["SP"] + 1) & 0xFFFFFFFF,
+                         "BP": prev["BP"], "STACK0": new_stk}
+            ax_trace.append(prev["AX"])
+            if verbose:
+                print(f"  step pc={cur_pc} op=EMIT  -> code[{target}]="
+                      f"({isa.NAMES.get(produced_op, produced_op)} {produced_imm}) pc={pc}")
+            cur_pc = pc
+            if cur_pc < 0 or cur_pc >= len(run_code):
+                break
+            continue
 
         pc = _snap(state[L.PC_VAL])
         # AX decode: for the efficient-ALU ops (MUL/DIV/MOD) the ax-mux writes the
@@ -1673,7 +1804,7 @@ def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
             print(f"  step pc={cur_pc} op={isa.NAMES.get(op, op):5s} -> "
                   f"pc={pc} ax={ax} sp={sp} bp={bp} stk={stk} halt={halted}")
         cur_pc = pc
-        if halted or cur_pc < 0 or cur_pc >= len(code):
+        if halted or cur_pc < 0 or cur_pc >= len(run_code):
             break
     return {"ax_trace": ax_trace, "ref_trace": ref_trace,
             "exact": ax_trace == ref_trace, "steps": len(ax_trace)}

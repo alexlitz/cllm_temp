@@ -117,6 +117,66 @@ int   n_tensors;
 int   input_tid;
 int   output_tid;
 
+/* ---- WEIGHT DEDUP (C4_DEDUP_WEIGHTS, opt-in, default OFF) --------------------
+ * The emulated transformer's weights are a tiny PALETTE of unique values replicated
+ * ~100x (198,610 nonzeros -> 1,895 unique).  With -DC4_DEDUP_WEIGHTS the runtime
+ * stores each float(=fixed-point) INITIALIZER's payload as a PALETTE INDEX (an int
+ * into `palette[]`) instead of the value, and a matmul weight read is the TWO-ACCESS
+ * chained indirection  `i = tv[a][flat]; W = palette[i]`  (the second chained load).
+ * This ADDS one load per weight fetch (the honest dedup cost) while collapsing the
+ * value storage to the palette.  DEFAULT-OFF -> the golden weight path (direct
+ * `tv[a][flat]`) is byte-identical; ON -> byte-EXACT (palette[idx]==the value).
+ * Non-weight (int64) tensors + runtime intermediates are never deduped. */
+#ifndef PALETTE_MAX
+#define PALETTE_MAX 4096                 /* >= 1,895 unique weight values */
+#endif
+long palette[PALETTE_MAX];               /* the unique fixed-point weight values */
+int  palette_n;                          /* number of distinct values stored */
+int  t_deduped[MAX_TENSORS];             /* 1 => tv[i] holds palette INDICES */
+#ifdef C4_DEDUP_WEIGHTS
+int  dedup_on = 1;
+#else
+int  dedup_on = 0;
+#endif
+
+/* ---- FUSED NON-MATMUL TAIL (C4_FUSE_TAIL, opt-in, default OFF) ---------------
+ * The self-emulation floor is the NON-MATMUL TAIL: with the matmul MAC fused to
+ * 1 step/MAC (C4_MEM_OPERAND) the tail (silu + element-wise adds; softmax is
+ * negligible at the S=1 decode row) is 98.5% of the total.  The tail ops are
+ * D-wide element-wise loops: each element the emulating c4 stack machine does
+ * pointer math + loads + the compute + a store + loop control (~112 steps/elem
+ * for add, ~141 for silu's exp-Taylor).  A FUSED tail superinstruction — the
+ * analogue of the fused MAC — commits ONE element per model.forward: the operand
+ * CAM reads run in the instruction's early blocks and feed the late-block
+ * add / silu, so 1 step/element.
+ *
+ * In THIS reference runtime the fusion is a byte-EXACT proof: with -DC4_FUSE_TAIL
+ * the silu (op_unary kind 3) and the element-wise adds (ew_broadcast kind 0) route
+ * through a dedicated fused per-element evaluator (`fused_silu` / `fused_add3`)
+ * that produces the IDENTICAL fixed-point value the unfused loop does (the fusion
+ * collapses STEPS, not values — exactly as palette[idx]==the value for dedup, and
+ * MAC [a],[b]==the bytecode dot for the MAC).  DEFAULT-OFF -> the golden op path is
+ * byte-identical; ON -> byte-EXACT.  The step COLLAPSE (loop -> 1/element) is
+ * grounded in _tail_fused_src / ground_fused_tail_selfemu, not in this runtime's
+ * wall (this runtime is compiled native, not self-emulated). */
+#ifdef C4_FUSE_TAIL
+int  fuse_tail_on = 1;
+#else
+int  fuse_tail_on = 0;
+#endif
+
+/* intern a fixed-point value into the palette; return its index (linear scan —
+ * C4-subset friendly; the palette is tiny so this is cheap at load time). */
+int palette_intern(long v) {
+    int i;
+    i = 0;
+    while (i < palette_n) { if (palette[i] == v) return i; i = i + 1; }
+    if (palette_n >= PALETTE_MAX) { printf("palette overflow (>%d)\n", PALETTE_MAX); exit(1); }
+    palette[palette_n] = v;
+    palette_n = palette_n + 1;
+    return palette_n - 1;
+}
+
 /* ---- node table ---- */
 int n_op[MAX_NODES];
 int n_nin[MAX_NODES];
@@ -270,9 +330,13 @@ int prod(int rank, int *dims) {
     return p;
 }
 
-/* allocate a runtime tensor's storage for the given shape + dtype/isfp */
+/* allocate a runtime tensor's storage for the given shape + dtype/isfp.  Resets
+ * t_deduped: a freshly COMPUTED tensor (matmul/add/...) holds VALUES, not palette
+ * indices.  The structural COPY ops (gather/reshape/transpose/concat/unsqueeze) that
+ * move a deduped payload verbatim re-assert t_deduped[out]=t_deduped[in] afterwards. */
 void alloc_tensor(int tid, int dtype, int isfp, int rank, int *dims) {
     int sz; int i;
+    t_deduped[tid] = 0;
     t_dtype[tid] = dtype;
     t_isfp[tid] = isfp;
     t_rank[tid] = rank;
@@ -324,13 +388,27 @@ void load(char *path) {
             /* float initializer -> fixed-point payload (t_isfp=1);
                int64 initializer -> raw int payload (t_isfp=0) */
             alloc_tensor(i, dt, (dt == DT_FLOAT) ? 1 : 0, rank, dims);
+            t_deduped[i] = 0;
             if (dt == DT_FLOAT) {
-                j = 0; while (j < ne) { tv[i][j] = rd_f32_fp(f); j = j + 1; }
+                if (dedup_on) {
+                    /* DEDUP: store the palette INDEX (an int), not the value.  The
+                       matmul weight read then chains  i=tv[a][flat]; W=palette[i]. */
+                    j = 0;
+                    while (j < ne) {
+                        long v; v = rd_f32_fp(f);
+                        tv[i][j] = (long)palette_intern(v);
+                        j = j + 1;
+                    }
+                    t_deduped[i] = 1;
+                } else {
+                    j = 0; while (j < ne) { tv[i][j] = rd_f32_fp(f); j = j + 1; }
+                }
             } else {
                 j = 0; while (j < ne) { tv[i][j] = rd_i64(f); j = j + 1; }
             }
         } else {
             t_dtype[i] = -1; t_isfp[i] = 0; t_rank[i] = 0; t_size[i] = 0;
+            t_deduped[i] = 0;
         }
         i = i + 1;
     }
@@ -361,6 +439,12 @@ void load(char *path) {
     fclose(f);
     printf("loaded %s: %d tensors, %d nodes (in=%d out=%d) [fixed-point 16.16]\n",
            path, n_tensors, n_nodes, input_tid, output_tid);
+    if (dedup_on)
+        printf("  [dedup ON] palette = %d unique weight values (two-access weight read)\n",
+               palette_n);
+    if (fuse_tail_on)
+        printf("  [fuse-tail ON] silu + element-wise adds route through the fused "
+               "per-element evaluators (1 step/element in self-emulation)\n");
 }
 
 /* find an attribute value on node `nd`, key `key`; return value index 0 or dflt */
@@ -393,8 +477,25 @@ int attr_val(int nd, int key, int idx) {
     return 0;
 }
 
-/* raw payload access (either fixed-point or raw int, per t_isfp) */
-long getv(int tid, int flat) { return tv[tid][flat]; }
+/* DEDUP-aware payload access.  For a deduped tensor (an initializer whose payload
+ * was interned into `palette[]` at load time) this is the TWO-ACCESS chained load
+ * `i = tv[tid][flat]; W = palette[i]` (the second chained load is the dedup cost);
+ * for a non-deduped tensor (dedup OFF, an int64 tensor, or a runtime intermediate)
+ * it is the plain single load.  Byte-EXACT either way (palette[idx] == the value).
+ * Routing ALL value reads through here keeps every op — matmul, add/mul, gather,
+ * reduce — reading the resolved value, so the whole forward is byte-identical. */
+long getv(int tid, int flat) {
+    if (t_deduped[tid]) {
+        int idx;
+        idx = (int)tv[tid][flat];       /* load 1: the palette index for this slot */
+        return palette[idx];            /* load 2: the value at that palette slot */
+    }
+    return tv[tid][flat];               /* direct (golden) single load */
+}
+
+/* the matmul weight fetch — the SAME two-access chained load, named for the MAC
+ * loop where the dedup step-cost is measured (see _matmul_dedup_src). */
+long get_wt(int tid, int flat) { return getv(tid, flat); }
 
 /* fixed-point multiply where we know the result should stay fixed-point:
    (a_fp * b_fp) >> SCALE_BITS with round-to-nearest.  a,b are long. */
@@ -404,6 +505,34 @@ long fpmul_l(long a, long b) {
     half = SCALE / 2;
     if (p >= 0) return (p + half) >> SCALE_BITS;
     return 0 - ((0 - p + half) >> SCALE_BITS);
+}
+
+/* ---- FUSED TAIL per-element evaluators (C4_FUSE_TAIL) ------------------------
+ * A fused tail superinstruction commits ONE element per forward: the operand CAM
+ * read(s) run in the instruction's early blocks and feed the late-block compute.
+ * These helpers are the byte-EXACT value proof of that fusion — each computes the
+ * SAME fixed-point result the unfused D-iteration loop does, for one element.  The
+ * step collapse (loop -> 1/element) is grounded in _tail_fused_src; here we prove
+ * the RESULT is unchanged so the fused self-forward stays byte-identical. */
+
+/* fused SILU/sigmoid element: sigmoid(x) = SCALE^2 / (SCALE + exp(-x)).  Same
+   value op_unary kind 3 computes, evaluated as one fused element (the exp-Taylor
+   inner loop collapses into the instruction's own nonlinear forward). */
+long fused_silu(long x) {
+    long negx; long e; long numer;
+    negx = 0 - x;
+    e = fp_exp(negx);
+    numer = (long)SCALE * (long)SCALE;
+    return numer / (SCALE + e);
+}
+
+/* fused ADD element: the aligned/-inf-saturated add ew_broadcast kind 0 does for
+   one pair of already-resolved (getv) operands.  One fused element per forward. */
+long fused_add3(long xa, long xb, int afp, int bfp) {
+    if (afp && !bfp) xb = xb * SCALE;
+    if (bfp && !afp) xa = xa * SCALE;
+    if (xa <= NEG_INF_FP || xb <= NEG_INF_FP) return NEG_INF_FP;
+    return xa + xb;
 }
 
 /* broadcasting elementwise: kind 0=add 1=sub 2=mul 3=div.
@@ -447,7 +576,11 @@ void ew_broadcast(int out, int a, int b, int kind) {
             i = i + 1;
         }
         va = getv(a, ai); vb = getv(b, bi);
-        if (kind == 0 || kind == 1) {
+        if (kind == 0 && fuse_tail_on) {
+            /* FUSED element-wise ADD (the tail's dominant #2 op): one fused element
+               per forward, byte-identical value to the unfused loop below. */
+            vr = fused_add3(va, vb, afp, bfp);
+        } else if (kind == 0 || kind == 1) {
             /* align: scale the raw-int operand up when the other is fixed-point */
             long xa; long xb;
             xa = va; xb = vb;
@@ -531,7 +664,10 @@ void op_matmul(int out, int a, int b) {
                 acc = 0;
                 r = 0;
                 while (r < K) {
-                    acc = acc + tv[a][aoff + p * K + r] * tv[b][boff + r * N + q];
+                    /* DEDUP-aware operand fetch: a deduped weight tensor resolves
+                       via `palette[tv[...]]` (the two-access chained load); a
+                       runtime intermediate / dedup-OFF reads directly.  Byte-exact. */
+                    acc = acc + get_wt(a, aoff + p * K + r) * get_wt(b, boff + r * N + q);
                     r = r + 1;
                 }
                 if (afp && bfp) {
@@ -566,6 +702,9 @@ void op_gather(int out, int data, int ind, int axis) {
     i = axis + 1; while (i < dr) { rdims[rank] = t_dims[data][i]; rank = rank + 1; i = i + 1; }
     if (rank == 0) { rdims[0] = 1; rank = 1; }
     alloc_tensor(out, t_dtype[data], t_isfp[data], rank, rdims);
+    /* Gather copies data payload VERBATIM: if `data` is a deduped (palette-indexed)
+       weight, the gathered rows are still palette indices -> propagate the flag. */
+    t_deduped[out] = t_deduped[data];
 
     o = 0;
     while (o < outer) {
@@ -602,6 +741,7 @@ void op_reshape(int out, int in, int shp) {
     if (neg >= 0) rdims[neg] = t_size[in] / known;
     sz = t_size[in];
     alloc_tensor(out, t_dtype[in], t_isfp[in], rank, rdims);
+    t_deduped[out] = t_deduped[in];      /* verbatim payload copy: indices stay indices */
     i = 0;
     while (i < sz) { tv[out][i] = tv[in][i]; i = i + 1; }
 }
@@ -617,6 +757,7 @@ void op_transpose(int out, int in, int nd, int *perm) {
     i = 0; while (i < rank) { odims[i] = idims[perm[i]]; i = i + 1; }
     strides_of(rank, idims, ist);
     alloc_tensor(out, t_dtype[in], t_isfp[in], rank, odims);
+    t_deduped[out] = t_deduped[in];      /* verbatim payload permute: indices stay indices */
     strides_of(rank, odims, ost);
     sz = t_size[in];
     i = 0; while (i < rank) { idx[i] = 0; i = i + 1; }
@@ -672,7 +813,9 @@ void op_concat(int nd, int out, int axis) {
                     int dstf; int srcf;
                     dstf = (o * total + off + k) * inner + aa;
                     srcf = (o * seg + k) * inner + aa;
-                    tv[out][dstf] = tv[cin][srcf];
+                    /* Concat may mix deduped + non-deduped inputs, so RESOLVE each
+                       source to its VALUE via getv (out is left non-deduped). */
+                    tv[out][dstf] = getv(cin, srcf);
                     aa = aa + 1;
                 }
                 k = k + 1;
@@ -708,6 +851,7 @@ void op_unsqueeze(int out, int in, int axtid) {
     }
     sz = (rank == 0) ? 1 : t_size[in];
     alloc_tensor(out, t_dtype[in], t_isfp[in], newrank, rdims);
+    t_deduped[out] = t_deduped[in];      /* verbatim payload copy: indices stay indices */
     i = 0;
     while (i < sz) { tv[out][i] = tv[in][i]; i = i + 1; }
 }
@@ -776,12 +920,18 @@ void op_unary(int out, int in, int kind) {
         } else if (kind == 2) {          /* abs */
             tv[out][i] = (x < 0) ? (0 - x) : x;
         } else if (kind == 3) {          /* sigmoid = SCALE^2 / (SCALE + exp(-x)) */
-            long negx; long numer; negx = 0 - x;
-            e = fp_exp(negx);            /* our graph only feeds x<=0, so -x>=0 -> exp<=1;
+            if (fuse_tail_on) {
+                /* FUSED SILU (the tail's dominant #1 op): the exp-Taylor inner loop
+                   collapses into one fused element per forward, byte-identical value. */
+                tv[out][i] = fused_silu(x);
+            } else {
+                long negx; long numer; negx = 0 - x;
+                e = fp_exp(negx);        /* our graph only feeds x<=0, so -x>=0 -> exp<=1;
                                             fp_exp clamps x>0 to SCALE (exp(0)=1) which is
                                             the correct 0.5 midpoint at x=0. */
-            numer = (long)SCALE * (long)SCALE;   /* 64-bit: avoid int overflow */
-            tv[out][i] = numer / (SCALE + e);
+                numer = (long)SCALE * (long)SCALE;   /* 64-bit: avoid int overflow */
+                tv[out][i] = numer / (SCALE + e);
+            }
         } else {                         /* identity */
             tv[out][i] = x;
         }

@@ -2,7 +2,7 @@
 
 A fast, GPU-free, **rule-attributable** structural debugging gate. It runs the
 value-faithful pure-IR interpreter
-([`neural_vm/unified_compiler/faithful_interpreter.py`](../neural_vm/unified_compiler/faithful_interpreter.py))
+([`neural_vm/unified_compiler/faithful_interpreter.py`](../neural_vm/verification/faithful_interpreter.py))
 over each program's **production decode setup**, reproduces the model's per-step
 `(PC, AX)` decode the way the production fail-fast path does, compares it to the
 DraftVM oracle, and on the first diverging byte **names the single owning

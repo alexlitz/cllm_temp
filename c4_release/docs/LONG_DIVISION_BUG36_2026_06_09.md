@@ -22,7 +22,7 @@ divergent block isolable to DIV — divergences appear at block 3
 the open L10 PSH `MEM_addr0` bug). Both are L10 issues and both are
 upstream of DIV semantics. No new fix landed; this doc complements the
 existing
-[`DIV_22_FAILING_ATTRIBUTION_2026_06_09.md`](DIV_22_FAILING_ATTRIBUTION_2026_06_09.md)
+[`DIV_22_FAILING_ATTRIBUTION_2026_06_09.md`](archive/DIV_22_FAILING_ATTRIBUTION_2026_06_09.md)
 with the oracle-localization step the brief asked for and an
 explicit structural-gap statement on `wide_div_rules`.
 
@@ -148,7 +148,7 @@ the SLOT_QUOTIENT[2..7] drift that originates inside `FlattenedDivMod`
 itself.
 
 The existing attribution doc
-[`DIV_22_FAILING_ATTRIBUTION_2026_06_09.md`](DIV_22_FAILING_ATTRIBUTION_2026_06_09.md)
+[`DIV_22_FAILING_ATTRIBUTION_2026_06_09.md`](archive/DIV_22_FAILING_ATTRIBUTION_2026_06_09.md)
 already enumerates the 22 `div_*` rowset and the 14
 `expr_mul_div_*` rowset, with the byte-1 dependence diagnosis and
 `neural=0` / `neural=1` / `neural=16` failure-shape signatures. This
@@ -180,7 +180,7 @@ For a future agent **without** the L10/L14/L15 constraint:
 
 ## Cross-references
 
-- [`DIV_22_FAILING_ATTRIBUTION_2026_06_09.md`](DIV_22_FAILING_ATTRIBUTION_2026_06_09.md)
+- [`DIV_22_FAILING_ATTRIBUTION_2026_06_09.md`](archive/DIV_22_FAILING_ATTRIBUTION_2026_06_09.md)
   — same-day per-row failure enumeration; this doc complements it
   with oracle-localization and structural-gap callouts.
 - [`BUG_CATALOG.md`](BUG_CATALOG.md) §Bug #36 — root surface.

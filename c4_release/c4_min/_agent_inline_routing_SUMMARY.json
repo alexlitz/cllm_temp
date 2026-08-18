@@ -1,0 +1,57 @@
+{
+  "experiment": "INLINE / NO-MODE routing into the grafted #910 byte-exact ALU (#914 follow-up)",
+  "question": "Can the rest of a pretrained Qwen2.5-0.5B-Instruct learn to use the byte-exact ALU INLINE and NATIVELY (content-triggered during normal generation, NO mode token / prompt / separate forward path), while preserving language and generalizing the routing?",
+  "host": "Qwen/Qwen2.5-0.5B-Instruct (494M, lean fp32, host + ALU FROZEN; ALU byte-exact by construction)",
+  "peak_rss_gb": 4.15,
+  "golden_untouched": "state_dict_sha256=1c04c3fd58f4c814ecf20811298d6b5f682dfcd7b3ca971a3da400fd18339d01 IDENTICAL on my worktree and pristine #914 base (567c94a2) -> ISA model byte-identical, golden untouched. My files import no build-path module.",
+  "findings": {
+    "1_trigger_when_to_invoke_CONTENT_TRIGGERED": {
+      "verdict": "WORKS, generalizes. NO mode token needed.",
+      "inline_no_mode_trigger_recall_train": "180/180 (100%)",
+      "inline_no_mode_trigger_recall_heldout": "60/60 (100%, unseen phrasings+operands)",
+      "false_trigger_nonarith": "0/60 (0%)",
+      "false_trigger_heldout_nonarith": "0/20 (0%)",
+      "false_trigger_numbers_but_no_arithmetic": "0/6 (0%) full-run [1/6 in the 8-example quick smoke]",
+      "note": "The 'decide to invoke the ALU from content' routing is robust and does NOT need a mode cue. Inline == explicit-mode on this axis (gap 0pp)."
+    },
+    "2_operand_read_route_the_RIGHT_operands": {
+      "verdict": "PARTIAL / the honest wall. Reading a single digit at its EXACT token generalizes; composing full multi-digit operands does not reach byte-exact on held-out.",
+      "value_as_256_class_readout_heldout": "0/60 (formulation artifact: a value never seen as a label is unreachable)",
+      "pinpoint_units_digit_at_exact_token": {
+        "same_range_disjoint_pairs": "A 150/150 (100%), B 150/150 (100%)",
+        "disjoint_value_range_mag_shift": "A 150/150 (100%), B 149/150 (99.3%)",
+        "meaning": "The operand digit IS cleanly present in the FROZEN host hidden state at the digit token and GENERALIZES. The wall is NOT representation."
+      },
+      "e2e_perdigit_read_and_compose": {
+        "train_operands_exact": "319/360 (89%) in-dist; 47/48 quick",
+        "heldout_indist_same_range_operands_exact": "31/120 (26%)",
+        "heldout_disjoint_range_operands_exact": "0/60",
+        "per_digit_place_heldout_disjoint_range": "units A 101/120 (84%) B 87/120 (73%); tens 44-58%; hundreds 44-49%",
+        "meaning": "Units digit generalizes (~84-100%); tens/hundreds degrade under value-range and phrasing shift; per-digit errors COMPOUND across 3 digits x 2 operands -> full-operand match collapses. Reaching byte-exact end-to-end needs a robust digit-token addressing + a magnitude-covering training distribution, not just more capacity."
+      }
+    },
+    "3_op_which_operation": {
+      "verdict": "generalizes in-distribution, partially under unseen phrasing",
+      "op_exact_train": "180/180 (100%)",
+      "op_exact_heldout_unseen_phrasing": "37/60 (62%) main; 56/120 (47%) e2e -> the op head reading the answer-slot partly memorizes phrasing->op"
+    },
+    "4_full_inline_pipeline_byte_exact": {
+      "train": "180/180 (100%) [value-class] ; 319/360 (89%) [digit e2e]",
+      "heldout": "0/60 [value-class] ; 8/120 (7%) in-dist [digit e2e] ; 0/60 disjoint-range",
+      "alu_byte_exact_given_routed_operands": "180/180 train, 52-59/60 heldout -> the ALU is ALWAYS byte-exact on whatever it is fed; ALL end-to-end loss is the ROUTER misreading operands/op, never the ALU."
+    },
+    "5_language_preservation": {
+      "verdict": "PRESERVED exactly. Host FROZEN, router is a separate module reading hidden states.",
+      "heldout_nonarith_perplexity": 93.288,
+      "delta_vs_base": 0.0,
+      "note": "No catastrophic forgetting is even POSSIBLE: no host weight changes. Zero-cost on language by construction."
+    },
+    "6_inline_vs_explicit_mode": {
+      "trigger_gap": "0pp (inline == mode-gated on trigger + false-trigger)",
+      "operand_gap": "0pp (both 0/60 held-out with value-class; the operand wall is orthogonal to the cue)",
+      "conclusion": "The MODE CUE buys NOTHING here: the content-triggered (inline) router matches the explicit-mode router on every axis. The bottleneck is operand READING, not the trigger, so a mode token does not help."
+    }
+  },
+  "verdict": "PARTIAL WIN, honestly. (a) The NATIVE / content-triggered decision to invoke the ALU works and generalizes with NO special mode (100% trigger recall, 0% false-trigger, inline == mode-gated -> a mode cue is unnecessary for triggering). (b) Language is preserved exactly (host frozen, delta 0). (c) The ALU stays byte-exact on whatever is routed (byte-exactness is never the failure). (d) The WALL is operand READING: the operand digits ARE recoverable and generalize at the exact token (units 84-100% held-out), but composing full multi-digit operands to byte-exact does NOT generalize out-of-distribution (0/60 disjoint range) and only 26% in-distribution held-out, because per-digit errors compound and higher-place digits do not extrapolate to unseen magnitudes. So: the network CAN natively/inline DECIDE to use the ALU without a special mode and keep language intact, but end-to-end byte-exact inline arithmetic on UNSEEN operands is NOT achieved by a frozen-host + trained-router here -- the honest cost is that operand extraction is the binding constraint, not the trigger and not the ALU.",
+  "precedent_positioning": "Toolformer learns WHEN to call an external tool inline from text -> here the 'when' (trigger) likewise generalizes inline with no mode token, but the tool is an INTERNAL byte-exact constructed circuit (not a black-box API) and the failure is the NALU-style operand-VALUE generalization (reading/composing the number), which frozen-host+linear-router does not solve extrapolatively; DNC-style learned addressing to the digit tokens is what makes the per-digit read generalize (units 100%), but full-operand composition remains the wall."
+}

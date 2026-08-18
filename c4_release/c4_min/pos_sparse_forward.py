@@ -45,6 +45,89 @@ def pos_sparse_enabled() -> bool:
     return os.environ.get("C4_POS_SPARSE", "0") == "1"
 
 
+# ---------------------------------------------------------------------------
+# INTEGER LEA-address snap (replaces the ONLY fp64 block, ``lea-addr-nib``).
+#
+# WHY fp64 was there:  the ``lea-addr-nib`` FFN decodes the frame byte
+# ``AXB_LO/AXB_HI = split_nibbles(LEA_Q & 0xFF)`` by summing up to ~768 saturating
+# silu UNIT steps (edges from -256..512), each routing ``±val`` (val 0..15) into
+# ``AXB_LO``.  For a large positive integer ``LEA_Q=k`` roughly ``k+256`` of those
+# ``+val``/``-val`` terms are ON, so the reduction is a long near-cancelling chain
+# whose partial sums reach O(few-thousand).  fp32 has only ~2^24 integer exactness
+# and the 1-row cuBLAS GEMV REASSOCIATES the reduction order, so the accumulated
+# rounding error GROWS with ``LEA_Q`` — measured up to ``77`` on ``AXB_LO`` (q=224:
+# fp32 decodes -20, the true nibble is 0).  #741 ran that one block in fp64 to
+# restore exactness (fp64's 2^53 mantissa absorbs the chain).  It is NOT a
+# half-integer tie at the ``_step_ge`` staircase — the staircase itself is exact;
+# it is the fp32 *accumulation order/precision* of the O(few-hundred-to-thousand)-
+# term W_down GEMV that diverges.
+#
+# The block computes an INTEGER address (``LEA_Q`` in [-256,511] is already snapped
+# to an exact integer by ``lea-q-snap`` upstream, and its ONLY output is the two
+# 4-bit nibbles of ``LEA_Q & 0xFF``).  So it is computed EXACTLY, and much faster,
+# in integer/deterministic arithmetic — no float64, no ~768-step silu sum at all:
+#
+#     gate = silu(S*(g-0.5)) / SILU_HALF        # the block's own LEA gate ramp (g=OP_IS[LEA])
+#     byte = round(LEA_Q) mod 256               # exact integer, |LEA_Q|<=512 << 2^24
+#     AXB_LO := AXB_LO + gate*((byte & 0xF) - AXB_LO)      # SET (clear+re-add) fused
+#     AXB_HI := AXB_HI + gate*((byte>>4)     - AXB_HI)
+#
+# On a LEA (g exactly 1.0) the delta reproduces the block's SET; off-LEA (g=0) the
+# delta is 0 -> byte-identical passthrough.  Verified 0/768 snapped-nibble mismatch
+# vs the fp64 block over the whole [-256,511] LEA_Q range (and vs the integer-exact
+# reference).  Gate: ``C4_LEA_INT_SNAP`` (default OFF -> golden byte-identical; the
+# runner still installs the fp64/fp32 path when OFF).
+# ---------------------------------------------------------------------------
+LEA_ADDR_NIB_BLOCK_NAME = "lea-addr-nib"
+
+
+def lea_int_snap_enabled() -> bool:
+    """The integer LEA-address snap that eliminates the ONLY fp64 block.
+
+    DEFAULT OFF.  When ON, the ``lea-addr-nib`` block's query-row FFN is computed
+    with the exact-integer nibble split of ``LEA_Q & 0xFF`` (int32-exact) instead
+    of the fp64 SwiGLU — no float64 anywhere in the forward, and the ~768-step
+    silu decode is replaced by a handful of elementwise ops.  ``C4_LEA_INT_SNAP=1``
+    to enable.  Escape hatch: unset / ``=0`` -> the runner keeps the fp64 (or
+    fp32) path and the build stays byte-identical to golden ``069cc32f``."""
+    return os.environ.get("C4_LEA_INT_SNAP", "0") == "1"
+
+
+def resolve_lea_snap_dims(L):
+    """Resolve the residual-dim indices the integer LEA snap reads/writes:
+    ``(gate=OP_IS[LEA], lea_q, axb_lo, axb_hi)``.  Returns ``None`` if the layout
+    does not expose them (non-exact-steps model) so the caller falls back."""
+    from . import isa
+    try:
+        return (int(L.OP_IS) + int(isa.LEA), int(L.LEA_Q),
+                int(L.AXB_LO), int(L.AXB_HI))
+    except Exception:
+        return None
+
+
+def apply_int_lea_addr_nib(aout: torch.Tensor, dims) -> torch.Tensor:
+    """Byte-exact INTEGER replacement for the ``lea-addr-nib`` FFN at the query row.
+
+    ``aout`` is the block's attention output ([...,D]); ``dims`` is the tuple
+    ``(gate_dim, lea_q_dim, axb_lo_dim, axb_hi_dim)`` from ``resolve_lea_snap_dims``.
+    Returns the FFN output (residual-add form): identical to ``aout`` everywhere
+    except ``AXB_LO``/``AXB_HI``, which get the SET result the fp64 block computes,
+    gated by the block's own LEA gate ramp.  No float64; no cuBLAS GEMV; exact."""
+    from .nibble_pure_forward_complete import S as _S, SILU_HALF as _SH
+    g_dim, q_dim, lo_dim, hi_dim = dims
+    g = aout[..., g_dim]
+    # the block's LEA gate ramp: silu(S*(g-0.5))/SILU_HALF (==1 for g=1, ==0 for g=0).
+    gate = F.silu(_S * (g - 0.5)) / _SH
+    # LEA_Q is a snapped exact integer in [-256,511]; byte = LEA_Q & 0xFF (int-exact).
+    byte = torch.remainder(torch.round(aout[..., q_dim]), 256.0)
+    new_lo = torch.remainder(byte, 16.0)
+    new_hi = torch.floor(byte / 16.0)
+    out = aout.clone()
+    out[..., lo_dim] = aout[..., lo_dim] + gate * (new_lo - aout[..., lo_dim])
+    out[..., hi_dim] = aout[..., hi_dim] + gate * (new_hi - aout[..., hi_dim])
+    return out
+
+
 def _attn_query_only(attn, x: torch.Tensor, q_idx: int) -> torch.Tensor:
     """Compute the SparseAttn block output but only the query row ``q_idx`` gets the
     real attention output; all other rows carry ``x`` unchanged (passthrough).
@@ -202,4 +285,5 @@ def block_macs(blk, S: int, pos_sparse: bool):
 
 
 __all__ = ["pos_sparse_enabled", "PositionSparseRunner", "block_macs",
-           "_block_query_only"]
+           "_block_query_only", "lea_int_snap_enabled", "resolve_lea_snap_dims",
+           "apply_int_lea_addr_nib", "LEA_ADDR_NIB_BLOCK_NAME"]

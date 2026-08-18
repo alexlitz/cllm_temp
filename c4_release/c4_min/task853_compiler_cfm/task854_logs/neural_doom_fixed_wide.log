@@ -1,0 +1,40 @@
+[minic-wide] SP_INIT=0xf000 lea_wide=True fine_grained=True
+[minic-wide] compiler instrs=752 input='/tmp/t853/doom_fixed.c' (71 bytes) K=200
+[minic-wide] draft steps=7120 halted=True code_off=752 n_prtf=32 REF_OUTPUT=b'1 320\n13 0\n1 200\n27 0\n13 0\n1 65536\n13 0\n1 8192\n13 0\n1 320\n13 0\n1 200\n13 0\n1 35\n13 0\n1 4\n13 0\n1 2\n13 0\n1 1\n25 0\n26 0\n27 0\n26 0\n27 0\n25 0\n26 0\n26 0\n13 0\n1 2\n25 0\n8 0\n' wall=0.18s
+[minic-wide] built dim=1464 blocks=263 build=36s peakRSS=1.8GB
+[minic-wide] verify_blocks matched=True forwards=50 accepted=7120/7120 wall=60.1s ms/step=8.4 eff_K=100 peak_vram=22.8GB
+[minic-wide] MODEL accepted all 7120 steps byte-exact: True
+[minic-wide] WIDE-LEA COMPILER-ON-32BIT-TRANSFORMER byte-exact: True
+[minic-wide] emitted bytecode:
+1 320
+13 0
+1 200
+27 0
+13 0
+1 65536
+13 0
+1 8192
+13 0
+1 320
+13 0
+1 200
+13 0
+1 35
+13 0
+1 4
+13 0
+1 2
+13 0
+1 1
+25 0
+26 0
+27 0
+26 0
+27 0
+25 0
+26 0
+26 0
+13 0
+1 2
+25 0
+8 0

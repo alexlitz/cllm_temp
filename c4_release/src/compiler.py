@@ -118,6 +118,8 @@ class TokenType(IntEnum):
     INC = 40
     DEC = 41
     BRAK = 42
+    NOT = 43     # unary logical not '!'  (prefix only)
+    BNOT = 44    # unary bitwise not '~'  (prefix only)
     LPAREN = 50
     RPAREN = 51
     LBRACE = 52
@@ -214,15 +216,14 @@ class Lexer:
             return (TokenType.ID, ident, line)
 
         if ch == "'":
-            self.advance()
-            val = ord(self.advance())
-            if self.peek() == '\\':
-                self.advance()
+            self.advance()                 # opening '
+            c = self.advance()             # first char inside the quotes
+            if c == '\\':                  # escape: test the FIRST inner char (was mis-testing the next)
                 esc = self.advance()
                 val = {'n': 10, 't': 9, '\\': 92, "'": 39, '0': 0}.get(esc, ord(esc))
             else:
-                val = ord(self.source[self.pos - 1])
-            self.advance()
+                val = ord(c)
+            self.advance()                 # closing '
             return (TokenType.NUM, val, line)
 
         if ch == '"':
@@ -271,7 +272,7 @@ class Lexer:
             if self.peek() == '=':
                 self.advance()
                 return (TokenType.NE, '!=', line)
-            return (TokenType.NUM, 0, line)
+            return (TokenType.NOT, '!', line)
         if ch == '<':
             if self.peek() == '=':
                 self.advance()
@@ -302,7 +303,7 @@ class Lexer:
         if ch == '^':
             return (TokenType.XOR, '^', line)
         if ch == '~':
-            return (TokenType.NUM, -1, line)
+            return (TokenType.BNOT, '~', line)
 
         if ch == '?':
             return (TokenType.COND, '?', line)
@@ -471,18 +472,23 @@ class Compiler:
             self.parse_global_decl()
 
     def parse_global_decl(self):
-        base_type = INT
+        # ``decl_base`` is the base type WITHOUT the leading pointer stars
+        # (int/char). Each declarator re-reads its own pointer stars so
+        # ``int a, *b, **c;`` gives a:int, b:int*, c:int**, matching c4.c's
+        # per-declarator ``while (tk == Mul)`` loop.
+        decl_base = INT
 
         if self.peek() == TokenType.KW_INT:
             self.advance()
-            base_type = INT
+            decl_base = INT
         elif self.peek() == TokenType.KW_CHAR:
             self.advance()
-            base_type = CHAR
+            decl_base = CHAR
         elif self.peek() == TokenType.KW_ENUM:
             self.parse_enum()
             return
 
+        base_type = decl_base
         while self.peek() == TokenType.MUL:
             self.advance()
             base_type += PTR
@@ -496,6 +502,19 @@ class Compiler:
             self.symbols[name] = Symbol(name, 'Glo', base_type, self.data_base + len(self.data) * 8)
             for _ in range(8):
                 self.data.append(0)
+            # Comma-separated globals: ``int a, b, *c;`` — each subsequent
+            # declarator re-reads its own pointer stars off ``decl_base``.
+            while self.peek() == TokenType.COMMA:
+                self.advance()
+                gtype = decl_base
+                while self.peek() == TokenType.MUL:
+                    self.advance()
+                    gtype += PTR
+                gname = self.token_val()
+                self.expect(TokenType.ID)
+                self.symbols[gname] = Symbol(gname, 'Glo', gtype, self.data_base + len(self.data) * 8)
+                for _ in range(8):
+                    self.data.append(0)
             self.expect(TokenType.SEMI)
 
     def parse_enum(self):
@@ -823,12 +842,37 @@ class Compiler:
                 self.code.pop()
             self.expr_type += PTR
 
+        elif self.peek() == TokenType.ADD:
+            # Unary plus: +x is a no-op that yields an int rvalue. Mirrors c4.c
+            # expr() `else if (tk == Add) { next(); expr(Inc); ty = INT; }`.
+            self.advance()
+            self.parse_expression(TokenType.INC)
+            self.expr_type = INT
+
         elif self.peek() == TokenType.SUB:
             self.advance()
             self.emit(Op.IMM, -1)
             self.emit(Op.PSH)
             self.parse_expression(TokenType.INC)
             self.emit(Op.MUL)
+            self.expr_type = INT
+
+        elif self.peek() == TokenType.NOT:
+            # Logical not: !x  ==  (x == 0).  Mirrors c4.c expr() '!' handler.
+            self.advance()
+            self.parse_expression(TokenType.INC)
+            self.emit(Op.PSH)
+            self.emit(Op.IMM, 0)
+            self.emit(Op.EQ)
+            self.expr_type = INT
+
+        elif self.peek() == TokenType.BNOT:
+            # Bitwise not: ~x  ==  (x ^ -1).  Mirrors c4.c expr() '~' handler.
+            self.advance()
+            self.parse_expression(TokenType.INC)
+            self.emit(Op.PSH)
+            self.emit(Op.IMM, -1)
+            self.emit(Op.XOR)
             self.expr_type = INT
 
         elif self.peek() == TokenType.INC or self.peek() == TokenType.DEC:
@@ -979,7 +1023,11 @@ class Compiler:
                 self.parse_expression(TokenType.MUL)
                 if saved_type >= PTR:
                     base_type = saved_type - PTR
-                    elem_size = 8 if base_type == INT else 1
+                    # Element size is sizeof(*p): 1 for char* (base CHAR), else 8
+                    # (int* AND any pointer-to-pointer int**/char** -> a pointer is
+                    # 8 bytes). Mirrors c4.c's `if ((ty = t) > PTR)` scale (t > PTR
+                    # holds for every non-char base) and the ++/-- stride below.
+                    elem_size = 1 if base_type == CHAR else 8
                     if elem_size > 1:
                         self.emit(Op.PSH)
                         self.emit(Op.IMM, elem_size)
@@ -993,7 +1041,9 @@ class Compiler:
                 self.parse_expression(TokenType.MUL)
                 if saved_type >= PTR and self.expr_type >= PTR:
                     base_type = saved_type - PTR
-                    elem_size = 8 if base_type == INT else 1
+                    # ptr - ptr: divide the byte delta by sizeof(*p) (1 for char*,
+                    # else 8). c4.c: `if (t > PTR && t == ty) { SUB; DIV sizeof(int) }`.
+                    elem_size = 1 if base_type == CHAR else 8
                     self.emit(Op.SUB)
                     if elem_size > 1:
                         self.emit(Op.PSH)
@@ -1002,7 +1052,8 @@ class Compiler:
                     self.expr_type = INT
                 elif saved_type >= PTR:
                     base_type = saved_type - PTR
-                    elem_size = 8 if base_type == INT else 1
+                    # ptr - int: scale the int by sizeof(*p) before subtracting.
+                    elem_size = 1 if base_type == CHAR else 8
                     if elem_size > 1:
                         self.emit(Op.PSH)
                         self.emit(Op.IMM, elem_size)
@@ -1059,20 +1110,67 @@ class Compiler:
                 self.emit(Op.SUB if is_inc else Op.ADD)
 
             elif self.peek() == TokenType.BRAK:
+                # Capture the token immediately before this `[` BEFORE consuming
+                # the index expression (self.pos still points at `[`). Used below
+                # to tell a compound index `a[i][j]` (prev == `]`) from a bare
+                # single index `arr[k]` (prev == identifier / `)`).
+                _prev_before_brak = (
+                    self.tokens[self.pos - 1][0] if self.pos >= 1 else None
+                )
                 self.advance()
                 self.emit(Op.PSH)
                 self.parse_expression(TokenType.ASSIGN)
                 self.expect(TokenType.RBRACKET)
                 if saved_type >= PTR:
                     base_type = saved_type - PTR
-                    elem_size = 8 if base_type == INT else 1
+                    # p[k] indexes by sizeof(*p): 1 for char*, else 8 (int* AND
+                    # int**/char** — a pointer element is 8 bytes). c4.c Brak uses
+                    # `if (t > PTR) { ... MUL sizeof(int) }`.
+                    elem_size = 1 if base_type == CHAR else 8
                     if elem_size > 1:
                         self.emit(Op.PSH)
                         self.emit(Op.IMM, elem_size)
                         self.emit(Op.MUL)
-                self.emit(Op.ADD)
-                self.expr_type = saved_type - PTR if saved_type >= PTR else saved_type
-                self.emit(Op.LI if self.expr_type != CHAR else Op.LC)
+                    self.emit(Op.ADD)
+                    self.expr_type = saved_type - PTR
+                    self.emit(Op.LI if self.expr_type != CHAR else Op.LC)
+                else:
+                    # Indexing a NON-pointer value `v[k]`.  In strict C this is a
+                    # type error (c4.c prints "pointer type expected" and exits),
+                    # but the flattened Doom port uses two distinct idioms that
+                    # both land here, and they want OPPOSITE strides:
+                    #
+                    #  (a) COMPOUND index `tbl[i][j]` where `tbl` is single-star
+                    #      `int*` (a flat table of block POINTERS stored as words).
+                    #      `tbl[i]` has type int (the pointer VALUE), and the inner
+                    #      `[j]` must scale by the WORD size (8) to read the int at
+                    #      `block + j*8`.  Byte-striding it was the dominant
+                    #      compound-index bug (dropped the ×8, needed a hand
+                    #      `((int*)tbl[i])[j]` cast at every render call site:
+                    #      R_GetColumn, R_DrawSprite ds[9]/ds[10], sprites[..][..]).
+                    #
+                    #  (b) SINGLE index `arr[k]` on a bare-`int` global that holds a
+                    #      malloc'd base pointer (`int players; players=malloc(...)`;
+                    #      likewise playeringame/wminfo/... ).  The port already
+                    #      encodes these subscripts in the units the surrounding
+                    #      code expects (byte offsets — `players[i*74+field]`), so
+                    #      this MUST retain the historical stride-1 (byte) lowering;
+                    #      word-scaling it corrupts the whole player/game state.
+                    #
+                    # Discriminate structurally: a compound index (a) has a `]`
+                    # immediately before this `[` (the outer subscript just
+                    # closed); a bare-array index (b) has an identifier / `)`
+                    # there.  Only (a) gets the ×8 word scale.  Genuine char
+                    # blocks (e.g. `myargv` holding `char*`) use an explicit
+                    # `(char*)` cast at the site so they take the byte-stride
+                    # pointer branch above.
+                    if _prev_before_brak == TokenType.RBRACKET:
+                        self.emit(Op.PSH)
+                        self.emit(Op.IMM, 8)
+                        self.emit(Op.MUL)
+                    self.emit(Op.ADD)
+                    self.expr_type = INT
+                    self.emit(Op.LI)
 
             else:
                 break

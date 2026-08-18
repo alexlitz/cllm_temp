@@ -130,6 +130,12 @@ class BoundedBlock:
         # default True keeps the a39ae2c all-fp64 byte-exact baseline.  The analyzer
         # (``analyze_fp64_blocks``) flips the fp32-safe blocks to False.
         self.fp64_ffn = bool(fp64_ffn)
+        # INTEGER LEA-address snap (C4_LEA_INT_SNAP, #870): when armed (a tuple of
+        # residual-dim indices, set by the runner for the ``lea-addr-nib`` block),
+        # the query-row FFN is computed EXACTLY in integer arithmetic (the frame-byte
+        # nibbles of ``LEA_Q & 0xFF``) instead of the fp64 SwiGLU — byte-exact, no
+        # float64.  None -> the fp64/fp32 path.
+        self._lea_snap_dims = None
         A = blk.attn
         self.H, self.HD, self.D = A.n_heads, A.head_dim, A.dim
         self.scale = A.scale
@@ -153,7 +159,21 @@ class BoundedBlock:
     def _ffn_qrow(self, aout):
         if self.routed:
             return self.ffn(aout)
+        # INTEGER LEA snap: exact-integer nibble split of ``LEA_Q & 0xFF`` — replaces
+        # the fp64 SwiGLU on the ``lea-addr-nib`` block (no float64, no ~768-step
+        # silu decode).  Byte-exact to the fp64 block over all LEA_Q in [-256,511].
+        if self._lea_snap_dims is not None:
+            from .pos_sparse_forward import apply_int_lea_addr_nib
+            return apply_int_lea_addr_nib(aout, self._lea_snap_dims)
         F_ = self.ffn
+        # FUSED-DELTA SPARSE FFN composition (#873, measurement-only branch): if the
+        # block's ffn was swapped for the #808 fused-delta / fused SwiGLU kernel
+        # (install_fused_delta_ffn), it exposes forward(x)->x+FFN(x) and NO W_up
+        # attribute; route the query-row FFN through it (byte-exact at the nibble
+        # margin per #808).  Composes with per-row block-skip (shrinks each LIVE
+        # block's FFN COMPUTE; per-row already picked the live blocks).
+        if getattr(F_, 'W_up', None) is None and hasattr(F_, 'forward'):
+            return F_.forward(aout)
         if self.fp64_ffn or self._W_gu32 is None:
             Wu, Wg, Wd = _dense(F_.W_up), _dense(F_.W_gate), _dense(F_.W_down)
             xq64 = aout.double()

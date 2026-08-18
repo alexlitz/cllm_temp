@@ -86,14 +86,14 @@ def mul_lookahead() -> bool:
 
 
 def _signed_divmod_enabled() -> bool:
-    """``C4_DIVMOD_SIGNED`` (#790, DEFAULT OFF): compute DIV/MOD with native-c4
+    """``C4_DIVMOD_SIGNED`` (#790, DEFAULT ON — golden migration 7d4afe61→3cabef64): compute DIV/MOD with native-c4
     SIGNED truncation-toward-zero semantics instead of the golden UNSIGNED floor.
     The base-16 long divider is UNSIGNED, so signed div/mod is done by NEGATING each
     negative operand to its magnitude BEFORE the divide (recording its sign) and
     conditionally negating the quotient (sign = SGN_A^SGN_B) / remainder (sign =
     SGN_A) AFTER — all via a two's-complement carry chain over the operand / result
-    nibble bands.  OFF -> DIV/MOD stay unsigned-floor -> golden byte-IDENTICAL."""
-    return os.environ.get("C4_DIVMOD_SIGNED", "0") not in ("0", "", "false", "False")
+    nibble bands.  C4_DIVMOD_SIGNED=0 -> unsigned-floor rollback == the pre-migration golden 7d4afe61."""
+    return os.environ.get("C4_DIVMOD_SIGNED", "1") not in ("0", "", "false", "False")
 
 
 # ---------------------------------------------------------------------------

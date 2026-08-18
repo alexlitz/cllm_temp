@@ -1,0 +1,89 @@
+[mod-wide] SP_INIT=0xf000 lea_wide=True fine_grained=True
+[mod-wide] compiler instrs=2923 module='c4_min/task853_compiler_cfm/mod3.c' (287 bytes) K=48 max_steps=400000
+[mod-wide] draft steps=53553 halted=True code_off=2923 n_prtf=79 emitted_words=158 wall=2.82s
+[mod-wide] built dim=1464 blocks=263 build=11s peakRSS=1.8GB
+[mod-wide] verify_blocks matched=True forwards=8862 accepted=53553/53553 wall=1881.9s ms/step=35.1 eff_K=6 peak_vram=21.7GB
+[mod-wide] MODEL accepted all 53553 steps byte-exact: True
+[mod-wide] WHOLE-MODULE COMPILER-ON-32BIT-TRANSFORMER byte-exact: True
+[mod-wide] emitted bytecode (158 words):
+6 0
+0 3
+9 0
+13 0
+0 2
+9 0
+25 0
+13 0
+1 0
+9 0
+25 0
+8 0
+8 0
+6 1
+0 -1
+13 0
+0 3
+9 0
+13 0
+0 2
+9 0
+27 0
+11 0
+0 -1
+9 0
+13 0
+1 0
+9 0
+26 0
+8 0
+8 0
+6 0
+0 3
+9 0
+13 0
+0 2
+9 0
+20 0
+4 42
+0 3
+9 0
+8 0
+0 2
+9 0
+8 0
+8 0
+6 2
+1 0
+13 0
+1 7
+11 0
+0 -1
+13 0
+1 10
+13 0
+1 20
+13 0
+3 0
+7 2
+11 0
+0 -2
+13 0
+0 -1
+9 0
+13 0
+1 2
+13 0
+3 13
+7 2
+11 0
+0 -2
+9 0
+13 0
+1 30
+13 0
+3 31
+7 2
+8 0
+8 0
+
+PROC_DONE

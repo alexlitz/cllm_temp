@@ -95,7 +95,97 @@
  *     trace's memory-load path is correct through the loop setup) but its end-to-end
  *     byte-exactness vs the reference is NOT yet confirmed (the ground-truth hybrid
  *     comparison was blocked on machine contention).
- *   - The binary is ~6.3 MB, fully static (`ldd: not a dynamic executable`), zero
+ *   - DEAD-BLOCK-FUSION (default ON; ALLC_NO_ATTN_FUSION=1 to disable): only 3 of the
+ *     242 blocks carry a LIVE attention head (audited from the baked weights, ALLC_
+ *     FUSION_AUDIT=1: b0 ingest Wv/Wo nnz=40, b7 nnz=16, b11 memory-CAM/LEV nnz=32);
+ *     the other 239 blocks have an ALL-ZERO W_v OR W_o slice, so their attention output
+ *     is mathematically-exact ZERO and the attn residual add is pure passthrough
+ *     (xout=xin).  We SKIP the entire attention sublayer (Q/K/V proj + softmax + O proj)
+ *     for those 239 blocks and run only the FFN — BYTE-EXACT (verified: fusion ON==OFF
+ *     stdout+exit byte-identical on echo/yes/cat/quine, and the kill-switch OFF==the
+ *     pre-fusion binary).  This collapses the per-step forward from ~473 ms/step to
+ *     ~24 ms/step (~19x): MEASURED echo 6.5s->0.41s (~16x full), 0.28s block-skip
+ *     (~23x); yes(y\\n x8) 26s->1.1s (~24x); cat 48s->1.8s (~27x).  Composes with
+ *     --block-skip / --evict / --io-burst.  _weight_all_zero() + g_attn_dead[] in
+ *     incr_discover(); applied in run_incremental / run_full_skip / run_full_evict.
+ *   - DIRECT-CAM (opt-in --direct-cam / ALLC_DIRECT_CAM=1; default OFF): resolve a
+ *     memory-LOAD op's AX (LI full-word / LC byte) O(1) from the store-log (load addr
+ *     = pre-step AX, latest-write-wins ac_mem_top/ac_mem_read) instead of the neural
+ *     memory-CAM — the SAME latest-write CAM rule the global heads implement, so it is
+ *     BYTE-EXACT (verified: 0 LI/LC steps where store-log != neural decode on cat +
+ *     quine; output byte-identical ON vs OFF).  HONEST: in the autoregressive all-C
+ *     path this is byte-exactness-proving but NOT a speedup lever — the neural forward
+ *     still runs in full (the b0 ingest block + b7/b11 are needed to decode PC/SP), so
+ *     the AX override happens AFTER the forward; the timing win is entirely dead-block-
+ *     fusion.  Kept as a verified O(1) resolution + a neural/store-log CAM-agreement
+ *     canary (ac_dcam_diff == 0 confirms the two CAMs never disagree on these progs).
+ *   - OPTIMIZED LIVE-BLOCK ATTENTION (the headline speedup on TOP of dead-block-fusion;
+ *     both default ON, each with a kill-switch).  Post-fusion, only 3 blocks run
+ *     attention: b0 (20 LOCAL ingest heads, ALiBi slope 6.0) and b7/b11 (3 GLOBAL
+ *     memory-CAM heads, slope ~0.004).  #879's fusion skipped the 239 DEAD blocks but
+ *     the 3 LIVE blocks still scanned ALL S past keys each step -> O(S) per query,
+ *     O(S^2) over a run.  Two byte-exact levers cut that to O(W)/O(#stores+W):
+ *       (a) LIVE-BLOCK LOCAL WINDOW (ALLC_NO_LIVE_WIN=1 to disable): b0's LOCAL heads
+ *           attend only the last AC_LIVE_LOCAL_WIN=32 keys.  BYTE-EXACT: an ingest head
+ *           (slope 6.0) has softmax1 weight EXACTLY 0.0f beyond its recency horizon —
+ *           MEASURED max nonzero-weight distance 28 over echo/cat/quine (ALLC_WINPROBE),
+ *           so W=32 is a proven-exact margin.  Turns b0's per-query O(S) scan into O(W).
+ *       (b) GLOBAL-HEAD KEY-SUBSET / direct-CAM-attn (ALLC_NO_GKEY=1 to disable): the 3
+ *           GLOBAL memory-CAM heads scan ONLY the keep-set keys (BOS + every §Memory
+ *           store row + last AC_GLOBAL_WIN=60 recency rows) instead of all S — O(#stores
+ *           +W) not O(S).  BYTE-EXACT for the SAME reason the eviction path is (V==0 on
+ *           every non-store row -> zero numerator; the softmax1 denom delta over the
+ *           dropped rows rounds away), scanned in the same ascending-k order + real
+ *           distances.  NOTE these GLOBAL heads are a broad soft blend (measured gnz=all
+ *           causal keys, top weight ~1/S), NOT a hard 1-hot gather — so a true O(1)
+ *           hard-gather of the attention output is NOT byte-exact; the byte-exact O(1)
+ *           resolution is the store-log AX override (DIRECT-CAM above).  This key-subset
+ *           is the byte-exact attention-level analogue.  g_gkey/ac_build_gkey.
+ *     MEASURED (quine, 363 steps, S 1651->12541, all-C incremental path): attention
+ *     ops stay FLAT ~13-16M/step ON vs growing 534M->3980M/step OFF (the O(S)->O(W)+
+ *     O(#stores) flattening); per-step 284ms->100ms; QUINE end-to-end 182s->36s (~5x),
+ *     byte-identical stdout+exit.  Both levers compose with dead-block-fusion / block-
+ *     skip / evict / io-burst; each is byte-exact ON vs OFF vs the #879 base on echo/
+ *     yes/cat/quine.  The FFN was ALREADY O(nnz)-sparse (coo_project, no dense W_up/
+ *     W_gate/W_down); per-op BLOCK-SKIP (below) already skips a skipped block's FFN too.
+ *   - OVERHEAD-KILL PASS (this change; all byte-exact, each with a kill-switch; profiled
+ *     with ALLC_TIMING=1 [per-phase overlay/fwd/decode] + ALLC_PHASE=1 [attn/ffn split]).
+ *     PROFILE found the runtime was OVERHEAD-bound, NOT flop-bound (~162K MACs/step but
+ *     24-73ms/step), with the dominant cost being TWO per-step O(S) leaks the forward
+ *     didn't even need + serial FFN elementwise:
+ *       (1) TAIL-ONLY OVERLAY (the biggest long-run lever): the incremental forward reads
+ *           ONLY the tail input rows [P..S-1] (prefix served from the K/V cache), yet the
+ *           driver rebuilt+copied the WHOLE [1,S,D] residual every step — pure O(S) waste
+ *           that GREW with the stream (MEASURED overlay 30ms/step at S=7651, ~40% of the
+ *           step).  ac_build_residual_tail(S,P) builds only [P..S-1] with the IDENTICAL
+ *           per-row overlay math (byte-exact for every row the forward reads; the prefix
+ *           rows in ac_resid/the input tensor are left unread), and the driver copies only
+ *           the tail.  overlay 30ms -> 0.2ms (150x).  incr_prefix_len(S) mirrors the P the
+ *           forward uses; block-skip/fresh-cache paths still full-build (byte-safe).
+ *       (2) GLOBAL-KEEP-SET from the STORE-LOG (ac_build_gkey): was a strided IS_STORE read
+ *           over the full [1,S,D] residual (a ~60MB cache-miss scan/step once the residual
+ *           is only tail-built); now derives the store rows directly from the store-log
+ *           (row 1+FRAME_LEN*fi+MEM_MARKER_LOCAL) — identical mask, no O(S) strided read.
+ *       (3) SPARSE FFN DOWN-RESIDUAL + persistent scratch (ALLC_NO_FFN_SPARSE=1 off): the
+ *           down-bias is all-zero every block, so `xout += hh@Wdown` is nonzero only on the
+ *           down weight's distinct output columns; add ONLY those (O(#cols) not O(D)) and
+ *           zero only them in dn — byte-exact +0.0 no-op elimination.  FFN scratch is a
+ *           persistent small buffer (steady-state T~31), one-shot local for the rare large-T
+ *           cold recompute (so the giant step-0 buffer never stays resident to THRASH the
+ *           steady-state working set out of cache — that thrash cost more than the mallocs
+ *           it saved; the T-cap fixed it).  ffn elementwise 82->64ms on echo.
+ *       (4) LARGE-T FFN THREADING (pthreads, T>=96 only): the rare full-recompute (quine
+ *           step 0, evict/skip fresh passes) forks the row-independent FFN across cores —
+ *           byte-exact (disjoint rows, unchanged per-(row,col) order).  step-0 fwd 1191->698ms.
+ *           The steady-state tail (T~31) stays serial (fork-join would cost more than it saves).
+ *     MEASURED end-to-end (multi-thread): quine 363 steps S->12541  23.3s -> 14.6s (1.6x,
+ *     the tail-overlay dominates the long-run win); echo 0.33->0.31s; yes8 0.74->0.67s; a
+ *     late step (S=7651) 73ms -> 40ms.  Byte-identical stdout+exit vs the #879+af32b58 base
+ *     on echo/yes/cat/quine for EVERY lever ON and OFF (fusion / live-win / gkey / block-skip
+ *     / evict / io-burst / direct-cam / ffn-sparse).  The C stays portable (no non-portable
+ *     intrinsics; -march=native is only host tuning — ALLC_MARCH=-mtune=generic builds a
+ *     byte-identical portable static binary).
+ *   - The binary is ~6.4 MB, fully static (`ldd: not a dynamic executable`), zero
  *     python/torch/.so deps — model + embed + program all embedded.
  *
  * ---- (original incremental.c header follows) ----
@@ -1111,6 +1201,57 @@ int   g_bup[NB_MAX], g_bgate[NB_MAX], g_bdown[NB_MAX];
 int   g_ffn_hidden[NB_MAX];  /* FFN hidden width PER BLOCK (varies! DIV/MOD megablocks) */
 int   g_ffn_hidden_max;      /* max over blocks (for scratch sizing) */
 
+/* ---- SPARSE FFN DOWN-RESIDUAL (byte-exact, default ON; ALLC_NO_FFN_SPARSE=1 off):
+ * the FFN residual add is  xout[j] += dn[j] + bdown[j]  over ALL D=g_D columns and
+ * ALL 242 blocks (~13M float ops/step) — but dn = hh@Wdown is SPARSE (only the
+ * distinct OUTPUT columns of the COO Wdown are ever nonzero; every other column of
+ * dn stays exactly 0.0 after the zero-fill) AND bdown is all-zero/absent for every
+ * block (audited: down-bias nnz total == 0).  So for such a block the add over the
+ * OTHER columns is `xout[j] += 0.0f + 0.0f`, an fp NO-OP.  We add ONLY the distinct
+ * down-output columns -> O(#down-cols) not O(D) per block, BYTE-EXACT.  We keep the
+ * dn accumulation from 0.0 unchanged (same ascending-r reduction order), then add
+ * each column to xout exactly once — bit-identical to the full-D loop.  Only enabled
+ * per-block when bdown is provably all-zero (else fall back to the full-D add). */
+int   g_ffn_sparse;              /* 1 => apply the sparse down-residual add */
+int   g_bdown_zero[NB_MAX];      /* 1 => this block's down bias is all-zero/absent */
+int  *g_down_cols[NB_MAX];       /* sorted distinct output columns of Wdown (or NULL) */
+int   g_down_ncols[NB_MAX];      /* count of distinct down-output columns */
+
+/* ---- DEAD-BLOCK-FUSION (attention->0): a block's attention SUBLAYER produces NO
+ * live output when its VALUE projection W_v is all-zero (=> V==0 => attn out==0)
+ * OR its OUTPUT projection W_o is all-zero (=> attn@W_o==0).  Either way the attn
+ * residual add is xout=xin (pure passthrough), so we can skip the ENTIRE attention
+ * sublayer (Q/K/V proj + softmax + O proj) and run only the FFN — BYTE-EXACT (the
+ * skipped ops contribute mathematically-exact zero to the residual).  Only ~4 of
+ * 242 blocks carry a LIVE attention head (block-0 ingest + the memory-CAM/stack-pop/
+ * LEV heads); the other ~238 have a fully-pruned attention slice.  Computed once at
+ * discover time; default ON (byte-neutral), disable with ALLC_NO_ATTN_FUSION=1. */
+int   g_attn_dead[NB_MAX];   /* 1 => attention sublayer is a no-op (skip it) */
+int   g_attn_dead_n;         /* count of dead-attention blocks (audit) */
+int   g_attn_fuse;           /* 1 => apply dead-block-fusion (default ON) */
+
+/* return 1 iff the weight tensor `tid` is all-zero (nnz==0, or every stored value
+ * is exactly 0.0f for COO; every dense entry exactly 0.0f otherwise).  A missing
+ * tensor (tid<0) counts as all-zero.  This is the mathematically-exact test for
+ * "this projection outputs 0 for every input" (the residual passthrough condition). */
+static int _weight_all_zero(int tid) {
+    if (tid < 0) return 1;
+    if (t_is_coo[tid]) {
+        int nnz = t_nnz[tid]; int j;
+        float *val = t_coo_val[tid];
+        if (nnz == 0 || !val) return 1;
+        for (j = 0; j < nnz; j = j + 1) if (val[j] != 0.0f) return 0;
+        return 1;
+    } else {
+        const float *W = tf[tid];
+        long n = 1; int r;
+        if (!W) return 1;
+        for (r = 0; r < t_rank[tid]; r = r + 1) n *= t_dims[tid][r];
+        { long i; for (i = 0; i < n; i = i + 1) if (W[i] != 0.0f) return 0; }
+        return 1;
+    }
+}
+
 /* ---- BOUNDED-KV (opt-in via ALLC_BOUNDED_W): a head is LOCAL if its ALiBi slope
  * matches an ingest recency slope (6.0 or 0.5) -> its softmax1 weight is EXACTLY
  * 0 beyond a small recency window, so scanning only the last-W keys is byte-exact.
@@ -1118,8 +1259,20 @@ int   g_ffn_hidden_max;      /* max over blocks (for scratch sizing) */
  * LOCAL flag once at discover time (slopes are shared across blocks). */
 #define AC_ING_SLOPE0 6.0f
 #define AC_ING_SLOPE1 0.5f
+/* byte-exact local window for the LIVE ingest heads (b0, slope 6.0): MEASURED max
+ * nonzero softmax1-weight distance is 28 over echo/cat/quine (ALLC_WINPROBE), so 32
+ * keys is a proven-exact margin.  Any key beyond it has exp(score-m)==0.0f exactly. */
+#define AC_LIVE_LOCAL_WIN 32
 int   g_head_local[512];     /* 1 if head h is a LOCAL (windowed) head */
 int   g_bounded_w;           /* window for local heads (0 = bounded-KV OFF) */
+
+/* WINDOW PROBE (ALLC_WINPROBE=1): record, per head, the MAX absolute-distance at
+ * which any key received a NONZERO softmax1 weight over the whole run — the true
+ * byte-exact local window for the LOCAL heads (diagnostic only, no output effect). */
+int   g_winprobe;
+int   g_winprobe_max[512];
+int   g_winprobe_gnz[512];    /* GLOBAL head: max #keys with nonzero softmax1 weight */
+float g_winprobe_gtop[512];   /* GLOBAL head: min top softmax1 weight (1.0 == hard gather) */
 
 /* per-phase work counters (contention-independent profile: attention QK/AV dot
  * ops vs projection+FFN COO nnz scatter ops).  Reset per step by the driver. */
@@ -1127,6 +1280,11 @@ long  g_iter_attn;           /* attention inner (dot + attn@V) fp ops */
 long  g_iter_proj;           /* Q/K/V/O projection COO scatter ops */
 long  g_iter_ffn;            /* FFN up/gate/down COO scatter ops */
 long  g_iter_attn_h[512];    /* per-head attention ops (race-free: each thread own h) */
+
+/* fine-grained per-phase WALL timers (ALLC_PHASE=1): attention sublayer vs FFN body
+ * vs per-block FFN scratch alloc.  Diagnostic only; accumulated per step. */
+int    g_phase_on;
+double g_ph_attn, g_ph_ffn, g_ph_alloc;
 
 /* ---- per-block KV cache (the stable prefix, rows 0..prefix_len-1) ---- */
 /* K/V stored [H][cap*HD] (row-major per head: pos-major, hd-minor). */
@@ -1201,6 +1359,34 @@ int incr_discover(void) {
     /* dims: Q weight is [D,D] (COO after aliasing). */
     if (g_wq[0] < 0) return 0;
     g_D = t_dims[g_wq[0]][0];
+
+    /* SPARSE FFN DOWN-RESIDUAL: precompute, per block, whether the down-bias is
+     * all-zero (=> the residual add over non-down-columns is a no-op) and the SORTED
+     * DISTINCT output columns of the COO Wdown (the only columns dn is ever nonzero).
+     * Default ON; ALLC_NO_FFN_SPARSE=1 disables (full-D residual add every block). */
+    {
+        char *e = getenv("ALLC_NO_FFN_SPARSE");
+        g_ffn_sparse = (e && atoi(e)) ? 0 : 1;
+        for (b = 0; b < g_nblocks; b = b + 1) {
+            g_bdown_zero[b] = _weight_all_zero(g_bdown[b]);
+            g_down_cols[b] = 0; g_down_ncols[b] = 0;
+            if (g_bdown_zero[b] && t_is_coo[g_wdown[b]] && t_nnz[g_wdown[b]] > 0) {
+                int nnz = t_nnz[g_wdown[b]]; int *col = t_coo_col[g_wdown[b]];
+                float *val = t_coo_val[g_wdown[b]];
+                /* mark distinct columns that carry a NONZERO value (a stored 0.0f
+                 * scatters +0.0 -> still a no-op, so it need not be visited) */
+                unsigned char *seen = calloc((size_t)g_D, 1);
+                int j, nc = 0;
+                for (j = 0; j < nnz; j = j + 1)
+                    if (val[j] != 0.0f && !seen[col[j]]) { seen[col[j]] = 1; nc++; }
+                g_down_cols[b] = malloc((size_t)(nc > 0 ? nc : 1) * sizeof(int));
+                { int c, w = 0; for (c = 0; c < g_D; c = c + 1) if (seen[c]) g_down_cols[b][w++] = c; }
+                g_down_ncols[b] = nc;
+                free(seen);
+            }
+        }
+    }
+
     /* alibi slope tensor: node off33 (Mul_1) input 0 = onnx::Mul_2978x [1,H,1,1] */
     g_slope_tid = _blk_node_in(base, 33, 0);
     if (g_slope_tid < 0) return 0;
@@ -1211,18 +1397,144 @@ int incr_discover(void) {
         int sc = _blk_node_in(base, 25, 1);
         g_scale = (sc >= 0 && tf[sc]) ? tf[sc][0] : 1.0f;
     }
-    /* BOUNDED-KV: read the window from the env; classify each head LOCAL/GLOBAL by
-     * its ALiBi slope (LOCAL == an ingest recency slope -> weight EXACTLY 0 beyond
-     * the window, so windowing is byte-exact).  Default OFF (w=0 -> exact). */
+    /* BOUNDED-KV / LIVE-BLOCK LOCAL WINDOW: classify each head LOCAL/GLOBAL by its
+     * ALiBi slope (LOCAL == an ingest recency slope 6.0/0.5 -> softmax1 weight is
+     * EXACTLY 0 beyond a small recency window, so windowing is byte-exact).
+     *
+     * TWO ways to set the local window (both byte-exact for the LOCAL heads):
+     *   - ALLC_BOUNDED_W=W : explicit legacy override (any W).
+     *   - LIVE-BLOCK LOCAL WINDOW (default ON): the 3 LIVE blocks (b0 ingest + b7/b11
+     *     memory-CAM) are the only ones that run attention post-dead-block-fusion; b0's
+     *     20 LOCAL heads (slope 6.0) have a MEASURED max nonzero-weight distance of 28
+     *     (ALLC_WINPROBE over echo/cat/quine), so a window of AC_LIVE_LOCAL_WIN=32 keys
+     *     is byte-exact and turns b0's per-query O(S) scan into O(W).  Kill-switch:
+     *     ALLC_NO_LIVE_WIN=1 (=> g_bounded_w stays 0 => full-history local scan).
+     * The GLOBAL memory-CAM heads (b7/b11, slope ~0.004) stay full-history here (their
+     * O(1) resolution is the separate DIRECT-CAM-ATTN lever below). */
     {
         char *e = getenv("ALLC_BOUNDED_W");
+        char *nl = getenv("ALLC_NO_LIVE_WIN");
         int h;
-        g_bounded_w = e ? atoi(e) : 0;
+        if (e) g_bounded_w = atoi(e);                       /* explicit override */
+        else if (nl && atoi(nl)) g_bounded_w = 0;           /* kill-switch: full */
+        else g_bounded_w = AC_LIVE_LOCAL_WIN;               /* default byte-exact win */
         for (h = 0; h < g_H; h = h + 1) {
             float sl = tf[g_slope_tid][h];
             float d0 = sl - AC_ING_SLOPE0; if (d0 < 0) d0 = -d0;
             float d1 = sl - AC_ING_SLOPE1; if (d1 < 0) d1 = -d1;
             g_head_local[h] = (d0 <= 1e-3f || d1 <= 1e-3f) ? 1 : 0;
+        }
+    }
+    /* DEAD-BLOCK-FUSION: mark every block whose attention sublayer is a no-op
+     * (all-zero W_v OR all-zero W_o -> attn residual == passthrough).  Default ON
+     * (byte-neutral); ALLC_NO_ATTN_FUSION=1 forces the full attention every block. */
+    {
+        char *e = getenv("ALLC_NO_ATTN_FUSION");
+        g_attn_fuse = (e && atoi(e)) ? 0 : 1;
+        g_attn_dead_n = 0;
+        for (b = 0; b < g_nblocks; b = b + 1) {
+            g_attn_dead[b] = (_weight_all_zero(g_wv[b]) || _weight_all_zero(g_wo[b]))
+                             ? 1 : 0;
+            if (g_attn_dead[b]) g_attn_dead_n = g_attn_dead_n + 1;
+        }
+        if (getenv("ALLC_FUSION_AUDIT")) {
+            fprintf(stderr, "allc: LIVE-attention blocks (nnz Wv/Wo):");
+            for (b = 0; b < g_nblocks; b = b + 1)
+                if (!g_attn_dead[b])
+                    fprintf(stderr, " b%d(Wv=%d,Wo=%d)", b,
+                            t_is_coo[g_wv[b]] ? t_nnz[g_wv[b]] : -1,
+                            t_is_coo[g_wo[b]] ? t_nnz[g_wo[b]] : -1);
+            fprintf(stderr, "\n");
+            /* ALLC_FUSION_AUDIT=2: deep per-head structure of the LIVE blocks —
+             * which heads carry nnz V/O, their ALiBi slope, and the Q/K nnz so we
+             * can classify each live head local (windowed) vs global (memory-CAM). */
+            if (atoi(getenv("ALLC_FUSION_AUDIT")) >= 2) {
+                /* FFN sparsity audit: total nnz + coverage over the 242 blocks. */
+                long tup = 0, tgate = 0, tdn = 0; int nzero_ffn = 0, ncoo = 0;
+                for (b = 0; b < g_nblocks; b = b + 1) {
+                    int nu = t_is_coo[g_wup[b]] ? t_nnz[g_wup[b]] : -1;
+                    int ng = t_is_coo[g_wgate[b]] ? t_nnz[g_wgate[b]] : -1;
+                    int nd = t_is_coo[g_wdown[b]] ? t_nnz[g_wdown[b]] : -1;
+                    if (t_is_coo[g_wup[b]]) ncoo++;
+                    if (nu > 0) tup += nu;
+                    if (ng > 0) tgate += ng;
+                    if (nd > 0) tdn += nd;
+                    if ((nu <= 0) && (ng <= 0) && (nd <= 0)) nzero_ffn++;
+                }
+                fprintf(stderr, "allc: FFN audit: %d/%d blocks COO; total nnz up=%ld "
+                        "gate=%ld down=%ld; %d all-zero-FFN blocks; ffn is ALREADY "
+                        "O(nnz) sparse (coo_project)\n", ncoo, g_nblocks, tup, tgate,
+                        tdn, nzero_ffn);
+                { long sh = 0; int nbup = 0, nbgate = 0, nbdown = 0; int bd_nz = 0;
+                  for (b = 0; b < g_nblocks; b = b + 1) sh += g_ffn_hidden[b];
+                  for (b = 0; b < g_nblocks; b = b + 1) {
+                      if (g_bup[b] >= 0 && !_weight_all_zero(g_bup[b])) nbup++;
+                      if (g_bgate[b] >= 0 && !_weight_all_zero(g_bgate[b])) nbgate++;
+                      if (g_bdown[b] >= 0 && !_weight_all_zero(g_bdown[b])) { nbdown++;
+                          { int cc; const float *bb2 = tf[g_bdown[b]];
+                            if (bb2) for (cc=0; cc<g_D; cc++) if (bb2[cc]!=0.0f) bd_nz++; } }
+                  }
+                  fprintf(stderr, "allc: FFN elemwise audit: sum(hid)=%ld over %d blocks "
+                          "(silu loop size/step at T=1); nonzero biases up=%d gate=%d "
+                          "down=%d (down bias nnz total=%d over D=%d)\n",
+                          sh, g_nblocks, nbup, nbgate, nbdown, bd_nz, g_D);
+                  /* silu-skip potential: sum(hid) over blocks where BOTH up-bias and
+                   * gate-bias are zero (there up==0 && gate==0 -> silu(0)*0==0, so
+                   * only the up-nnz rows need computing).  Report the skippable hid. */
+                  { long sh_skip = 0, sh_bias = 0; int nskip = 0;
+                    for (b = 0; b < g_nblocks; b = b + 1) {
+                        int upz = _weight_all_zero(g_bup[b]);
+                        int gz  = _weight_all_zero(g_bgate[b]);
+                        if (upz && gz) { sh_skip += g_ffn_hidden[b]; nskip++; }
+                        else sh_bias += g_ffn_hidden[b];
+                    }
+                    fprintf(stderr, "allc: silu-skip audit: %d blocks (hid sum=%ld) have "
+                            "zero up+gate bias -> silu computable ONLY on up-nnz rows; "
+                            "%ld hid in bias-carrying blocks (must compute full)\n",
+                            nskip, sh_skip, sh_bias); }
+                  /* FULL-NOOP audit: a block whose attn is dead AND whose FFN delta
+                   * (hh@Wdown + bdown) is identically 0 (Wdown all-zero AND bdown
+                   * all-zero) is a pure passthrough xout==xin -> skip it entirely. */
+                  { int nnoop = 0;
+                    for (b = 0; b < g_nblocks; b = b + 1)
+                        if (g_attn_dead[b] && _weight_all_zero(g_wdown[b])
+                            && _weight_all_zero(g_bdown[b])) nnoop++;
+                    fprintf(stderr, "allc: FULL-NOOP audit: %d/%d blocks are attn-dead + "
+                            "zero-down-proj + zero-down-bias -> pure passthrough (skippable)\n",
+                            nnoop, g_nblocks); } }
+                fprintf(stderr, "allc: per-head slopes:");
+                { int h; for (h = 0; h < g_H; h = h + 1)
+                    fprintf(stderr, " h%d=%.5g%s", h, tf[g_slope_tid][h],
+                            g_head_local[h] ? "(L)" : "(G)"); }
+                fprintf(stderr, "\n");
+                for (b = 0; b < g_nblocks; b = b + 1) {
+                    if (g_attn_dead[b]) continue;
+                    fprintf(stderr, "allc: block %d live heads:\n", b);
+                    { int h; for (h = 0; h < g_H; h = h + 1) {
+                        int col0 = h * g_HD, col1 = col0 + g_HD;
+                        int j, vnnz = 0, onnz = 0, qnnz = 0, knnz = 0;
+                        /* V writes head-h output cols [col0,col1); count nnz there */
+                        if (t_is_coo[g_wv[b]]) for (j = 0; j < t_nnz[g_wv[b]]; j++)
+                            { int c = t_coo_col[g_wv[b]][j];
+                              if (c >= col0 && c < col1 && t_coo_val[g_wv[b]][j] != 0.0f) vnnz++; }
+                        /* O reads head-h input rows [col0,col1); count nnz there */
+                        if (t_is_coo[g_wo[b]]) for (j = 0; j < t_nnz[g_wo[b]]; j++)
+                            { int r = t_coo_row[g_wo[b]][j];
+                              if (r >= col0 && r < col1 && t_coo_val[g_wo[b]][j] != 0.0f) onnz++; }
+                        if (t_is_coo[g_wq[b]]) for (j = 0; j < t_nnz[g_wq[b]]; j++)
+                            { int c = t_coo_col[g_wq[b]][j];
+                              if (c >= col0 && c < col1 && t_coo_val[g_wq[b]][j] != 0.0f) qnnz++; }
+                        if (t_is_coo[g_wk[b]]) for (j = 0; j < t_nnz[g_wk[b]]; j++)
+                            { int c = t_coo_col[g_wk[b]][j];
+                              if (c >= col0 && c < col1 && t_coo_val[g_wk[b]][j] != 0.0f) knnz++; }
+                        if (vnnz || onnz || qnnz || knnz)
+                            fprintf(stderr, "   h%2d slope=%.5g %s  Vnnz=%d Onnz=%d "
+                                    "Qnnz=%d Knnz=%d\n", h, tf[g_slope_tid][h],
+                                    g_head_local[h] ? "LOCAL " : "GLOBAL", vnnz, onnz,
+                                    qnnz, knnz);
+                    } }
+                }
+            }
         }
     }
     g_incr_ready = 1;
@@ -1234,40 +1546,32 @@ int incr_discover(void) {
     return 1;
 }
 
-/* row projection:  out[t][*] = sum_r act[t][r] * W[r][*] for t in [0,T).
- * act is [T,K] (row-major); out is [T,N].  W may be:
+/* row projection over a ROW RANGE [r0,r1):  out[t][*] = sum_r act[t][r] * W[r][*].
+ * act is [.,K] (row-major); out is [.,N].  W may be:
  *   (a) COO (t_is_coo): scatter the nnz in STORED order (ascending flat r*N+q),
  *       so each out[t][q] accumulates ascending-r == the dense reduction order.
- *   (b) DENSE (is_init==1, a small weight to_sparse_onnx kept dense): a plain
- *       row-major dense matmul, ALSO ascending-r per column (same order).
- * Both are byte-exact to the graph's op_matmul.  Parallelise over the T rows
- * (each writes a disjoint out row). */
-static void coo_project(const float *act, int T, int K, int Wt,
-                        float *out, int N) {
+ *   (b) DENSE (is_init==1, a small weight kept dense): a plain row-major dense
+ *       matmul, ALSO ascending-r per column (same order).
+ * Both are byte-exact to the graph's op_matmul.  Each row writes a disjoint out
+ * slice -> byte-exact under any row split (no counter side-effects here). */
+static void proj_rows(const float *act, int r0, int r1, int K, int Wt,
+                      float *out, int N) {
     int t;
     if (t_is_coo[Wt]) {
         int nnz = t_nnz[Wt];
         int *row = t_coo_row[Wt]; int *col = t_coo_col[Wt]; float *val = t_coo_val[Wt];
-        #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-        #endif
-        for (t = 0; t < T; t = t + 1) {
+        for (t = r0; t < r1; t = t + 1) {
             const float *arow = act + (long)t * K;
             float *orow = out + (long)t * N;
-            int q; int j;
-            for (q = 0; q < N; q = q + 1) orow[q] = 0.0f;
+            int j;
+            memset(orow, 0, (size_t)N * sizeof(float));   /* 0.0f == all-zero bits */
             for (j = 0; j < nnz; j = j + 1)
                 orow[col[j]] += arow[row[j]] * val[j];
         }
-        SPARSE_ITERS = SPARSE_ITERS + (long)T * (long)nnz;
-        DENSE_EQUIV_ITERS = DENSE_EQUIV_ITERS + (long)T * (long)K * (long)N;
     } else {
         /* dense fallback: out[t][q] = sum_r act[t][r] * W[r*N+q], ascending r */
         const float *W = tf[Wt];
-        #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-        #endif
-        for (t = 0; t < T; t = t + 1) {
+        for (t = r0; t < r1; t = t + 1) {
             const float *arow = act + (long)t * K;
             float *orow = out + (long)t * N;
             int q; int r;
@@ -1278,8 +1582,20 @@ static void coo_project(const float *act, int T, int K, int Wt,
                 for (q = 0; q < N; q = q + 1) orow[q] += a * wr[q];
             }
         }
-        DENSE_EQUIV_ITERS = DENSE_EQUIV_ITERS + (long)T * (long)K * (long)N;
-        SPARSE_ITERS = SPARSE_ITERS + (long)T * (long)K * (long)N;
+    }
+}
+
+/* whole-matrix projection (all T rows), used by the attention Q/K/V/O paths.  Keeps
+ * the SPARSE_ITERS / DENSE_EQUIV_ITERS diagnostic tallies. */
+static void coo_project(const float *act, int T, int K, int Wt,
+                        float *out, int N) {
+    proj_rows(act, 0, T, K, Wt, out, N);
+    if (t_is_coo[Wt]) {
+        SPARSE_ITERS += (long)T * (long)t_nnz[Wt];
+        DENSE_EQUIV_ITERS += (long)T * (long)K * (long)N;
+    } else {
+        DENSE_EQUIV_ITERS += (long)T * (long)K * (long)N;
+        SPARSE_ITERS += (long)T * (long)K * (long)N;
     }
 }
 
@@ -1295,6 +1611,154 @@ static void cache_reserve(int b, int need) {
     }
 }
 
+/* ---- PERSISTENT FFN SCRATCH (kills the per-block malloc/free of up/gate/hh/dn):
+ * the FFN runs 242x/step and previously malloc'd 4 buffers each time.  These grow-
+ * only scratch buffers are reused across ALL blocks + steps (single-threaded FFN
+ * body).  Byte-neutral (same values, same order).
+ *
+ * CACHE-FOOTPRINT DISCIPLINE: the persistent buffers are sized to the STEADY-STATE
+ * tail (T ~= FRAME_LEN+1 = 31 rows), NOT to the one-off cold-start full recompute
+ * (T = S, e.g. 1651 at quine step 0, which would leave ~85MB permanently resident
+ * and THRASH the tiny steady-state working set out of L2/L3 for every later step).
+ * A step whose T exceeds the persistent cap (only the rare fresh/full recompute)
+ * malloc/free's a one-shot local buffer instead — so the resident scratch stays
+ * small (a few MB) after the cold step.  ffn_alloc() returns the buffer to use and
+ * sets *owned=1 when the caller must free it. */
+#define FFN_SCRATCH_MAX_T 64      /* persistent only up to this tail size */
+static float *g_ffn_up, *g_ffn_gate, *g_ffn_hh, *g_ffn_dn;
+static long   g_ffn_scratch_hid, g_ffn_scratch_d;
+static void ffn_scratch_reserve(long need_hid, long need_d) {
+    if (need_hid > g_ffn_scratch_hid) {
+        g_ffn_up   = realloc(g_ffn_up,   need_hid * sizeof(float));
+        g_ffn_gate = realloc(g_ffn_gate, need_hid * sizeof(float));
+        g_ffn_hh   = realloc(g_ffn_hh,   need_hid * sizeof(float));
+        g_ffn_scratch_hid = need_hid;
+    }
+    if (need_d > g_ffn_scratch_d) {
+        g_ffn_dn = realloc(g_ffn_dn, need_d * sizeof(float));
+        g_ffn_scratch_d = need_d;
+    }
+}
+
+/* ---- FFN over a ROW-RANGE [r0,r1): all work is per-row-independent, so this is the
+ * unit a pthread worker owns.  up/gate/hh/dn are the (shared) scratch; each worker
+ * writes disjoint row slices -> byte-exact under any row split (same per-(row,col)
+ * ascending-r reduction order regardless of which thread runs the row). */
+static void ffn_rows(int b, float *xout, int r0, int r1, int hid,
+                     const float *bup, const float *bgate, const float *bdown,
+                     float *up, float *gate, float *hh, float *dn) {
+    int t;
+    /* up/gate projection for these rows (COO scatter, ascending-r, byte-exact) */
+    proj_rows(xout, r0, r1, g_D, g_wup[b], up, hid);
+    proj_rows(xout, r0, r1, g_D, g_wgate[b], gate, hid);
+    /* silu(up)*gate */
+    for (t = r0; t < r1; t++) {
+        const float *upr = up + (long)t * hid, *gar = gate + (long)t * hid;
+        float *hhr = hh + (long)t * hid; int j;
+        for (j = 0; j < hid; j++) {
+            float u = upr[j] + (bup ? bup[j] : 0.0f);
+            float ga = gar[j] + (bgate ? bgate[j] : 0.0f);
+            float su = u / (1.0f + expf(-u));
+            hhr[j] = su * ga;
+        }
+    }
+    /* down projection + residual add (sparse when down-bias is zero) */
+    if (g_ffn_sparse && g_bdown_zero[b] && g_down_cols[b]) {
+        int *dc = g_down_cols[b]; int nc = g_down_ncols[b];
+        int nnz = t_nnz[g_wdown[b]];
+        int *drow = t_coo_row[g_wdown[b]], *dcol = t_coo_col[g_wdown[b]]; float *dval = t_coo_val[g_wdown[b]];
+        for (t = r0; t < r1; t++) {
+            const float *hr = hh + (long)t * hid; float *dr = dn + (long)t * g_D;
+            long ro = (long)t * g_D; int c, j;
+            for (c = 0; c < nc; c++) dr[dc[c]] = 0.0f;
+            for (j = 0; j < nnz; j++) dr[dcol[j]] += hr[drow[j]] * dval[j];
+            for (c = 0; c < nc; c++) { int jj = dc[c]; xout[ro + jj] += dr[jj]; }
+        }
+    } else {
+        proj_rows(hh, r0, r1, hid, g_wdown[b], dn, g_D);
+        for (t = r0; t < r1; t++) {
+            float *xr = xout + (long)t * g_D; const float *dr = dn + (long)t * g_D; int j;
+            for (j = 0; j < g_D; j++) xr[j] += dr[j] + (bdown ? bdown[j] : 0.0f);
+        }
+    }
+}
+
+#ifdef USE_PTHREADS
+/* fork-join over FFN row ranges — only used for LARGE T (cold/full-recompute steps),
+ * where the per-row work dwarfs the thread spawn cost.  Byte-exact (disjoint rows). */
+typedef struct { int b; float *xout; int r0, r1, hid;
+                 const float *bup, *bgate, *bdown;
+                 float *up, *gate, *hh, *dn; } _ffn_arg;
+static void *_ffn_worker(void *a) {
+    _ffn_arg *w = (_ffn_arg *)a;
+    ffn_rows(w->b, w->xout, w->r0, w->r1, w->hid, w->bup, w->bgate, w->bdown,
+             w->up, w->gate, w->hh, w->dn);
+    return 0;
+}
+static int _nthreads(void);   /* fwd decl (defined with the attn pool below) */
+#endif
+
+/* FFN THREADING THRESHOLD: below this T the fork-join overhead exceeds the per-row
+ * work (steady-state incremental tail T~31 stays serial), so parallelise only the
+ * rare large-T full-recompute (quine step 0, evict/skip fresh passes). */
+#define FFN_PAR_MIN_T 96
+
+/* ---- the SwiGLU FFN sublayer for block b over T tail rows in `xout` (in place).
+ * Shared by run_incremental / run_full_skip / run_full_evict (was inlined 3x,
+ * byte-identical).  Persistent scratch for small T (steady state); one-shot local
+ * buffers for the rare large-T cold recompute (keeps the resident set small so the
+ * steady-state working set stays in cache).  For large T the row loops fork-join
+ * across cores (byte-exact). */
+static void ffn_block(int b, float *xout, int T) {
+    int hid = g_ffn_hidden[b];
+    const float *bup = (g_bup[b] >= 0) ? tf[g_bup[b]] : 0;
+    const float *bgate = (g_bgate[b] >= 0) ? tf[g_bgate[b]] : 0;
+    const float *bdown = (g_bdown[b] >= 0) ? tf[g_bdown[b]] : 0;
+    float *up, *gate, *hh, *dn;
+    int owned = 0;
+    double _a0 = g_phase_on ? _now_ms() : 0;
+    if (T <= FFN_SCRATCH_MAX_T) {
+        ffn_scratch_reserve((long)T * hid, (long)T * g_D);
+        up = g_ffn_up; gate = g_ffn_gate; hh = g_ffn_hh; dn = g_ffn_dn;
+    } else {
+        up = malloc((long)T * hid * sizeof(float));
+        gate = malloc((long)T * hid * sizeof(float));
+        hh = malloc((long)T * hid * sizeof(float));
+        dn = malloc((long)T * g_D * sizeof(float));
+        owned = 1;
+    }
+    if (g_phase_on) { g_ph_alloc += _now_ms() - _a0; }
+    /* diagnostic iter tallies (proj_rows itself is counter-free): up/gate read D->hid,
+     * down reads hid->D — all three COO-sparse in this model. */
+    g_iter_ffn += (long)T * (t_nnz[g_wup[b]] + t_nnz[g_wgate[b]] + t_nnz[g_wdown[b]]);
+    SPARSE_ITERS += (long)T * (t_nnz[g_wup[b]] + t_nnz[g_wgate[b]] + t_nnz[g_wdown[b]]);
+    DENSE_EQUIV_ITERS += (long)T * ((long)g_D * hid * 2 + (long)hid * g_D);
+
+#ifdef USE_PTHREADS
+    { int nth = (T >= FFN_PAR_MIN_T) ? _nthreads() : 1;
+      if (nth > T) nth = T;
+      if (nth > 1) {
+        pthread_t th[256]; _ffn_arg args[256]; int i;
+        int per = (T + nth - 1) / nth;
+        for (i = 0; i < nth; i++) {
+            args[i].b = b; args[i].xout = xout; args[i].hid = hid;
+            args[i].bup = bup; args[i].bgate = bgate; args[i].bdown = bdown;
+            args[i].up = up; args[i].gate = gate; args[i].hh = hh; args[i].dn = dn;
+            args[i].r0 = i * per; args[i].r1 = (i + 1) * per;
+            if (args[i].r1 > T) args[i].r1 = T;
+            pthread_create(&th[i], 0, _ffn_worker, &args[i]);
+        }
+        for (i = 0; i < nth; i++) pthread_join(th[i], 0);
+      } else ffn_rows(b, xout, 0, T, hid, bup, bgate, bdown, up, gate, hh, dn);
+    }
+#else
+    ffn_rows(b, xout, 0, T, hid, bup, bgate, bdown, up, gate, hh, dn);
+#endif
+
+    if (g_phase_on) g_ph_ffn += _now_ms() - _a0;   /* whole FFN body (proj+silu+resid) */
+    if (owned) { free(up); free(gate); free(hh); free(dn); }
+}
+
 /* ABSOLUTE-position map for the EVICT (compacted-stream) path.  When set (non-NULL)
  * the K/V cache rows are a COMPACTED subset of the logical stream (evicted rows are
  * physically absent), so a cache row index `k` no longer equals its absolute stream
@@ -1305,6 +1769,21 @@ static void cache_reserve(int b, int need) {
  * NULL (all other paths: incremental / full-skip) => identity (abs_pos[i]==i), the
  * exact prior behaviour (attn_head then reads k / qpos directly). */
 const int *g_abs_pos;        /* NULL => identity; else abs position per cache row */
+
+/* ---- GLOBAL-HEAD KEY-SUBSET (DIRECT-CAM-ATTN, default ON; ALLC_NO_GKEY=1 to disable):
+ * the 3 GLOBAL memory-CAM heads (b7 h20, b11 h21/h22, ALiBi slope ~0.004) gate their
+ * VALUE projection to EXACTLY 0 on every NON-store row, so only §Memory store rows
+ * carry a nonzero value into their attention output; and the softmax1 denominator is
+ * unchanged when the non-store rows OUTSIDE the recency window are dropped (the SAME
+ * byte-exact keep-set the FREE-DRIVEN EVICTION path is proven on: BOS + live store
+ * rows + last-W recency rows).  So for a GLOBAL head we can scan ONLY the keep-set
+ * keys instead of all SK keys — O(#stores + W) not O(S) per query — BYTE-EXACT.
+ * g_gkey[k] (per cache row, built per forward) = 1 iff key k is in the keep-set;
+ * NULL => scan every key (the exact prior behaviour).  The LOCAL heads always scan
+ * their full windowed range (g_gkey is ignored for them). */
+const unsigned char *g_gkey;     /* NULL => scan all keys; else GLOBAL keep-set mask */
+int   g_gkey_on;                 /* 1 => build+use the global keep-set (default ON) */
+#define AC_GLOBAL_WIN (2 * G_FRAME_LEN)   /* recency window kept for GLOBAL heads */
 
 /* one head's softmax1+ALiBi attention over the tail rows: Qt[t] (head h) attends
  * over cached K/V[0..SK-1], writes attnout[t][h*HD..].  Each head is independent
@@ -1324,6 +1803,13 @@ static void attn_head(int h, int b, int P, int T, int SK,
      * so no windowed local key is ever missing; the local_win here is a harmless
      * upper bound (all kept local-window rows are contiguous at the tail). */
     int local_win = (g_bounded_w > 0 && g_head_local[h]) ? g_bounded_w : 0;
+    /* GLOBAL-HEAD KEY-SUBSET: for a GLOBAL memory-CAM head, restrict the scan to the
+     * keep-set keys (g_gkey[k]==1: store rows + BOS + recency window).  Byte-exact:
+     * the dropped keys carry V==0 (zero numerator) and their softmax1 exp-weight sums
+     * to a denom delta that rounds away — the SAME keep-set proven byte-exact by the
+     * eviction path (scanned here in the same ascending-k order + same real distances).
+     * A LOCAL head ignores g_gkey (it uses local_win).  NULL g_gkey => scan all. */
+    const unsigned char *gk = (!g_head_local[h] && g_gkey) ? g_gkey : 0;
     int t;
     long ops = 0;
     for (t = 0; t < T; t = t + 1) {
@@ -1333,11 +1819,11 @@ static void attn_head(int h, int b, int P, int T, int SK,
         int k; float m; float denom; int hd;
         int klo = 0;
         if (local_win > 0) { klo = qpos - local_win + 1; if (klo < 0) klo = 0; }
-        ops += (long)(qpos - klo + 1) * 2 * g_HD;   /* dot + attn@V */
         m = 0.0f;                   /* softmax1 sink: clamp(max,0) starts at 0 */
         for (k = klo; k < SK; k = k + 1) {
             int kabs = g_abs_pos ? g_abs_pos[k] : k;
             if (kabs > qabs) { sch[k] = -1e30f; continue; }   /* causal (abs) */
+            if (gk && !gk[k]) { sch[k] = -1e30f; continue; }  /* global keep-set skip */
             {
                 const float *kv = g_Kc[b] + (long)k * g_D + hoff;
                 float dot = 0.0f;
@@ -1347,14 +1833,29 @@ static void attn_head(int h, int b, int P, int T, int SK,
                     sch[k] = dot * g_scale - slope * dist;
                 }
                 if (sch[k] > m) m = sch[k];
+                ops += 2 * g_HD;                          /* realised dot + attn@V */
             }
         }
         denom = expf(-m);           /* softmax1: exp(x-m)/(exp(-m)+sum exp(x-m)) */
         for (k = klo; k < SK; k = k + 1) {
             int kabs = g_abs_pos ? g_abs_pos[k] : k;
             if (kabs > qabs) continue;                       /* skip non-causal */
+            if (gk && !gk[k]) continue;                      /* global keep-set skip */
             sch[k] = expf(sch[k] - m);
             denom += sch[k];
+        }
+        if (g_winprobe && !g_head_local[h]) {   /* GLOBAL head: how many keys blend? */
+            int nz = 0; float wtop = 0.0f;
+            for (k = klo; k < SK; k = k + 1) {
+                float w;
+                if (gk && !gk[k]) continue;
+                w = sch[k] / denom;
+                if (w != 0.0f) { nz++; if (w > wtop) wtop = w; }
+            }
+            if (nz > g_winprobe_gnz[h]) g_winprobe_gnz[h] = nz;
+            /* record min top-weight (1.0 => hard 1-hot gather; <1 => soft blend + sink) */
+            if (wtop < g_winprobe_gtop[h] || g_winprobe_gtop[h] == 0.0f)
+                g_winprobe_gtop[h] = wtop;
         }
         {
             float *outv = attnout + (long)t * g_D + hoff;
@@ -1364,7 +1865,12 @@ static void attn_head(int h, int b, int P, int T, int SK,
                 float w;
                 const float *vv;
                 if (kabs > qabs) continue;
+                if (gk && !gk[k]) continue;                  /* global keep-set skip */
                 w = sch[k] / denom;
+                if (g_winprobe && sch[k] != 0.0f) {   /* nonzero softmax1 weight */
+                    int dist = qabs - kabs;
+                    if (dist > g_winprobe_max[h]) g_winprobe_max[h] = dist;
+                }
                 vv = g_Vc[b] + (long)k * g_D + hoff;
                 for (hd = 0; hd < g_HD; hd = hd + 1) outv[hd] += w * vv[hd];
             }
@@ -1429,6 +1935,18 @@ static void attn_all_heads(int b, int P, int T, int SK,
  * prefix length (= prev_S-1, 0 on a fresh stream), reading each block's cached
  * prefix K/V.  Writes the exact hidden row -1 into tf[output_tid] row S-1 (only
  * that row is read by the driver).  Byte-exact vs run() at row -1.  Returns 0. */
+/* the EXACT prefix length run_incremental(S) will use for the CURRENT cache state —
+ * lets the driver build ONLY the tail input rows [P..S-1] (the only rows the forward
+ * reads).  Mirrors the P logic below; MUST stay in sync with it. */
+int incr_prefix_len(int S) {
+    int P;
+    if (!g_incr_ready) return 0;
+    if (g_prev_S == 0 || S <= g_prev_S) P = 0;
+    else P = g_prev_S - 1;
+    if (P != g_prefix_len) P = 0;
+    return P;
+}
+
 void run_incremental(int S) {
     int P; int T; int b;
     float *xin;                 /* current block-input residual for tail rows [T,D] */
@@ -1438,7 +1956,8 @@ void run_incremental(int S) {
     if (!g_incr_ready) { run(); return; }
 
     /* prefix length: rows [0..P-1] are stable (cached).  On a fresh stream (or a
-     * reset when S went backwards) P=0 and caches are empty. */
+     * reset when S went backwards) P=0 and caches are empty.  incr_prefix_len(S)
+     * MUST return this same P (the driver relies on it to tail-build the input). */
     if (g_prev_S == 0 || S <= g_prev_S) {
         P = 0; g_prefix_len = 0;
         for (b = 0; b < g_nblocks; b = b + 1) g_cap[b] = g_cap[b]; /* keep alloc */
@@ -1470,6 +1989,14 @@ void run_incremental(int S) {
     for (b = 0; b < g_nblocks; b = b + 1) {
         int SK = P + T;         /* total keys = prefix + tail */
         int h; int t;
+        double _pt0 = g_phase_on ? _now_ms() : 0;
+        if (g_attn_fuse && g_attn_dead[b]) {
+            /* DEAD-BLOCK-FUSION: attention sublayer is a no-op (W_v or W_o all-zero
+             * -> attn out == 0 -> residual passthrough).  Skip Q/K/V proj + softmax
+             * + O proj entirely; the block-input residual passes straight to the FFN.
+             * BYTE-EXACT (the skipped ops add mathematically-exact zero). */
+            memcpy(xout, xin, (long)T * g_D * sizeof(float));
+        } else {
         /* Q/K/V projections for the tail rows (COO, ascending-r, byte-exact) */
         coo_project(xin, T, g_D, g_wq[b], Qt, g_D);
         coo_project(xin, T, g_D, g_wk[b], Kt, g_D);
@@ -1495,48 +2022,11 @@ void run_incremental(int S) {
         coo_project(attnout, T, g_D, g_wo[b], xout, g_D);
         g_iter_proj += (long)T * t_nnz[g_wo[b]];
         for (t = 0; t < T * g_D; t = t + 1) xout[t] = xout[t] + xin[t];
+        }   /* end attention sublayer */
+        if (g_phase_on) g_ph_attn += _now_ms() - _pt0;
 
-        /* SwiGLU FFN:  up = xout@Wup + b_up; gate = xout@Wgate + b_gate;
-         *              h = silu(up)*gate;  xout' = xout + h@Wdown + b_down.
-         * FFN hidden width is PER-BLOCK (DIV/MOD megablocks are wide); biases may
-         * be absent (folded-away zero) -> read via the NULL-guarded g_bup etc. */
-        {
-            int hid = g_ffn_hidden[b];
-            const float *bup = (g_bup[b] >= 0) ? tf[g_bup[b]] : 0;
-            const float *bgate = (g_bgate[b] >= 0) ? tf[g_bgate[b]] : 0;
-            const float *bdown = (g_bdown[b] >= 0) ? tf[g_bdown[b]] : 0;
-            float *up = malloc((long)T * hid * sizeof(float));
-            float *gate = malloc((long)T * hid * sizeof(float));
-            float *hh = malloc((long)T * hid * sizeof(float));
-            float *dn = malloc((long)T * g_D * sizeof(float));
-            coo_project(xout, T, g_D, g_wup[b], up, hid);
-            coo_project(xout, T, g_D, g_wgate[b], gate, hid);
-            g_iter_ffn += (long)T * (t_nnz[g_wup[b]] + t_nnz[g_wgate[b]]
-                                     + t_nnz[g_wdown[b]]);
-            #ifdef _OPENMP
-            #pragma omp parallel for schedule(static)
-            #endif
-            for (t = 0; t < T; t = t + 1) {
-                int j;
-                for (j = 0; j < hid; j = j + 1) {
-                    float u = up[(long)t * hid + j] + (bup ? bup[j] : 0.0f);
-                    float ga = gate[(long)t * hid + j] + (bgate ? bgate[j] : 0.0f);
-                    float su = u / (1.0f + expf(-u));       /* SiLU(up) */
-                    hh[(long)t * hid + j] = su * ga;
-                }
-            }
-            coo_project(hh, T, hid, g_wdown[b], dn, g_D);
-            #ifdef _OPENMP
-            #pragma omp parallel for schedule(static)
-            #endif
-            for (t = 0; t < T; t = t + 1) {
-                int j;
-                for (j = 0; j < g_D; j = j + 1)
-                    xout[(long)t * g_D + j] += dn[(long)t * g_D + j]
-                                             + (bdown ? bdown[j] : 0.0f);
-            }
-            free(up); free(gate); free(hh); free(dn);
-        }
+        /* SwiGLU FFN (shared helper; sparse down-residual + persistent scratch). */
+        ffn_block(b, xout, T);
 
         /* this block's output tail becomes the next block's input tail */
         { float *tmp = xin; xin = xout; xout = tmp; }
@@ -1614,6 +2104,11 @@ void run_full_skip(int S, const unsigned char *live_mask) {
         int SK = T;
         if (!live_mask[b]) continue;    /* SKIP: xout==xin, residual passes through
                                          * (xin is already the running residual) */
+        if (g_attn_fuse && g_attn_dead[b]) {
+            /* DEAD-BLOCK-FUSION: attn no-op (W_v/W_o all-zero); residual passthrough
+             * into the FFN.  BYTE-EXACT (skipped ops add exact zero). */
+            memcpy(xout, xin, (long)T * g_D * sizeof(float));
+        } else {
         /* Q/K/V projections for ALL rows (COO, ascending-r, byte-exact) */
         coo_project(xin, T, g_D, g_wq[b], Qt, g_D);
         coo_project(xin, T, g_D, g_wk[b], Kt, g_D);
@@ -1634,45 +2129,10 @@ void run_full_skip(int S, const unsigned char *live_mask) {
         coo_project(attnout, T, g_D, g_wo[b], xout, g_D);
         g_iter_proj += (long)T * t_nnz[g_wo[b]];
         for (t = 0; t < T * g_D; t = t + 1) xout[t] = xout[t] + xin[t];
+        }   /* end attention sublayer */
 
-        /* SwiGLU FFN (identical to run_incremental) */
-        {
-            int hid = g_ffn_hidden[b];
-            const float *bup = (g_bup[b] >= 0) ? tf[g_bup[b]] : 0;
-            const float *bgate = (g_bgate[b] >= 0) ? tf[g_bgate[b]] : 0;
-            const float *bdown = (g_bdown[b] >= 0) ? tf[g_bdown[b]] : 0;
-            float *up = malloc((long)T * hid * sizeof(float));
-            float *gate = malloc((long)T * hid * sizeof(float));
-            float *hh = malloc((long)T * hid * sizeof(float));
-            float *dn = malloc((long)T * g_D * sizeof(float));
-            coo_project(xout, T, g_D, g_wup[b], up, hid);
-            coo_project(xout, T, g_D, g_wgate[b], gate, hid);
-            g_iter_ffn += (long)T * (t_nnz[g_wup[b]] + t_nnz[g_wgate[b]]
-                                     + t_nnz[g_wdown[b]]);
-            #ifdef _OPENMP
-            #pragma omp parallel for schedule(static)
-            #endif
-            for (t = 0; t < T; t = t + 1) {
-                int j;
-                for (j = 0; j < hid; j = j + 1) {
-                    float u = up[(long)t * hid + j] + (bup ? bup[j] : 0.0f);
-                    float ga = gate[(long)t * hid + j] + (bgate ? bgate[j] : 0.0f);
-                    float su = u / (1.0f + expf(-u));
-                    hh[(long)t * hid + j] = su * ga;
-                }
-            }
-            coo_project(hh, T, hid, g_wdown[b], dn, g_D);
-            #ifdef _OPENMP
-            #pragma omp parallel for schedule(static)
-            #endif
-            for (t = 0; t < T; t = t + 1) {
-                int j;
-                for (j = 0; j < g_D; j = j + 1)
-                    xout[(long)t * g_D + j] += dn[(long)t * g_D + j]
-                                             + (bdown ? bdown[j] : 0.0f);
-            }
-            free(up); free(gate); free(hh); free(dn);
-        }
+        /* SwiGLU FFN (shared helper; identical to run_incremental) */
+        ffn_block(b, xout, T);
         { float *tmp = xin; xin = xout; xout = tmp; }   /* out becomes next in */
     }
 
@@ -1744,6 +2204,11 @@ void run_full_evict(int S_eff, const int *abs_pos, const unsigned char *live_mas
     for (b = 0; b < g_nblocks; b = b + 1) {
         int SK = T;
         if (live_mask && !live_mask[b]) continue;   /* per-op skip (byte-exact) */
+        if (g_attn_fuse && g_attn_dead[b]) {
+            /* DEAD-BLOCK-FUSION: attn no-op (W_v/W_o all-zero); residual passthrough
+             * into the FFN.  BYTE-EXACT (skipped ops add exact zero). */
+            memcpy(xout, xin, (long)T * g_D * sizeof(float));
+        } else {
         coo_project(xin, T, g_D, g_wq[b], Qt, g_D);
         coo_project(xin, T, g_D, g_wk[b], Kt, g_D);
         coo_project(xin, T, g_D, g_wv[b], Vt, g_D);
@@ -1759,44 +2224,10 @@ void run_full_evict(int S_eff, const int *abs_pos, const unsigned char *live_mas
         coo_project(attnout, T, g_D, g_wo[b], xout, g_D);
         g_iter_proj += (long)T * t_nnz[g_wo[b]];
         for (t = 0; t < T * g_D; t = t + 1) xout[t] = xout[t] + xin[t];
+        }   /* end attention sublayer */
 
-        {
-            int hid = g_ffn_hidden[b];
-            const float *bup = (g_bup[b] >= 0) ? tf[g_bup[b]] : 0;
-            const float *bgate = (g_bgate[b] >= 0) ? tf[g_bgate[b]] : 0;
-            const float *bdown = (g_bdown[b] >= 0) ? tf[g_bdown[b]] : 0;
-            float *up = malloc((long)T * hid * sizeof(float));
-            float *gate = malloc((long)T * hid * sizeof(float));
-            float *hh = malloc((long)T * hid * sizeof(float));
-            float *dn = malloc((long)T * g_D * sizeof(float));
-            coo_project(xout, T, g_D, g_wup[b], up, hid);
-            coo_project(xout, T, g_D, g_wgate[b], gate, hid);
-            g_iter_ffn += (long)T * (t_nnz[g_wup[b]] + t_nnz[g_wgate[b]]
-                                     + t_nnz[g_wdown[b]]);
-            #ifdef _OPENMP
-            #pragma omp parallel for schedule(static)
-            #endif
-            for (t = 0; t < T; t = t + 1) {
-                int j;
-                for (j = 0; j < hid; j = j + 1) {
-                    float u = up[(long)t * hid + j] + (bup ? bup[j] : 0.0f);
-                    float ga = gate[(long)t * hid + j] + (bgate ? bgate[j] : 0.0f);
-                    float su = u / (1.0f + expf(-u));
-                    hh[(long)t * hid + j] = su * ga;
-                }
-            }
-            coo_project(hh, T, hid, g_wdown[b], dn, g_D);
-            #ifdef _OPENMP
-            #pragma omp parallel for schedule(static)
-            #endif
-            for (t = 0; t < T; t = t + 1) {
-                int j;
-                for (j = 0; j < g_D; j = j + 1)
-                    xout[(long)t * g_D + j] += dn[(long)t * g_D + j]
-                                             + (bdown ? bdown[j] : 0.0f);
-            }
-            free(up); free(gate); free(hh); free(dn);
-        }
+        /* SwiGLU FFN (shared helper; sparse down-residual + persistent scratch). */
+        ffn_block(b, xout, T);
         { float *tmp = xin; xin = xout; xout = tmp; }
     }
 
@@ -1937,6 +2368,79 @@ static void ac_build_residual(int S) {
             frame_idx += 1;
         }
         /* the query row (last position) carries ALL ROLE one-hots for ingest */
+        {
+            float *row = ac_resid + (long)(S - 1) * G_D;
+            for (j = 0; j < G_N_ROLES; j = j + 1) row[G_ROLE + j] = 1.0f;
+        }
+    }
+}
+
+/* ---- TAIL-ONLY residual build (the O(S)->O(T) overlay fix for the incremental path):
+ * the incremental forward reads ONLY the tail input rows [P..S-1] (rows [0..P-1] are
+ * the stable prefix, served from the cross-step K/V cache — their input residual is
+ * never read).  So building + copying the FULL [1,S,D] residual every step is pure
+ * O(S) waste that GROWS with the stream (measured: 30ms/step overlay at S=7651, ~40%
+ * of the whole step).  This builds ONLY rows [P..S-1] into ac_resid (at their absolute
+ * offsets, so run_incremental's tf[input_tid]+(P+t)*D indexing is unchanged), with the
+ * IDENTICAL per-row overlay math as ac_build_residual -> BYTE-EXACT for every tail row
+ * the forward reads.  Prefix rows in ac_resid/the input tensor are left stale (unread).
+ * P must equal the prefix run_incremental will use (= g_prev_S-1, or 0 on fresh). */
+static void ac_build_residual_tail(int S, int P) {
+    int i, k, j, b;
+    if (P <= 0) { ac_build_residual(S); return; }   /* fresh -> full build */
+    ac_resid_reserve(S);
+    /* 1+2) embed + program-data overlay for tail rows [P..S-1] */
+    for (i = P; i < S; i = i + 1) {
+        int tok = ac_stream[i];
+        float *row = ac_resid + (long)i * G_D;
+        memcpy(row, G_EMBED + (long)tok * G_D, G_D * sizeof(float));
+        row[G_ONE] = 1.0f;
+        for (k = 0; k < G_PROGLEN; k = k + 1) {
+            row[G_CODE_OP_DIM[k]]  = (float)G_PROG_OP[k];
+            row[G_CODE_IMM_DIM[k]] = (float)G_PROG_IMM[k];
+            ac_write_nibbles(row, G_CODE_IMM_NIB_DIM[k],
+                             (long)G_PROG_IMM[k] & 0xFFFFFFFFL, G_IMM_NIBS);
+        }
+    }
+    /* 3) frame ROLE / IS_FRAME_BYTE tags + store-KV rows, ONLY for frames overlapping
+     * the tail.  A frame at absolute base `pos` (=1+FRAME_LEN*frame_idx) touches rows
+     * [pos..pos+FRAME_LEN); we visit only frames whose span intersects [P..S-1]. */
+    {
+        int first_fi = (P - 1) / G_FRAME_LEN; if (first_fi < 0) first_fi = 0;
+        int pos = 1 + G_FRAME_LEN * first_fi, frame_idx = first_fi;
+        while (pos + G_FRAME_LEN <= S) {
+            for (j = 0; j < G_FRAME_LEN; j = j + 1) {
+                int abspos = pos + j;
+                if (abspos < P || abspos >= S) continue;    /* tail rows only */
+                { int role = G_ROLE_OF[j];
+                  if (role >= 0) {
+                      float *row = ac_resid + (long)abspos * G_D;
+                      row[G_ROLE + role] = 1.0f;
+                      row[G_IS_FRAME_BYTE] = 1.0f;
+                  } }
+            }
+            {
+                int mem_pos = pos + G_MEM_MARKER_LOCAL;
+                if (mem_pos >= P && mem_pos < S) {
+                    int si; long addr = 0, val = 0; int have = 0;
+                    for (si = 0; si < ac_nstore; si = si + 1)
+                        if (ac_store_fidx[si] == frame_idx) {
+                            addr = ac_store_addr[si]; val = ac_store_val[si]; have = 1;
+                        }
+                    if (have) {
+                        float *row = ac_resid + (long)mem_pos * G_D;
+                        row[G_IS_STORE] = 1.0f;
+                        row[G_IS_FRAME_BYTE] = 0.0f;
+                        for (b = 0; b < G_ADDR_BITS; b = b + 1)
+                            row[G_ADDR_BIN + b] = (float)((addr >> b) & 1L);
+                        ac_write_nibbles(row, G_VAL_NIB, val & 0xFFFFFFFFL, 16);
+                    }
+                }
+            }
+            pos += G_FRAME_LEN;
+            frame_idx += 1;
+        }
+        /* the query row (last position, always in the tail) carries ALL ROLE one-hots */
         {
             float *row = ac_resid + (long)(S - 1) * G_D;
             for (j = 0; j < G_N_ROLES; j = j + 1) row[G_ROLE + j] = 1.0f;
@@ -2102,6 +2606,13 @@ static long ac_mem_read(long addr) {
  * Gated by env C4_IO_BURST=1 or --io-burst.  0 = strict per-byte (MODE 1). */
 static int ac_io_burst = 0;
 
+/* DIRECT-CAM (opt-in ALLC_DIRECT_CAM=1): resolve LI/LC (memory-load) AX directly
+ * from the store-log (address = pre-step AX, latest-write-wins) instead of the
+ * neural memory-CAM.  Same CAM rule -> intended byte-exact; DEFAULT OFF.  A per-run
+ * mismatch count (ac_dcam_diff) surfaces any neural-vs-store-log CAM disagreement. */
+static int  ac_direct_cam = 0;
+static long ac_dcam_diff = 0;
+
 /* PER-OP BLOCK-SKIP (#738): each step, run ONLY the decoded op's LIVE blocks
  * (run_full_skip) instead of the full 242-block forward — the residual passes
  * straight through the skipped blocks (byte-exact for decode).  echo's ops
@@ -2127,6 +2638,18 @@ static int *ac_abs_pos;                       /* abs stream pos per compacted ro
 static int  ac_abs_pos_cap;
 static int  ac_evict_peak_rows;               /* max compacted row-count seen (report) */
 
+/* GLOBAL-HEAD KEY-SUBSET (DIRECT-CAM-ATTN): the per-forward keep-set mask fed to the
+ * GLOBAL memory-CAM heads (see g_gkey in attn_head).  ac_gkey[k]=1 for BOS, every
+ * §Memory store row (IS_STORE==1 in the residual), and the last AC_GLOBAL_WIN rows;
+ * 0 for the dropped non-store rows (which carry V==0 and round away in the denom).
+ * Built directly off the residual's IS_STORE dim so it matches what the model sees.
+ * Default ON; ALLC_NO_GKEY=1 disables (g_gkey stays NULL -> full global scan).
+ * NOT used on the evict path (there the rows are ALREADY compacted to the keep-set). */
+static unsigned char *ac_gkey;
+static int  ac_gkey_cap;
+static long ac_gkey_kept;                     /* total kept keys across the run (report) */
+static long ac_gkey_total;                    /* total keys scanned-if-full (report) */
+
 /* precompute the per-op live-block count from the header mask (once, at startup). */
 static void ac_init_live_counts(void) {
     int op, b;
@@ -2135,6 +2658,37 @@ static void ac_init_live_counts(void) {
         for (b = 0; b < G_SKIP_NB; b = b + 1) c += G_LIVE_MASK[(long)op * G_SKIP_NB + b];
         ac_live_count[op] = c;
     }
+}
+
+/* Build the GLOBAL-HEAD keep-set mask: keep BOS(0), every §Memory STORE row, and the
+ * last AC_GLOBAL_WIN rows.  This is the SAME keep-set the eviction path is proven
+ * byte-exact on, so restricting the GLOBAL memory-CAM heads to these keys is byte-exact.
+ *
+ * The store-row set is derived DIRECTLY from the store-log (a store at frame fi lives at
+ * absolute row 1+FRAME_LEN*fi+MEM_MARKER_LOCAL) instead of a strided read of the full
+ * [1,S,D] residual — critical now that the residual is only tail-built (its prefix rows
+ * would otherwise be a ~60MB strided cache-miss scan every step, an O(S) leak).  Result
+ * is IDENTICAL: a row carries IS_STORE==1 iff it is a committed store's marker slot.
+ * Returns the kept count. */
+static int ac_build_gkey(int S) {
+    int i, kept = 0, win = AC_GLOBAL_WIN;
+    int lo_win = S - win; if (lo_win < 0) lo_win = 0;
+    if (ac_gkey_cap < S) {
+        ac_gkey_cap = S < 256 ? 256 : S;
+        ac_gkey = realloc(ac_gkey, (long)ac_gkey_cap * sizeof(unsigned char));
+    }
+    /* window + BOS in one pass (contiguous, cache-friendly), then scatter store rows */
+    if (lo_win > 0) memset(ac_gkey, 0, (size_t)lo_win);
+    for (i = (lo_win > 0 ? lo_win : 0); i < S; i = i + 1) ac_gkey[i] = 1;   /* window */
+    if (lo_win > 0) ac_gkey[0] = 1;                                        /* BOS */
+    { int si;
+      for (si = 0; si < ac_nstore; si = si + 1) {
+          int fi = ac_store_fidx[si];
+          long sp = 1 + (long)G_FRAME_LEN * fi + G_MEM_MARKER_LOCAL;
+          if (sp >= 0 && sp < lo_win) ac_gkey[sp] = 1;   /* store rows below window */
+      } }
+    for (i = 0; i < S; i = i + 1) kept += ac_gkey[i];
+    return kept;
 }
 
 /* PRTF-burst: AX = pointer.  Walk §Memory mem[ptr], mem[ptr+1], ... until a NUL
@@ -2194,6 +2748,7 @@ static int ac_run_vm(int max_steps) {
     ac_build_frame(0, 0, G_SP_INIT, G_SP_INIT, 0, 0, 0, 0);
 
     int timing = getenv("ALLC_TIMING") ? atoi(getenv("ALLC_TIMING")) : 0;
+    g_phase_on = getenv("ALLC_PHASE") ? atoi(getenv("ALLC_PHASE")) : 0;
     double t_overlay = 0, t_fwd = 0, t_decode = 0;
     for (step = 0; step < max_steps; step = step + 1) {
         int S = ac_S;
@@ -2204,7 +2759,16 @@ static int ac_run_vm(int max_steps) {
         double ta, tb, tc, td;
 
         int S_fwd = S;               /* rows fed to the forward (S, or S_eff if evict) */
+        int build_P = 0;             /* tail-build start (0 = full build) */
         ta = _now_ms();
+
+        /* decode the CURRENT opcode (from the pre-step PC) FIRST — it needs only
+         * cur_pc — so we know the forward path (evict / block-skip / incremental)
+         * and can build ONLY the input rows that path will actually read. */
+        op  = (cur_pc >= 0 && cur_pc < G_PROGLEN) ? G_PROG_OP[cur_pc] : -1;
+        imm = (cur_pc >= 0 && cur_pc < G_PROGLEN) ? G_PROG_IMM[cur_pc] : 0;
+        (void)imm;
+
         if (ac_evict) {
             /* build the COMPACTED keep-set residual (flat memory); S_eff <= S rows */
             int win = ac_evict_w > 0 ? ac_evict_w : (2 * G_FRAME_LEN);
@@ -2215,21 +2779,31 @@ static int ac_run_vm(int max_steps) {
             S_fwd = ac_build_residual_evict(S, win, ac_abs_pos);
             if (S_fwd > ac_evict_peak_rows) ac_evict_peak_rows = S_fwd;
         } else {
-            ac_build_residual(S);
+            /* TAIL-ONLY BUILD: the incremental forward reads ONLY rows [P..S-1], so
+             * build just the tail (O(T) not O(S)) when the plain-incremental path
+             * will run.  block-skip / a fresh cache (P=0) need the full build. */
+            int will_skip = (ac_block_skip && g_incr_ready && !ac_skip_latched_off
+                             && G_SKIP_NB == g_nblocks && op >= 0
+                             && op < G_SKIP_NUM_OPS && G_SKIP_HAVE[op]
+                             && ((long)ac_live_count[op] * S < (long)g_nblocks * 31));
+            if (!will_skip && g_incr_ready) build_P = incr_prefix_len(S);
+            if (build_P > 0) ac_build_residual_tail(S, build_P);
+            else             ac_build_residual(S);
         }
 
-        /* decode the CURRENT opcode (from the pre-step PC) BEFORE the forward so
-         * the per-op BLOCK-SKIP schedule can run ONLY that op's live blocks. */
-        op  = (cur_pc >= 0 && cur_pc < G_PROGLEN) ? G_PROG_OP[cur_pc] : -1;
-        imm = (cur_pc >= 0 && cur_pc < G_PROGLEN) ? G_PROG_IMM[cur_pc] : 0;
-        (void)imm;
-
-        /* feed the residual into the incremental forward's input tensor + run */
+        /* feed the residual into the incremental forward's input tensor + run.  For a
+         * tail build we copy ONLY the tail rows [P..S-1] — run_incremental reads no
+         * prefix input row, so the prefix stays stale (unread), saving the O(S) copy. */
         {
             int rdim[3]; rdim[0] = 1; rdim[1] = S_fwd; rdim[2] = G_D;
             alloc_tensor(input_tid, DT_FLOAT, 3, rdim);
             t_is_init[input_tid] = 1;
-            memcpy(tf[input_tid], ac_resid, (long)S_fwd * G_D * sizeof(float));
+            if (build_P > 0)
+                memcpy(tf[input_tid] + (long)build_P * G_D,
+                       ac_resid + (long)build_P * G_D,
+                       (long)(S_fwd - build_P) * G_D * sizeof(float));
+            else
+                memcpy(tf[input_tid], ac_resid, (long)S_fwd * G_D * sizeof(float));
         }
         tb = _now_ms();
         g_iter_attn = 0; g_iter_proj = 0; g_iter_ffn = 0;
@@ -2263,6 +2837,11 @@ static int ac_run_vm(int max_steps) {
              * thrash that would re-invalidate the cache every other step). */
             if (ac_block_skip && !ac_skip_latched_off && has_live && !use_skip)
                 ac_skip_latched_off = 1;
+            /* GLOBAL-HEAD KEY-SUBSET: build the keep-set mask (store rows + BOS +
+             * recency window) and feed it to the GLOBAL memory-CAM heads so they scan
+             * O(#stores+W) keys not O(S) — byte-exact (same keep-set as eviction).  The
+             * evict path already compacts to this set physically, so g_gkey is left
+             * NULL there (all rows ARE keep-set rows). */
             if (ac_evict) {
                 /* EVICT: compacted full recompute over S_fwd keep-set rows with
                  * ABSOLUTE-position ALiBi.  Composes with block-skip (pass the op's
@@ -2271,11 +2850,20 @@ static int ac_run_vm(int max_steps) {
                     (ac_block_skip && G_SKIP_NB == g_nblocks && op >= 0
                      && op < G_SKIP_NUM_OPS && G_SKIP_HAVE[op])
                         ? &G_LIVE_MASK[(long)op * G_SKIP_NB] : 0;
+                g_gkey = 0;
                 run_full_evict(S_fwd, ac_abs_pos, lm);
             }
-            else if (use_skip) run_full_skip(S, &G_LIVE_MASK[(long)op * G_SKIP_NB]);
-            else if (g_incr_ready) run_incremental(S);
-            else               run();
+            else {
+                if (g_gkey_on) {
+                    int kept = ac_build_gkey(S);
+                    g_gkey = ac_gkey;
+                    ac_gkey_kept += kept; ac_gkey_total += S;
+                } else g_gkey = 0;
+                if (use_skip) run_full_skip(S, &G_LIVE_MASK[(long)op * G_SKIP_NB]);
+                else if (g_incr_ready) run_incremental(S);
+                else               run();
+                g_gkey = 0;
+            }
         }
         tc = _now_ms();
 
@@ -2286,6 +2874,23 @@ static int ac_run_vm(int max_steps) {
         stk = ac_snap_lane((double)state[G_STK_VAL]);
         halted = ((double)state[G_HALTED] > 0.5) ? 1 : 0;
         ax = ac_decode_reg(state, G_AX);
+
+        /* ---- DIRECT-CAM (opt-in ALLC_DIRECT_CAM=1): resolve a MEMORY-LOAD op's AX
+         * from the store-log O(1) (address = pre-step AX, latest-write-wins) instead
+         * of the neural memory-CAM.  This is the SAME latest-write CAM rule the neural
+         * global heads implement (and that the burst I/O already relies on), so it is
+         * intended byte-exact.  LI loads a full 32-bit word (ac_mem_top); LC loads one
+         * byte (ac_mem_read).  DEFAULT OFF (the neural forward's AX is authoritative);
+         * a mismatch counter (ac_dcam_diff) is bumped so any neural/store-log CAM
+         * disagreement is visible rather than silently overriding. */
+        if (ac_direct_cam && (op == G_OP_LI || op == G_OP_LC)) {
+            long dcaddr = cur_ax & 0xFFFFFFFFL;   /* load address = pre-step AX */
+            long dv = (op == G_OP_LI) ? (ac_mem_top(dcaddr) & 0xFFFFFFFFL)
+                                      : (ac_mem_read(dcaddr) & 0xFF);
+            if (dv != (ax & (op == G_OP_LI ? 0xFFFFFFFFL : 0xFFL)))
+                ac_dcam_diff += 1;
+            ax = dv;
+        }
 
         /* ---- SYSCALL opcodes (READ/OPEN/CLOS): the ONE class NOT computed
          * neurally (§Tool Use Mode — the model has no rules for them, so its
@@ -2398,6 +3003,10 @@ static int ac_run_vm(int max_steps) {
         fprintf(stderr, "TIMING: overlay %.1f  fwd %.1f  decode %.1f ms total "
                 "(%d steps, %.1f ms/step)\n", t_overlay, t_fwd, t_decode,
                 step, (t_overlay + t_fwd + t_decode) / (step > 0 ? step : 1));
+    if (g_phase_on)
+        fprintf(stderr, "PHASE (within fwd, ms total): attn %.1f  ffn %.1f  "
+                "ffn-alloc %.1f  (%d steps)\n",
+                g_ph_attn, g_ph_ffn, g_ph_alloc, step);
     return step;
 }
 
@@ -2418,6 +3027,7 @@ int main(int argc, char **argv) {
             else if (strcmp(argv[k], "--io-burst") == 0) ac_io_burst = 1;
             else if (strcmp(argv[k], "--block-skip") == 0) ac_block_skip = 1;
             else if (strcmp(argv[k], "--evict") == 0) ac_evict = 1;
+            else if (strcmp(argv[k], "--direct-cam") == 0) ac_direct_cam = 1;
             else if (strncmp(argv[k], "--evict-w=", 10) == 0)
                 { ac_evict = 1; ac_evict_w = atoi(argv[k] + 10); }
             else if (is_allc && argv[k][0] != '-') max_steps = atoi(argv[k]);
@@ -2428,6 +3038,15 @@ int main(int argc, char **argv) {
             ac_block_skip = 1;
         if (getenv("ALLC_EVICT") && atoi(getenv("ALLC_EVICT"))) ac_evict = 1;
         if (getenv("ALLC_EVICT_W")) ac_evict_w = atoi(getenv("ALLC_EVICT_W"));
+        if (getenv("ALLC_DIRECT_CAM") && atoi(getenv("ALLC_DIRECT_CAM")))
+            ac_direct_cam = 1;
+        if (getenv("ALLC_WINPROBE") && atoi(getenv("ALLC_WINPROBE"))) {
+            int _h; g_winprobe = 1;
+            for (_h = 0; _h < 512; _h = _h + 1) g_winprobe_max[_h] = -1;
+        }
+        /* GLOBAL-HEAD KEY-SUBSET default ON; ALLC_NO_GKEY=1 disables it. */
+        g_gkey_on = 1;
+        if (getenv("ALLC_NO_GKEY") && atoi(getenv("ALLC_NO_GKEY"))) g_gkey_on = 0;
         if (is_allc) {
             int nsteps;
             a = 0; while (a < MAX_TENSORS) { tf[a] = 0; ti[a] = 0; a = a + 1; }
@@ -2436,11 +3055,16 @@ int main(int argc, char **argv) {
                     ac_io_burst ? "BURST (MODE 2, runtime §Memory syscall)"
                                 : "STRICT (MODE 1, per-byte pointer-walk)");
             load(0);                       /* embedded blob */
-            if (incr_discover())
+            if (incr_discover()) {
                 fprintf(stderr, "allc: %d blocks H=%d HD=%d D=%d ffn<=%d "
                         "(windowed KV, O(S)/step)\n", g_nblocks, g_H, g_HD, g_D,
                         g_ffn_hidden_max);
-            else
+                if (g_attn_fuse)
+                    fprintf(stderr, "allc: DEAD-BLOCK-FUSION ON: %d/%d blocks have "
+                            "a LIVE attention head; %d dead-attention blocks skip "
+                            "Q/K/V/O+softmax (byte-exact)\n",
+                            g_nblocks - g_attn_dead_n, g_nblocks, g_attn_dead_n);
+            } else
                 fprintf(stderr, "allc: block layout not regular; full-recompute\n");
             if (ac_block_skip) {
                 if (G_SKIP_NB == g_nblocks) {
@@ -2460,8 +3084,34 @@ int main(int argc, char **argv) {
                         "store rows + last-%d recency rows; ABSOLUTE-pos ALiBi; KV "
                         "flat at ~heap+window over arbitrary length)\n",
                         ac_evict_w > 0 ? ac_evict_w : (2 * G_FRAME_LEN));
+            if (ac_direct_cam)
+                fprintf(stderr, "allc: DIRECT-CAM ON (LI/LC AX resolved O(1) from the "
+                        "store-log, latest-write-wins; overrides the neural memory-CAM "
+                        "decode)\n");
             nsteps = ac_run_vm(max_steps);
             fprintf(stderr, "allc: %d VM steps, final S=%d\n", nsteps, ac_S);
+            if (g_gkey_on && ac_gkey_total > 0)
+                fprintf(stderr, "allc: GLOBAL-HEAD KEY-SUBSET ON: scanned %ld/%ld keys "
+                        "for the 3 global memory-CAM heads (%.1fx fewer)\n",
+                        ac_gkey_kept, ac_gkey_total,
+                        (double)ac_gkey_total / (double)(ac_gkey_kept > 0 ? ac_gkey_kept : 1));
+            if (g_winprobe) {
+                int _h, gmaxL = -1, gmaxG = -1;
+                fprintf(stderr, "allc: WINPROBE max nonzero-weight distance per head:\n");
+                for (_h = 0; _h < g_H; _h = _h + 1) {
+                    if (g_winprobe_max[_h] < 0) continue;
+                    fprintf(stderr, "   h%2d %s max_dist=%d  gnz=%d gtop=%.6f\n", _h,
+                            g_head_local[_h] ? "LOCAL " : "GLOBAL", g_winprobe_max[_h],
+                            g_winprobe_gnz[_h], g_winprobe_gtop[_h]);
+                    if (g_head_local[_h]) { if (g_winprobe_max[_h] > gmaxL) gmaxL = g_winprobe_max[_h]; }
+                    else { if (g_winprobe_max[_h] > gmaxG) gmaxG = g_winprobe_max[_h]; }
+                }
+                fprintf(stderr, "allc: WINPROBE LOCAL max_dist=%d  GLOBAL max_dist=%d\n",
+                        gmaxL, gmaxG);
+            }
+            if (ac_direct_cam)
+                fprintf(stderr, "allc: DIRECT-CAM: %ld LI/LC steps where store-log != "
+                        "neural decode (0 == byte-exact CAM agreement)\n", ac_dcam_diff);
             if (ac_evict)
                 fprintf(stderr, "allc: EVICT peak compacted rows = %d (vs full stream "
                         "S=%d) -> %d live stores kept\n", ac_evict_peak_rows, ac_S,

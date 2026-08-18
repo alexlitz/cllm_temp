@@ -1,0 +1,48 @@
+{
+  "host": "Qwen/Qwen2.5-0.5B-Instruct",
+  "dev": "cuda:0",
+  "mechanism": "per-digit read at located digit tokens + frozen byte-exact ALU",
+  "train": {
+    "n_arith": 48,
+    "n_non": 16,
+    "trigger_recall": "48/48",
+    "trigger_recall_pct": 100.0,
+    "false_trigger": "0/16",
+    "false_trigger_pct": 0.0,
+    "op_exact": "48/48",
+    "operands_exact": "47/48",
+    "full_inline": "47/48",
+    "full_inline_pct": 97.91666666666667,
+    "per_op": {
+      "ADD": "8/8",
+      "SUB": "8/8",
+      "DIV": "8/8",
+      "CMP_LT": "8/8",
+      "CMP_EQ": "8/8",
+      "CMP_GT": "7/8"
+    }
+  },
+  "heldout": {
+    "n_arith": 60,
+    "n_non": 20,
+    "trigger_recall": "60/60",
+    "trigger_recall_pct": 100.0,
+    "false_trigger": "0/20",
+    "false_trigger_pct": 0.0,
+    "op_exact": "17/60",
+    "operands_exact": "0/60",
+    "full_inline": "0/60",
+    "full_inline_pct": 0.0,
+    "per_op": {
+      "ADD": "0/10",
+      "SUB": "0/10",
+      "DIV": "0/10",
+      "CMP_LT": "0/10",
+      "CMP_EQ": "0/10",
+      "CMP_GT": "0/10"
+    }
+  },
+  "final_loss": 0.061610642820596695,
+  "peak_rss_gb": 4.147308349609375,
+  "elapsed_s": 14.864315509796143
+}

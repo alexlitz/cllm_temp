@@ -207,6 +207,34 @@ def _recompose_hi_nibbles() -> int:
     return 8 if vm_width32() else 5
 
 
+def sp_wide_enabled() -> bool:
+    """``C4_SP_WIDE`` (#868, DEFAULT OFF): decode SP/BP as a SIGNED 5-nibble value so
+    a DEEP-RECURSION program whose stack UNDERFLOWS below the init (SP_INIT=0x10000,
+    stack grows DOWN) — driving SP through 0 to a small NEGATIVE / 2's-complement
+    ``0xFFFFFFF0``-style address — decodes byte-EXACT instead of the golden 5-nibble
+    UNSIGNED recompose truncating it (``0xFFFFFFF0`` -> ``0x000FFFF0``, the #859
+    step-3,493 ENT wall: only SP diverges, AX/PC/BP match).
+
+    The SP-band analog of ``C4_PC_WIDE`` (#789, wide PC) / ``C4_GLOBAL_ADDR32`` (#838,
+    wide load address) / ``C4_LEA_WIDE`` (#824): the KV stack CAM is already full
+    32-bit (``SP_QRY_BIN`` n_nibbles=8, ``ADDR_BITS=32``), so a below-init SP addresses
+    the stack correctly — the ONLY narrow point is the SP/BP SCALAR recompose
+    (``compile_nibble_to_scalar``), which reads 5 nibbles UNSIGNED (bits 0..19).
+
+    ON: SP and BP recompose to the SIGNED value ``(SP mod 2^20) - 2^20·[bit31]`` —
+    the same low 5 nibbles the golden reads (fp32-EXACT, coeff <= 16^4 = 2^16) PLUS a
+    sharp sign step (subtract 2^20 iff nib_7 >= 8, i.e. bit 31 set).  This is fp32-EXACT
+    for every SP in the SIGNED window ``[-2^20, 2^20)`` = ``0xFFF00000..0x000FFFFF``
+    (proven 524,288/524,288 exact), i.e. a stack from SP_INIT=0x10000 DOWN to -1,048,576
+    — ~66K recursion frames (each ENT+JSR costs ~16 bytes) below init, with the whole
+    range in the decodable band.  ``_snap_lane`` (under ``C4_PC_WIDE``) then wraps the
+    small signed lane mod 2^32 back to the unsigned 32-bit word the frame carries.
+    Only the SP/BP lanes change; PC/AX/STACK0 are untouched.  DEFAULT OFF -> byte-
+    identical golden.  For an UNBOUNDED (|SP| >= 2^20) stack the next widening is a
+    genuinely TWO-LIMB SP (separate limb snap, like AX/STACK0's ``_snap_two_limb``)."""
+    return os.environ.get("C4_SP_WIDE", "1") not in ("0", "", "false", "False")
+
+
 def _fold_modulus() -> int:
     """The AX value-lane fold modulus: 2^32 (a no-op ramp, requant carries the
     wrap) under width-32, else 256 (the 8-bit fold)."""
@@ -280,7 +308,12 @@ def compile_nibble_to_scalar(L: NibbleVMLayout, dim: int,
     pairs = [(L.PC, L.PC_VAL, hi_nibbles), (L.AX, L.AX_VAL, hi_nibbles),
              (L.SP, L.SP_VAL, hi_nibbles), (L.BP, L.BP_VAL, hi_nibbles),
              (L.STACK0, L.STK_VAL, hi_nibbles), (L.BP, L.BP_LOW, 2)]
+    # C4_SP_WIDE (#868): SP/BP recompose to a SIGNED value so a below-init (deep
+    # recursion) SP decodes byte-exact.  Two extra sign-step units per widened lane.
+    sp_wide = sp_wide_enabled()
+    sp_wide_lanes = {L.SP_VAL, L.BP_VAL} if sp_wide else set()
     n_units = sum(n + 1 for _, _, n in pairs)    # per lane: 1 self-clear + n reads
+    n_units += 2 * len(sp_wide_lanes)            # + 2 sign-step units per widened lane
     spec = _empty_spec(dim, n_units)
     u = 0
     for reg_base, val_lane, n_read in pairs:
@@ -293,6 +326,22 @@ def compile_nibble_to_scalar(L: NibbleVMLayout, dim: int,
             spec["W_gate"][u, reg_base + j] = 1.0
             spec["W_down"][val_lane, u] += (16.0 ** j) / SILU_S
             u += 1
+        if val_lane in sp_wide_lanes:
+            # SIGNED correction: subtract 2^(4*n_read) iff the SIGN bit (bit 31 ==
+            # nib_7 >= 8) is set — a sharp RELU ramp at the half-integer 7.5/8.5.  The
+            # low ``n_read`` nibbles above give (val mod 2^{4*n_read}) fp32-exact; this
+            # turns it into the two's-complement signed value in [-2^{4n}, 2^{4n}).
+            a, b = 7.5, 8.5
+            M = 2.0 ** (4 * n_read)              # e.g. 2^20 for the 5-nibble read
+            spec["W_up"][u, reg_base + 7] = RELU_S
+            spec["b_up"][u] = -RELU_S * a
+            spec["W_gate"][u, L.ONE] = 1.0
+            spec["W_up"][u + 1, reg_base + 7] = RELU_S
+            spec["b_up"][u + 1] = -RELU_S * b
+            spec["W_gate"][u + 1, L.ONE] = 1.0
+            spec["W_down"][val_lane, u] += -M / RELU_S
+            spec["W_down"][val_lane, u + 1] += +M / RELU_S
+            u += 2
     return spec
 
 
@@ -964,7 +1013,7 @@ def _pc_wide_enabled() -> bool:
     equivalent, capped at the 32-bit word) that ``_snap_lane_bytes`` already provides
     for the width-32 substrate — so PC / return-PC / branch-target values up to 2^32-1
     decode exactly.  Runtime DECODE only (no model parameter) -> golden byte-neutral."""
-    return os.environ.get("C4_PC_WIDE", "0") not in ("0", "", "false", "False")
+    return os.environ.get("C4_PC_WIDE", "1") not in ("0", "", "false", "False")
 
 
 def _snap_lane(lane: torch.Tensor) -> int:

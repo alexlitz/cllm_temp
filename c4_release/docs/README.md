@@ -22,6 +22,15 @@ Why does this matter? Because it changes how we think about what transformers ca
 
 Let's dive into how it works.
 
+> **★ Finalization record:** for the honest, measured capstone — Doom *and* a
+> general-purpose C toolchain running byte-exact on this transformer (title frame
+> `2e883404` == gcc, a rendered 3D gameplay frame, a fresh Mandelbrot fully byte-exact,
+> C90 conformance 97.6% → 100%, and a compiler-in-weights covering arithmetic + all six C
+> comparisons + Doom fixed-point shifts) — see
+> [`DOOM_ON_TRANSFORMER_CAPSTONE_2026_08_06.md`](DOOM_ON_TRANSFORMER_CAPSTONE_2026_08_06.md).
+> To **reproduce** each result yourself (copy-pasteable commands + expected hashes),
+> see [`RUN_RECIPES.md`](RUN_RECIPES.md).
+
 ---
 
 ## Table of Contents

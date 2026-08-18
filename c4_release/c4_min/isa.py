@@ -56,6 +56,55 @@ HALT = 38  # alias EXIT
 F_ADD, F_SUB, F_MUL, F_DIV = 40, 41, 42, 43
 NUM_OPS_FLOAT = 44   # OP_IS band width when C4_FLOAT_OPS is on (covers 0..43)
 
+# ---------------------------------------------------------------------------
+# EMIT (in-transformer JIT, ``C4_CFM_EMIT``, DEFAULT OFF).  The CFM-path analog
+# of ``nibble_compiler.EMIT`` (value 30 on the bespoke handoff ISA — a value that
+# is OPEN here).  EMIT APPENDS / rewrites a CODE frame into the SAME KV §Memory
+# the fetch@PC CAM reads: the produced instruction's op rides AX, its imm rides
+# STACK0, and the EMIT instruction's OWN immediate is the TARGET code address to
+# write — ``code[IMM] := Instr(op=AX, imm=STACK0)`` (mirror of
+# ``nibble_compiler.compile_emit_store``: ``CODE_WORD[IMM] := AX + 256*STACK0``).
+# Because ``_bake_code_cam`` is an address-keyed CAM over ALL code frames, a
+# runtime-appended frame becomes fetchable by PC with NO residual-width (D)
+# growth — the program-length-INDEPENDENT JIT the bespoke fixed-width ``CODE_WORD``
+# band (program size capped by D) lacks.  EMIT is NOT a neural dispatch op (no FFN
+# rule decodes it): the driver services it (like JSR/ENT/LEV/SI/SC) by reading the
+# model's AX/STACK0 and mutating the runtime code list.  Its VALUE (45) sits ABOVE
+# both NUM_OPS (40) and NUM_OPS_FLOAT (44), so the OP_IS one-hot band width
+# (``num_ops_effective``) is UNCHANGED whether or not EMIT is used -> the golden
+# 069cc32f layout/build stays byte-identical (EMIT only ever appears in the driver
+# + this reference oracle, never in the baked weights).
+EMIT = 45
+
+# ---------------------------------------------------------------------------
+# NATIVE DOOM RENDER-MACRO opcode DRAWSPAN (gated, DEFAULT OFF).  47 = DRAWSPAN
+# (doom_drawspan, C4_DOOM_DRAWSPAN) -- the V_DrawPatch column-copy render macro.
+# (Value 45 is taken by EMIT above; 46 is reserved for NAMEEQ on the doom-render
+# lineage.)  This opcode VALUE sits ABOVE the golden NUM_OPS=40 opcode one-hot
+# band, so the baseline OP_IS layout is UNCHANGED when the gate is off;
+# DRAWSPAN's gate widens the band to ``NUM_OPS_DRAWSPAN`` only when on (golden
+# byte-identical off).  The op SEMANTICS live in ``c4_min.doom_drawspan``.
+DRAWSPAN = 47
+NUM_OPS_DRAWSPAN = 48   # OP_IS band width when C4_DOOM_DRAWSPAN is on (covers 0..47)
+
+# ---------------------------------------------------------------------------
+# NATIVE DOOM GAMEPLAY RENDER-MACRO opcodes DRAWCOL / DRAWSPANF (gated, DEFAULT
+# OFF).  These are the 3D-view analogs of the title's DRAWSPAN (V_DrawPatch)
+# fold: the per-pixel TEXTURE-MAPPED fill loops that dominate a healthy gameplay
+# frame.  48 = DRAWCOL (``R_DrawColumn`` -- a texture-mapped VERTICAL wall column:
+# a fixed-point source-texel walk ``frac += fracstep`` / ``src[(frac>>16)&127]``,
+# a colormap/light lookup ``cmap[...]``, and a strided dest byte write
+# ``dest += SCREENWIDTH``); 49 = DRAWSPANF (``R_DrawSpan`` -- a texture-mapped
+# HORIZONTAL floor/ceiling span: a 2D u,v walk ``xfrac/yfrac += step``, the same
+# colormap lookup, and a CONTIGUOUS dest byte write ``*dest++``).  Both sit ABOVE
+# the golden NUM_OPS=40 band AND above DRAWSPAN (47), so the baseline OP_IS layout
+# and the DRAWSPAN layout are UNCHANGED when the gate is off; the
+# ``C4_DOOM_DRAWCOL`` gate widens the band to ``NUM_OPS_DRAWCOL`` only when on
+# (golden byte-identical off).  The op SEMANTICS live in ``c4_min.doom_drawcol``.
+DRAWCOL = 48
+DRAWSPANF = 49
+NUM_OPS_DRAWCOL = 50   # OP_IS band width when C4_DOOM_DRAWCOL is on (covers 0..49)
+
 
 def float_ops_enabled() -> bool:
     """``C4_FLOAT_OPS`` (DEFAULT OFF): add the gated IEEE-754 single F_ADD/F_SUB/
@@ -64,11 +113,42 @@ def float_ops_enabled() -> bool:
     return os.environ.get("C4_FLOAT_OPS", "0") not in ("0", "", "false", "False")
 
 
+def drawspan_enabled() -> bool:
+    """``C4_DOOM_DRAWSPAN`` (DEFAULT OFF): add the gated DRAWSPAN render-macro
+    opcode (47).  OFF -> the OP_IS band stays at its non-DRAWSPAN width and every
+    downstream layout dim is byte-identical to the golden 069cc32f build.  The
+    canonical gate + op semantics live in ``c4_min.doom_drawspan``; this mirror
+    keeps ``isa`` self-contained (no import cycle) for the OP_IS band sizing."""
+    return os.environ.get("C4_DOOM_DRAWSPAN", "0") not in ("0", "", "false", "False")
+
+
+def drawcol_enabled() -> bool:
+    """``C4_DOOM_DRAWCOL`` (DEFAULT OFF): add the gated GAMEPLAY render-macro
+    opcodes DRAWCOL (48, R_DrawColumn) + DRAWSPANF (49, R_DrawSpan).  OFF -> the
+    OP_IS band stays at its non-DRAWCOL width and every downstream layout dim is
+    byte-identical to the golden 069cc32f build.  The canonical gate + op
+    semantics live in ``c4_min.doom_drawcol``; this mirror keeps ``isa``
+    self-contained (no import cycle) for the OP_IS band sizing."""
+    return os.environ.get("C4_DOOM_DRAWCOL", "0") not in ("0", "", "false", "False")
+
+
 def num_ops_effective() -> int:
     """Width of the OP_IS opcode one-hot band for the CURRENT flag state:
-    ``NUM_OPS`` (40, golden) when C4_FLOAT_OPS is off, ``NUM_OPS_FLOAT`` (44)
-    when on.  The layout reads THIS so a flag-off build is byte-identical."""
-    return NUM_OPS_FLOAT if float_ops_enabled() else NUM_OPS
+    ``NUM_OPS`` (40, golden) normally; widened to ``NUM_OPS_FLOAT`` (44) when
+    C4_FLOAT_OPS is on, to ``NUM_OPS_DRAWSPAN`` (48) when C4_DOOM_DRAWSPAN is on
+    (the DRAWSPAN opcode-47 one-hot needs a slot), and to ``NUM_OPS_DRAWCOL``
+    (50) when C4_DOOM_DRAWCOL is on (the DRAWSPANF opcode-49 one-hot needs a
+    slot).  The band is the MAX of the enabled extensions, so the gates compose.
+    The layout reads THIS, so a flag-off build is byte-identical to golden
+    069cc32f."""
+    width = NUM_OPS
+    if float_ops_enabled():
+        width = max(width, NUM_OPS_FLOAT)
+    if drawspan_enabled():
+        width = max(width, NUM_OPS_DRAWSPAN)
+    if drawcol_enabled():
+        width = max(width, NUM_OPS_DRAWCOL)
+    return width
 
 NAMES = {
     LEA: "LEA", IMM: "IMM", JMP: "JMP", JSR: "JSR", BZ: "BZ", BNZ: "BNZ",
@@ -80,6 +160,7 @@ NAMES = {
     OPEN: "OPEN", READ: "READ", CLOS: "CLOS", PRTF: "PRTF",
     MALC: "MALC", FREE: "FREE", MSET: "MSET", MCMP: "MCMP",
     F_ADD: "F_ADD", F_SUB: "F_SUB", F_MUL: "F_MUL", F_DIV: "F_DIV",
+    EMIT: "EMIT",
     NOP: "NOP",
     HALT: "HALT",
 }
@@ -188,7 +269,7 @@ def assemble(prog: List[Tuple[str, int]]) -> List[Instr]:
 
 
 def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
-              out: list = None, stdin=None):
+              out: list = None, stdin=None, mem_init: dict = None):
     """Reference 8-bit interpreter. Returns list of AX values emitted per step.
 
     Stack grows downward from ``mem_size`` (top). ``pop`` reads stack[SP] then SP+=1.
@@ -211,8 +292,17 @@ def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
     sp = mem_size          # empty stack
     pc = 0
     mem = [0] * mem_size
+    # ``mem_init`` pre-seeds the data §Memory (the input "file" a compiler reads via
+    # LI/LC) — the reference analog of the CFM driver's pre-seeded store_log.
+    if mem_init:
+        for a, v in mem_init.items():
+            mem[a % mem_size] = v & MASK
     stack = [0] * (mem_size + 1)
     emitted = []
+    # EMIT mutates ``code`` in place (writes the just-produced bytecode into the
+    # code array a later JMP runs), so work on a private copy — the caller's list
+    # stays pristine and re-runnable, matching the model driver's own runtime copy.
+    code = list(code)
 
     def push(v):
         nonlocal sp
@@ -320,6 +410,18 @@ def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
             pc = imm if ax == 0 else pc
         elif op == BNZ:
             pc = imm if ax != 0 else pc
+        elif op == EMIT:
+            # In-transformer JIT: rewrite the code slot at ``imm`` to the produced
+            # instruction whose op rides AX and whose imm rides the stack top
+            # (STACK0), then POP that immediate.  ``code`` is mutated in place, so
+            # a later JMP to the emitted region runs the freshly-produced bytecode
+            # (self-modifying / just-compiled code).  Byte-exact analog of the CFM
+            # driver's EMIT service + ``nibble_compiler.compile_emit_store``.
+            produced_imm = pop()                  # STACK0 -> produced instruction imm
+            produced_op = ax & MASK               # AX     -> produced instruction op
+            while imm >= len(code):
+                code.append(Instr(NOP, 0))        # grow into the reserved JIT region
+            code[imm] = Instr(produced_op, produced_imm)
         elif op == HALT:
             emitted.append(ax)
             break

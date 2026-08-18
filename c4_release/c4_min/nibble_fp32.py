@@ -35,7 +35,8 @@ hard cases; the covered range is stated explicitly).
 The public builders return ``(name, spec)`` FFN sub-block lists (the same SwiGLU
 tensor-dict container the integer ALU uses) that ``build_pure_forward_complete_model``
 wires like any other op block, gated behind ``C4_FLOAT_OPS`` (default OFF -> the
-golden ``_fingerprint_build`` 069cc32f is byte-identical).
+golden ``_fingerprint_build`` build is byte-identical: 7d4afe61 by default, or
+069cc32f under the ``C4_BP_RESTORE_HIBYTE=0`` escape hatch).
 """
 from __future__ import annotations
 

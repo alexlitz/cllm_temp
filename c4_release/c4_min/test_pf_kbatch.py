@@ -78,3 +78,103 @@ def test_kbatch_forward_count():
     for K in (1, 2, 4):
         _, n_fwd = KB.drive_kbatch(model, L, runner, code, K=K, seed_mem={})
         assert n_fwd == (n_steps + K - 1) // K, (K, n_fwd, n_steps)
+
+
+# ---------------------------------------------------------------------------
+# #874 — PER-ROW block-skip byte-exactness.  Each block runs ONLY the query rows
+# whose op uses it (not the union of all K).  The reference is the K=1 SINGLE-STEP
+# decode (each step in its own forward -> no cross-row union), which is the TRUE
+# per-step semantics.  (The older UNION K-batch is NOT byte-exact to it for a mixed
+# batch — its SHL/EQ ax-recompose blocks corrupt the AX band of the other rows — so
+# per-row is both correct and cheaper.  We therefore gate per-row against the K=1
+# per-step reference, not against the union K-batch.)
+# ---------------------------------------------------------------------------
+def _perstep_ref(model, L, runner, code, *, seed, max_steps=200):
+    """The K=1 per-step decode = each step its own forward over the frozen stream
+    (no cross-row union)."""
+    return KB.drive_kbatch(model, L, runner, code, K=1, seed_mem=seed,
+                           max_steps=max_steps, perrow=False)[0]
+
+
+@pytest.mark.parametrize("K", [2, 4, 8, 16, 32, 64])
+def test_perrow_battery_byte_exact(K):
+    """PER-ROW block-skip == the K=1 per-step decode, on the whole battery."""
+    model, L, runner = _model()
+    for name, prog, seed in _battery():
+        code = prog if (prog and isinstance(prog[0], isa.Instr)) else isa.assemble(prog)
+        ref = _perstep_ref(model, L, runner, code, seed=seed)
+        pr, _ = KB.drive_kbatch(model, L, runner, code, K=K, seed_mem=seed,
+                                perrow=True)
+        assert pr == ref, f"perrow K={K} {name}: ref={ref} perrow={pr}"
+
+
+@pytest.mark.parametrize("K", [2, 4, 8, 16, 32, 64])
+def test_perrow_graphed_battery_byte_exact(K):
+    """GROUPED graphed PER-ROW (compacted same-subset FFN runs) == the K=1 per-step
+    decode.  Same skip as ``perrow`` plus the launch-collapsing FFN-chain grouping."""
+    model, L, runner = _model()
+    for name, prog, seed in _battery():
+        code = prog if (prog and isinstance(prog[0], isa.Instr)) else isa.assemble(prog)
+        ref = _perstep_ref(model, L, runner, code, seed=seed)
+        pr, _ = KB.drive_kbatch(model, L, runner, code, K=K, seed_mem=seed,
+                                perrow_graphed=True)
+        assert pr == ref, f"perrow_graphed K={K} {name}: ref={ref} perrow={pr}"
+
+
+@pytest.mark.parametrize("K", [2, 4, 8, 16, 32, 64])
+def test_wholestep_battery_byte_exact(K):
+    """WHOLE-STEP masked FFN-span collapse (C4_WHOLESTEP_GRAPH) == the K=1 per-step
+    decode, on the whole battery.  Each maximal FFN-only span between attention blocks
+    runs as ONE fixed-shape masked pass (``where(rowmask, ffn(x), x)``); dead rows keep
+    their input == the per-row skip.  (On CPU this exercises the eager masked-chain
+    fallback, which is byte-identical to the graphed path.)"""
+    model, L, runner = _model()
+    for name, prog, seed in _battery():
+        code = prog if (prog and isinstance(prog[0], isa.Instr)) else isa.assemble(prog)
+        ref = _perstep_ref(model, L, runner, code, seed=seed)
+        pr, _ = KB.drive_kbatch(model, L, runner, code, K=K, seed_mem=seed,
+                                wholestep=True)
+        assert pr == ref, f"wholestep K={K} {name}: ref={ref} wholestep={pr}"
+
+
+@pytest.mark.parametrize("K", [4, 16, 64])
+def test_wholestep_deep_nested_loop(K):
+    """WHOLE-STEP masked collapse == the K=1 per-step decode over a deep nested loop."""
+    model, L, runner = _model()
+    deep = _nested_prog(3, 4)
+    ref = _perstep_ref(model, L, runner, deep, seed={}, max_steps=60)
+    pr, _ = KB.drive_kbatch(model, L, runner, deep, K=K, seed_mem={},
+                            max_steps=60, wholestep=True)
+    assert pr == ref, f"wholestep K={K}: ref={ref[:20]} wholestep={pr[:20]}"
+
+
+@pytest.mark.parametrize("K", [4, 16, 64])
+def test_perrow_deep_nested_loop(K):
+    """PER-ROW and grouped-graphed PER-ROW == the K=1 per-step decode over a deep
+    nested loop (the multi-batch, mixed-op stress case — a DIV-free loop where per-row
+    skips the whole 179-block divmod span for every row)."""
+    model, L, runner = _model()
+    deep = _nested_prog(3, 4)
+    ref = _perstep_ref(model, L, runner, deep, seed={}, max_steps=60)
+    for perrow_kw in ({"perrow": True}, {"perrow_graphed": True}):
+        pr, _ = KB.drive_kbatch(model, L, runner, deep, K=K, seed_mem={},
+                                max_steps=60, **perrow_kw)
+        assert pr == ref, f"{perrow_kw} K={K}: ref={ref[:20]} perrow={pr[:20]}"
+
+
+def test_perrow_block_count_reduction():
+    """The per-row row-mask shrinks blocks-per-row: a K-batch with one DIV pays the
+    179-block divmod span ONLY on the DIV row, not on all K rows.  Union pays it on
+    every row."""
+    model, L, runner = _model()
+    # 8 ADD steps + 1 DIV step: union = |live(ADD) U live(DIV)| ~ 188 for ALL 9 rows;
+    # per-row = ADD's ~14 for the 8 ADD rows + DIV's 188 for the 1 DIV row.
+    ops = [isa.ADD] * 8 + [isa.DIV]
+    union = runner.live_union(ops)
+    rows_by_block = runner.per_block_rows(ops)
+    union_per_row = len(union)                       # every row pays the union
+    perrow_avg = sum(len(rs) for rs in rows_by_block.values()) / len(ops)
+    assert perrow_avg < union_per_row / 3, (perrow_avg, union_per_row)
+    # the div blocks (present only for the 1 DIV row) must have subset size 1.
+    div_only = [bi for bi, rs in rows_by_block.items() if rs == [8]]
+    assert len(div_only) > 100, len(div_only)   # ~179 alu-div blocks, DIV-row only

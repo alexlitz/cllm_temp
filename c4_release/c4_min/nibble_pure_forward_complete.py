@@ -133,6 +133,44 @@ def _unify_cam_head_enabled() -> bool:
         return True
     return os.environ.get("C4_UNIFY_CAM_HEAD", "0") not in ("0", "", "false", "False")
 
+
+def _bp_restore_hibyte_nibs() -> int:
+    """``C4_BP_RESTORE_HIBYTE`` (DEFAULT ON): how many nibbles the LEV/pop STK_VAL /
+    BP_VAL / LEV_RET_VAL scalar recomposes read.
+
+    The frame-pointer-restore path (``compile_stk_recompose`` / ``compile_unify_stk_recompose``
+    / ``compile_lev_ret_recompose``) recomposes the saved BP / return-PC popped from the
+    KV store into its wide scalar lane as ``VAL = Σ_j 16^j·nibble_j``.  Historically it
+    HARDCODED 8 nibbles — the ``C4_VM_WIDTH32`` fp64 count, where ``16^7`` is exact — but
+    the doom/mandelbrot build runs the recompose in **fp32**, where ``16^7 = 2^28`` is far
+    past fp32's 2^24 unit precision.  A saved BP like ``0x10000`` (SP_INIT) arrives with a
+    clean nibble-4 but a ~1e-6 CAM-read RESIDUE on the high nibbles j=5,6,7 (which SHOULD
+    be 0).  The 8-nibble recompose weights that residue by ``16^7 ≈ 2.7e8`` → a −256/−16/−1
+    error, dragging ``0x10000`` down to ``0xFEEF`` (65536 → 65263, the mandelbrot boundary
+    step-688 LEV divergence).  The residue-immune per-byte-argmax decode
+    (``_decode_reg_from_nibbles``) is CORRECT on the SAME nibbles — only the wide-scalar
+    recompose amplifies the residue.
+
+    DEFAULT (ON): read ``_recompose_hi_nibbles()`` nibbles — the SAME fp32-safe count the
+    base ``compile_nibble_to_scalar`` uses for EVERY other register (5 in fp32: coeff ≤
+    16^4 = 2^16 < 2^24 fp32-exact; 8 in fp64/width32).  The dropped high nibbles j∈[5,7]
+    carry only residue (a real saved-BP / return-PC in these programs fits bits 0..19), so
+    the value is UNCHANGED for a clean value and residue-immune for a residue-laden one.
+    This is the general-program-correctness default: MANDELBROT is fully byte-exact
+    (interior/escape/boundary all match oracle) and DOOM stays byte-exact (its saved BPs
+    decode clean at both 5 and 8 nibbles).  DEFAULT-ON golden ``_fingerprint_build`` =
+    ``7d4afe61`` (fewer FFN units: the recompose reads 5 nibbles not 8, so each of the 3
+    recompose ops drops 3 hi-nibble units).
+
+    ESCAPE HATCH (``C4_BP_RESTORE_HIBYTE=0``): revert to the old ``hi_nibbles=8``
+    recompose — the pre-fix golden ``069cc32f`` (byte-identical to the historical
+    doom-build golden), for rollback + old-byte-identity checks."""
+    import os
+    if os.environ.get("C4_BP_RESTORE_HIBYTE", "1") in ("0", "false", "False"):
+        return 8
+    from .nibble_vm import _recompose_hi_nibbles
+    return _recompose_hi_nibbles()
+
 # Number of nibbles the STATIC immediate-nibble program encoding carries per slot.
 # The corpus's largest VALUE literal is < 10^4 (< 16^4); 5 nibbles (< 16^5 ≈ 1.05M)
 # is generous headroom while keeping the CODE_IMM_NIB band (code_size × IMM_NIBS)
@@ -193,6 +231,18 @@ def _pf_cfm_enabled() -> bool:
     return _os.environ.get("C4_PF_CFM", "0") not in ("0", "", "false", "False")
 
 
+def _cfm_emit_enabled() -> bool:
+    """``C4_CFM_EMIT`` (DEFAULT OFF): the in-transformer JIT on the DIRECT-CAM code
+    path.  The driver services ``isa.EMIT`` (value 45) as a control op (no FFN
+    dispatch rule, like JSR/ENT/LEV): the model FETCHES the EMIT instruction from
+    the code CAM, the register CAM reconstructs the input state, and the driver
+    reads the produced word from the input registers (op<-AX, imm<-STACK0), overlays
+    a runtime CODE frame at the EMIT immediate keyed bits(addr) on the WIDE
+    (``CODE_ADDR_BITS``, position-invariant) direct-CAM lanes, and bumps PC.  EMIT
+    adds NO baked weights, so flag-ON is byte-identical to golden 069cc32f."""
+    return _os.environ.get("C4_CFM_EMIT", "0") not in ("0", "", "false", "False")
+
+
 # ===========================================================================
 # RUN-PHASE 32-bit gap closers (#789 PC-arith, #790 32-bit op gaps).  Every one
 # is a GATED env flag DEFAULT-OFF: with all off the build is byte-IDENTICAL to
@@ -207,7 +257,7 @@ def _shift32_enabled() -> bool:
     with ``pop </>> ax`` (32-bit, arithmetic SHR sign-fill) — the byte truncation was
     the ONLY thing losing bits.  Doom's fixed-point ``>>`` is the #1 fast-path fix.
     OFF -> SHL/SHR stay in ``byte_ax_ops`` (byte result) -> golden byte-IDENTICAL."""
-    return _os.environ.get("C4_SHIFT32", "0") not in ("0", "", "false", "False")
+    return _os.environ.get("C4_SHIFT32", "1") not in ("0", "", "false", "False")
 
 
 def _cmp32_enabled() -> bool:
@@ -219,16 +269,16 @@ def _cmp32_enabled() -> bool:
     ``CMP_EQ=1`` and ``CMP_GT=CMP_LT=0``; the sign-corrected magnitude order (already
     32-bit-exact for the DECISIVE sign/low-byte cases) is untouched off the tie.  OFF
     -> the cmp blocks are byte-IDENTICAL to golden."""
-    return _os.environ.get("C4_CMP32", "0") not in ("0", "", "false", "False")
+    return _os.environ.get("C4_CMP32", "1") not in ("0", "", "false", "False")
 
 
 def _divmod_signed_enabled() -> bool:
-    """``C4_DIVMOD_SIGNED`` (DEFAULT OFF): compute DIV/MOD with C4/native-c4 SIGNED
+    """``C4_DIVMOD_SIGNED`` (DEFAULT ON — golden 3cabef64): compute DIV/MOD with C4/native-c4 SIGNED
     truncation-toward-zero semantics (quotient sign = sign(a)^sign(b), remainder sign
     = sign(a), magnitudes from the unsigned base-16 long division) instead of the
     golden's UNSIGNED floor.  Native c4 ``int`` is signed, so Doom's signed ``/`` /
-    ``%`` need this.  OFF -> DIV/MOD stay unsigned-floor -> golden byte-IDENTICAL."""
-    return _os.environ.get("C4_DIVMOD_SIGNED", "0") not in ("0", "", "false", "False")
+    ``%`` need this.  C4_DIVMOD_SIGNED=0 -> unsigned-floor rollback == the pre-migration golden 7d4afe61."""
+    return _os.environ.get("C4_DIVMOD_SIGNED", "1") not in ("0", "", "false", "False")
 
 
 # ===========================================================================
@@ -276,6 +326,29 @@ class PureForwardCompleteLayout(PureForwardLayout):
         # steps -- avoids the large-q GPU sparse accumulation error (the #680 deep-read-
         # back miss).  The address decode takes its low byte via ``a & 0xFF``.
         self.LEA_Q = self._scalar("LEA_Q")                    # signed BP_low+4*imm [-256,511]
+        # WIDE LEA (C4_LEA_WIDE, DEFAULT OFF — see ``_lea_wide_enabled``): the full
+        # 32-bit frame address ``AX = BP + 4*imm`` computed byte-by-byte with a carry
+        # chain, so a frame-relative pointer keeps its high bytes (``LEA 40`` off
+        # BP=0x10000 -> 0x100a0, not the folded 0xa0).  Allocated ONLY under the wide
+        # flag; OFF -> these bands are absent -> the layout / golden hash is byte-
+        # identical (the golden 069cc32f flags-off build never widens the substrate).
+        self.LEAW_A = self.LEAW_B = self.LEAW_C = self.LEAW_U16 = None
+        self.IMM_CLEAN_SNAP = None
+        if _lea_wide_enabled():
+            self.LEAW_A = self._band("LEAW_A", 4)    # operand A bytes = BP bytes 0..3
+            self.LEAW_B = self._band("LEAW_B", 4)    # operand B bytes = (4*imm) bytes 0..3
+            self.LEAW_C = self._band("LEAW_C", 5)    # carry chain C[0]=0 .. C[4]=drop
+            self.LEAW_U16 = self._scalar("LEAW_U16")  # u16 = (4*imm) mod 2^16 scratch
+            # IMM_CLEAN_SNAP: the wide-LEA reads ``4*imm`` from the immediate; the folded
+            # path (``compile_lea_q_reduce`` + ``compile_lea_q_snap``) recomputes it EXACT
+            # from the nibble bands, but the wide path historically read the silu-recomposed
+            # ``IMM_CLEAN`` SCALAR, which at DEEP context carries a residue up to ~0.26 (the
+            # SAME class ``compile_lea_addr_nib`` documents: "even IMM_CLEAN ... carry a
+            # residue that, amplified 4x, drifts q across a cell boundary at a deep read-back")
+            # -> 4x -> ~1.0 -> a wrong LEA byte (the #854 0xFF__-BP wide-LEA divergence).
+            # This scratch holds the nearest-INTEGER snap of IMM_CLEAN so the wide operand
+            # /split blocks read a residue-FREE 4*imm.  Allocated ONLY under the wide flag.
+            self.IMM_CLEAN_SNAP = self._scalar("IMM_CLEAN_SNAP")
         # FULL 32-bit IMM: the immediate's 8 nibbles are part of the STATIC program
         # encoding (CODE_IMM_NIB[i][j], written by the overlay from the bytecode —
         # a pure re-encoding of the constant, no runtime compute), gathered at PC
@@ -1155,6 +1228,69 @@ def compile_lea_q_reduce(L, dim: int) -> Dict[str, torch.Tensor]:
     return spec
 
 
+def _fine_grained_wide_enabled() -> bool:
+    """The DOOM-PROVEN fine-grained full-32-bit config: every per-concern wide flag ON
+    EXCEPT the buggy two-limb ``C4_VM_WIDTH32`` value substrate.  DEFAULT OFF (all six
+    flags off -> golden ``069cc32f`` byte-identical).
+
+    Umbrella = ``C4_CMP32 ∧ C4_SHIFT32 ∧ C4_PC_WIDE ∧ C4_GLOBAL_ADDR32 ∧ C4_SP_WIDE ∧
+    C4_DIVMOD_SIGNED``.  This is the config that gives 7/7 signed compares, 0 CMP
+    divergences, and correct signed DIV/MOD/SHL/SHR (evidence: /tmp/c4_stage1
+    ``regcheck_doomcfg.txt`` 7/7 vs the ``C4_VM_WIDTH32``-substrate ``regcheck_*``
+    2/7 — the two-limb value substrate REGRESSES signed CMP ``GT(5,-5)→0`` /
+    ``NE(5,-5)→0`` and SHIFT because it recomposes a wide scalar with ~1e-6 residue
+    that reaches ~±1 at ~10^6-scale operands and mis-fires the sign/tie).  It is the
+    #854 Stage-2 target and the substrate the wide-LEA is now gated onto (below)."""
+    from .nibble_vm import _pc_wide_enabled, sp_wide_enabled
+    from .nibble_pure_forward import global_addr32_enabled
+    return (_cmp32_enabled() and _shift32_enabled() and _pc_wide_enabled()
+            and global_addr32_enabled() and sp_wide_enabled()
+            and _divmod_signed_enabled())
+
+
+def _lea_wide_enabled() -> bool:
+    """WIDE (full-32-bit) LEA on the CFM/lean path (#824 ``C4_LEA_WIDE`` ported into
+    the ``build_pure_forward_complete_model`` builder).  DEFAULT OFF.
+
+    The CFM LEA pipeline (dispatch ``AX = BP_LOW + 4·imm`` -> ``fold-lea`` &0xFF ->
+    ``lea-q-reduce`` -> ``lea-addr-nib`` -> ``ax-byte-nib``) UNCONDITIONALLY folds the
+    frame address to its LOW BYTE (``AX = (BP + 4·imm) & 0xFF``), regardless of the
+    wide flags — the wide-LEA branch that the UNIFIED builder carries
+    (``nibble_vm.base_dispatch_rules``: ``lea_bp = full BP if w32``, and the two-limb
+    ``AX_LO = BP + IMM_LO``) was never ported here.  So a frame-relative pointer
+    ``LEA 40`` off ``BP = 0x10000`` folds to ``0xa0`` instead of the full ``0x100a0``,
+    and any load through it reads the wrong cell.
+
+    ON the ``lea-wide`` blocks below recompute the FULL address ``AX = BP + 4·imm``
+    across all 4 bytes via a nibble-domain byte-ripple-add (every intermediate < 512 ->
+    fp32-EXACT, no wide-scalar recompose), matching the unified builder and the
+    full-address Rust c4vm32 reference.  The byte-0 result is identical to the folded
+    path (``ax-byte-nib`` already wrote AX nibbles 0,1 = ``(BP_low+4·imm)&0xFF``); the
+    wide blocks OVERWRITE AX nibbles 2..7 with bytes 1..3 of the full sum
+    (carry-propagated from byte 0), gated on OP_IS[LEA].
+
+    GATE (#854 re-gate, decoupled from the buggy substrate): the wide-LEA activates iff
+    ``C4_LEA_WIDE!=0`` AND the DOOM-PROVEN fine-grained wide set is enabled
+    (``_fine_grained_wide_enabled()``: ``C4_CMP32 ∧ C4_SHIFT32 ∧ C4_PC_WIDE ∧
+    C4_GLOBAL_ADDR32 ∧ C4_SP_WIDE ∧ C4_DIVMOD_SIGNED``).  It requires ``C4_SP_WIDE`` for
+    the full BP recompose and ``C4_GLOBAL_ADDR32`` for the wide load address to be
+    MEANINGFUL, and it must NOT require the two-limb ``C4_VM_WIDTH32`` value substrate —
+    that substrate REGRESSES signed CMP (``GT(5,-5)→0`` / ``NE(5,-5)→0``) and SHIFT
+    (see ``_fine_grained_wide_enabled``), while the fine-grained set gives 7/7 signed
+    compares and 0 CMP divergences.  This decouples the CORRECT wide-LEA from the broken
+    substrate: the folded golden path is unchanged, and the doom fine-grained config now
+    gets BOTH correct signed CMP AND the wide frame address.
+
+    OFF (the golden 069cc32f flags-off build, or any config missing a fine-grained
+    flag) the ``lea-wide`` scratch bands are never allocated and the blocks are never
+    appended, so the layout / every baked weight / the golden fingerprint are
+    byte-identical.  Kill-switch ``C4_LEA_WIDE=0`` forces the fold even under the full
+    fine-grained set (escape hatch)."""
+    if not _fine_grained_wide_enabled():
+        return False
+    return _os.environ.get("C4_LEA_WIDE", "1") != "0"
+
+
 def _lea_q_snap_enabled() -> bool:
     """The LEA_Q integer-SNAP (deep-context residue fix, #705).  DEFAULT ON.
 
@@ -1324,6 +1460,269 @@ def compile_lea_addr_nib(L, dim: int) -> Dict[str, torch.Tensor]:
                 spec["W_down"][lane, m_lo] += -val
                 spec["W_down"][lane, p_hi] += -val
                 spec["W_down"][lane, m_hi] += val
+    return spec
+
+
+# LEA immediate window: IMM_CLEAN is exact in [-2048, 2047] (CLEAN_NIBS=3), so
+# 4*imm is in [-8192, 8188].  ``LEA_IMM4_BIAS`` shifts 4*imm into the non-negative
+# range [0, 16380] so a SMALL-coefficient (<=256) staircase computes floor(4*imm/256)
+# WITHOUT the fp32-lethal 65536-scale two's-complement indicator (a 65536*[.] step's
+# ~1e-5 silu residue amplifies to ~0.8 absolute — the off-by-one seen with the naive
+# u16 form).  Every coefficient here stays <= 256, so the residue amplification is
+# < 3e-3 << 0.5 and the split is fp32-EXACT.
+_LEA_IMM4_BIAS = 8192
+_LEA_F_OFF = _LEA_IMM4_BIAS // 256          # 32 : floor((4*imm+BIAS)/256) - 32 = floor(4*imm/256)
+
+
+def compile_imm_clean_snap(L, dim: int) -> Dict[str, torch.Tensor]:
+    """WIDE LEA (C4_LEA_WIDE), pre-block: SNAP the immediate to an EXACT INTEGER in the
+    dedicated ``IMM_CLEAN_SNAP`` scratch, so the wide operand/split blocks read a
+    residue-FREE ``4*imm`` (the #854 fp32 wide-LEA fix).
+
+    ``compile_imm_clean`` reconstructs ``IMM_CLEAN`` from ``IMM_NIB`` via a TRIANGULAR
+    one-hot, which INTERPOLATES near an integer: at DEEP context the ``IMM_NIB`` nibbles
+    themselves carry a residue (the deep PC one-hot; measured ``IMM_NIB0=11.9997`` in the
+    ``_lea_q_snap`` note), so ``IMM_CLEAN`` arrives sub-integer (measured ``6.7422`` for a
+    true ``7`` in the composed doom-render path).  The wide-LEA reads ``4*imm`` from that
+    scalar -> the 4x amplifies the ~0.26 residue to ~1.0 -> the ripple-add byte crosses a
+    16-cell boundary and the model decodes the WRONG frame address (``AX=0xffeb`` where the
+    draft computes ``0xffdc``) whenever BP sits in the just-below-init ``0xFF__`` stack
+    regime (doom's SP_INIT=0x10000 frame area).  This is the SAME residue class the folded
+    path already fixes with ``compile_lea_q_snap`` (which SNAPS the ``IMM_NIB`` nibbles via
+    a SHARP half-integer-step round), but the wide path was never covered — mandelbrot /
+    minic avoid it only because they use C4_SP_INIT=0xF000 (BP above ``0xFF__``).
+
+    Fix: re-derive the immediate here with the SAME residue-immune nearest-integer round
+    ``rnd(nib) = Σ_{v=1..15} step(nib >= v-0.5)`` the folded ``compile_lea_q_snap`` uses (a
+    SHARP UNIT silu-step staircase — a nibble with residue << 0.5 sits >> 1/RELU_S from
+    every edge, so each step is a clean 0/1 and the sum is the EXACT nearest integer, unlike
+    the triangular pulse which reproduces the residue).
+
+    ``n_nib`` is FIXED at 3 (signed 12-bit, ``[-2048, 2047]``): a LEA immediate is a FRAME
+    slot offset — always tiny (id-Doom: min -26, max 9), unlike a JSR PC target — so 3
+    nibbles cover every LEA imm, and, crucially, the ``rnd`` recompose coefficient stays
+    ``<= 16^2 = 256`` (NOT ``16^3=4096``): a 4096-coefficient rnd unit amplifies the silu
+    ~1e-6 residue by ~4096 and, summed over 15 edges × several nibbles, exceeds 0.5 (the
+    off-by-one seen with a 4-nibble recompose).  With ``<= 256`` the amplified residue is
+    ``256·15·1e-6 ≈ 4e-3 << 0.5`` -> fp32-EXACT.  The signed top nibble (a SHARP step at
+    edge 7.5, coefficient ``16^3=4096=2^12`` exact — a sharp 0/1 step carries NO residue)
+    matches ``compile_imm_clean``'s ``a-16`` convention so ``IMM_CLEAN_SNAP`` equals
+    ``round(IMM_CLEAN)`` for every LEA immediate.  LEA-gated (0 on non-LEA -> byte-identical
+    off-LEA; and the whole block only exists under the wide flag, so the golden flag-OFF
+    layout / hash is untouched)."""
+    g = L.OP_IS + isa.LEA
+    dst = L.IMM_CLEAN_SNAP
+    n_nib = 3                                          # signed 12-bit: covers every LEA imm,
+    top = n_nib - 1                                    # keeps rnd coeff <= 16^2=256 (fp32-safe)
+    edges = [v - 0.5 for v in range(1, 16)]            # 15 half-integer edges per nibble
+    # units: n_nib * (15 edges * 2 relu) + 1 self-clear.
+    spec = _empty_spec(dim, n_nib * (len(edges) * 2) + 1)
+    u = 0
+    step_base = {}
+    for j in range(n_nib):
+        step_base[j] = {}
+        for e in edges:
+            base = u
+            for jj in range(2):                        # step(nib>=e) = silu(z)-silu(z-1)
+                spec["W_up"][u, L.IMM_NIB + j] = RELU_S
+                spec["b_up"][u] = -RELU_S * e - (0.0 if jj == 0 else 1.0)
+                spec["W_gate"][u, g] = 1.0             # gate on LEA -> 0 off-LEA
+                u += 1
+            step_base[j][e] = base
+    # SET: self-clear IMM_CLEAN_SNAP (gated on LEA) so recurrent steps are idempotent.
+    spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+    spec["W_gate"][u, dst] = 1.0
+    spec["W_down"][dst, u] += -1.0 / SILU_HALF; u += 1
+    # recompose the SIGNED integer: dst += Σ_j 16^j · rnd(IMM_NIB[j]); the TOP nibble is
+    # SIGNED (subtract 16·16^top when nib_top >= 8), matching compile_imm_clean's a-16.
+    base = 1
+    for j in range(n_nib):
+        for e in edges:                                # rnd(nib) = Σ_v step(nib>=v-0.5)
+            p, m = step_base[j][e], step_base[j][e] + 1
+            spec["W_down"][dst, p] += float(base)      # +step -> +1 per crossed edge
+            spec["W_down"][dst, m] += -float(base)     # -step (silu@e-1) -> UNIT step
+        base *= 16
+    # two's-complement sign of the TOP nibble: subtract 16^n_nib when nib_top >= 8 (i.e.
+    # the top nibble's edge-7.5 step is ON).  base is now 16^n_nib (=4096, a 2^12 SHARP-step
+    # coefficient -> exact 0/1, no residue).
+    p, m = step_base[top][7.5], step_base[top][7.5] + 1
+    spec["W_down"][dst, p] += -float(base)
+    spec["W_down"][dst, m] += float(base)
+    return spec
+
+
+def compile_lea_wide_operands(L, dim: int) -> Dict[str, torch.Tensor]:
+    """WIDE LEA, block 1/3 (C4_LEA_WIDE): set operand A = BP bytes and the SIGNED
+    ``f = floor(4*imm / 256)`` scratch (the low addend split runs the next block),
+    LEA-gated (every band 0 on a non-LEA op -> byte-identical off-LEA).
+
+      LEAW_A[i] = BP byte i = BP_nib[2i] + 16*BP_nib[2i+1]   (i=0..3, clean nibbles)
+      LEAW_U16  = f = floor(4*imm / 256)  in [-32, 31]  (signed; computed via the
+                  bias-shifted small-coefficient staircase, see ``_LEA_IMM4_BIAS``).
+
+    ``4*imm`` from the EXACT-INTEGER ``IMM_CLEAN_SNAP`` (``compile_imm_clean_snap`` snaps
+    the deep-context IMM residue to the nearest integer — the #854 wide-LEA fix; without it
+    the raw silu-recomposed ``IMM_CLEAN`` scalar's ~0.26 residue is amplified 4x and the
+    frame byte crosses a cell edge in the ``0xFF__`` BP regime); |4*imm| <= 8188.  The two
+    low addend bytes (B0/B1) and the sign-fill bytes (B2/B3) are finished in
+    ``compile_lea_wide_split`` from this f + 4*imm, all with coefficients <= 256
+    (fp32-EXACT — no 65536-scale indicator)."""
+    g = L.OP_IS + isa.LEA
+    a, f = L.LEAW_A, L.LEAW_U16
+    imm4b = {L.IMM_CLEAN_SNAP: 4.0, L.ONE: float(_LEA_IMM4_BIAS)}   # (4*imm + BIAS) in [0,16380]
+    spec = _empty_spec(dim, 4 * 2 + 2 + 64 * 2)
+    u = 0
+
+    def clear(band):
+        nonlocal u
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, band] = 1.0
+        spec["W_down"][band, u] += -1.0 / SILU_HALF; u += 1
+
+    def add_lin(terms, const, band, scale):
+        nonlocal u
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        for bd, c in terms.items():
+            spec["W_gate"][u, bd] += c
+        spec["b_gate"][u] += const
+        spec["W_down"][band, u] += scale / SILU_HALF; u += 1
+
+    def floor_div_ge(terms, m, kmax, band, scale):    # band += scale*floor((terms)/m)
+        nonlocal u
+        for k in range(1, kmax + 1):
+            c, w = k * m - 0.5, 0.2
+            for tt, tc in ((c - w, scale), (c, -scale)):
+                for bd, cf in terms.items():
+                    spec["W_up"][u, bd] += RELU_S * cf
+                spec["b_up"][u] += -RELU_S * tt
+                spec["W_gate"][u, g] = 1.0
+                spec["W_down"][band, u] += tc / (RELU_S * w); u += 1
+
+    # A[i] = BP byte i (clean BP nibbles).
+    for i in range(4):
+        clear(a + i)
+        add_lin({L.BP + 2 * i: 1.0, L.BP + 2 * i + 1: 16.0}, 0.0, a + i, 1.0)
+    # f = floor(4*imm/256) = floor((4*imm+BIAS)/256) - BIAS/256.  (4*imm+BIAS) in [0,16380]
+    # -> floor <= 63 (kmax=64).  All coefficients <= 256 -> fp32-exact.
+    clear(f)
+    add_lin({L.ONE: 1.0}, 0.0, f, -float(_LEA_F_OFF))          # - 32
+    floor_div_ge(imm4b, 256, 64, f, 1.0)                      # + floor((4*imm+BIAS)/256)
+    return spec
+
+
+def compile_lea_wide_split(L, dim: int) -> Dict[str, torch.Tensor]:
+    """WIDE LEA, block 2/3 (C4_LEA_WIDE): finish the SIGN-EXTENDED addend bytes from
+    ``4*imm`` and the signed ``f = floor(4*imm/256)`` scratch (computed the previous
+    block), LEA-gated.  All coefficients <= 256 (fp32-EXACT):
+
+        neg     = [4*imm < 0] = [f < 0]                       (sharp 0/1 step)
+        LEAW_B0 = 4*imm - 256*f          in [0, 255]          (low byte)
+        LEAW_B1 = f + 256*neg            in [0, 255]          (second byte, two's-compl)
+        LEAW_B2 = LEAW_B3 = 255*neg      (sign fill: 0x00 for imm>=0, 0xFF for imm<0)
+    """
+    g = L.OP_IS + isa.LEA
+    b, f = L.LEAW_B, L.LEAW_U16
+    imm4 = {L.IMM_CLEAN_SNAP: 4.0}   # #854: EXACT-INTEGER 4*imm (residue-free, see snap block)
+    spec = _empty_spec(dim, 3 + 2 + 2 + 2 * 2 + 2 * 3)
+    u = 0
+
+    def clear(band):
+        nonlocal u
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, band] = 1.0
+        spec["W_down"][band, u] += -1.0 / SILU_HALF; u += 1
+
+    def add_lin(terms, const, band, scale):
+        nonlocal u
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        for bd, c in terms.items():
+            spec["W_gate"][u, bd] += c
+        spec["b_gate"][u] += const
+        spec["W_down"][band, u] += scale / SILU_HALF; u += 1
+
+    def step_lt0(terms, band, scale):              # band += scale*[form < 0] = scale*(1-[form>=0])
+        nonlocal u
+        add_lin({L.ONE: 1.0}, 0.0, band, scale)    # + scale
+        c, w = -0.5, 0.2                           # [form >= 0] ramp at -0.5
+        for k, t in enumerate((c - w, c)):
+            for bd, cf in terms.items():
+                spec["W_up"][u, bd] += RELU_S * cf
+            spec["b_up"][u] += -RELU_S * t
+            spec["W_gate"][u, g] = 1.0
+            spec["W_down"][band, u] += (-scale if k == 0 else scale) / (RELU_S * w)
+            u += 1
+
+    # B0 = 4*imm - 256*f  (f = floor(4*imm/256), so this is 4*imm mod 256 in [0,255]).
+    clear(b + 0)
+    add_lin(imm4, 0.0, b + 0, 1.0)                 # + 4*imm
+    add_lin({f: 1.0}, 0.0, b + 0, -256.0)          # - 256*f
+    # B1 = f + 256*neg   (neg = [4*imm<0]; f in [-32,31] -> B1 in [0,255]).
+    clear(b + 1)
+    add_lin({f: 1.0}, 0.0, b + 1, 1.0)             # + f
+    step_lt0(imm4, b + 1, 256.0)                   # + 256*[4*imm<0]
+    # B2 = B3 = 255*neg  (sign fill).
+    for hb in (b + 2, b + 3):
+        clear(hb)
+        step_lt0(imm4, hb, 255.0)
+    return spec
+
+
+def compile_lea_wide_byte(L, dim: int, i: int) -> Dict[str, torch.Tensor]:
+    """WIDE LEA, byte ``i`` of the ripple ADD ``AX = BP + 4*imm`` (C4_LEA_WIDE),
+    LEA-gated.  ONE block per byte (like the ALU add chain) because the carry lane
+    ``LEAW_C[i+1]`` written here is READ as ``LEAW_C[i]`` by the NEXT byte's block —
+    the carry ripples through the residual across blocks (a unit only sees the block
+    INPUT, so producer and consumer must be different blocks).
+
+        sum_i = A[i] + B[i] + carry_i        (carry_0 = 0)
+        AX_nib[2i]   = sum_i mod 16
+        AX_nib[2i+1] = floor(sum_i/16) mod 16
+        LEAW_C[i+1]  = [sum_i >= 256]         (carry-out)
+    Every sum_i < 512 -> fp32-EXACT.  SET (clears each dst first), gated on OP_IS[LEA]
+    so a non-LEA op is untouched (byte-identical off-LEA)."""
+    g = L.OP_IS + isa.LEA
+    a, b, cc = L.LEAW_A, L.LEAW_B, L.LEAW_C
+    spec = _empty_spec(dim, 200)
+    u = 0
+    terms = {a + i: 1.0, b + i: 1.0}
+    if i > 0:
+        terms[cc + i] = 1.0                         # + carry_in from previous byte's block
+
+    def clear(band):
+        nonlocal u
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, band] = 1.0
+        spec["W_down"][band, u] += -1.0 / SILU_HALF; u += 1
+
+    def step_ge(thr, band, scale):                  # band += scale*[sum >= thr]
+        nonlocal u
+        c, w = thr - 0.5, 0.2
+        for k, t in enumerate((c - w, c)):
+            for bd, cf in terms.items():
+                spec["W_up"][u, bd] += RELU_S * cf
+            spec["b_up"][u] += -RELU_S * t
+            spec["W_gate"][u, g] = 1.0
+            spec["W_down"][band, u] += (scale if k == 0 else -scale) / (RELU_S * w)
+            u += 1
+
+    def floor_div(m, kmax, band, scale):            # band += scale*floor(sum/m)
+        for k in range(1, kmax + 1):
+            step_ge(k * m, band, scale)
+
+    # carry-out first (needed for the next byte): [sum >= 256]
+    clear(cc + i + 1)
+    step_ge(256, cc + i + 1, 1.0)
+    # low nibble = sum - 16*floor(sum/16)   (sum in [0,511])
+    clear(L.AX + 2 * i)
+    for bd, cf in terms.items():                    # + sum
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, bd] = cf
+        spec["W_down"][L.AX + 2 * i, u] += 1.0 / SILU_HALF; u += 1
+    floor_div(16, 32, L.AX + 2 * i, -16.0)
+    # high nibble = floor(sum/16) - 16*floor(sum/256)
+    clear(L.AX + 2 * i + 1)
+    floor_div(16, 32, L.AX + 2 * i + 1, 1.0)
+    floor_div(256, 2, L.AX + 2 * i + 1, -16.0)
     return spec
 
 
@@ -1691,7 +2090,7 @@ def build_pure_forward_complete_model(code_size: int = 32,
         # PART A: build the muxed read address + merged enable BEFORE the merged head.
         block_specs.append(("unify-cam-prep", compile_unify_cam_prep(L, dim)))
     block_specs += [
-        ("stack-pop-cam", compile_stk_recompose(L, dim)),        # ATTN=stack+lev(+merged) heads
+        ("stack-pop-cam", compile_stk_recompose(L, dim, hi_nibbles=_bp_restore_hibyte_nibs())),  # ATTN=stack+lev(+merged) heads
     ]
     if _unify:
         # PART A: demux the merged-head value -> AX (load) / STACK0 (pop) + AX_VAL recompose.
@@ -1699,13 +2098,15 @@ def build_pure_forward_complete_model(code_size: int = 32,
         # PART A fix: re-recompose STK_VAL from the demux-updated STACK0 (the demux
         # wrote STACK0 one block AFTER stack-pop-cam's stale STK_VAL recompose).  LEV
         # reads STK_VAL for BP=MEM[BP]; without this a nested LEV sets BP=0.
-        block_specs.append(("unify-stk-recompose", compile_unify_stk_recompose(L, dim)))
+        block_specs.append(("unify-stk-recompose",
+                            compile_unify_stk_recompose(L, dim, hi_nibbles=_bp_restore_hibyte_nibs())))
     if _one:
         # PART A+ (C4_UNIFY_CAM_ONE): the SECOND cam block.  The SAME merged head INDEX
         # re-fires here with query=LEV_QRY_BIN (BP+4), enable=IS_LEV -> LEV_RET; its FFN
         # recomposes LEV_RET_VAL.  This is LEV's SECOND read (the return PC) on the SAME
         # head as the first (MEM[BP]) — one head index, two sequential blocks.
-        block_specs.append(("lev-cam2", compile_lev_ret_recompose(L, dim)))
+        block_specs.append(("lev-cam2",
+                            compile_lev_ret_recompose(L, dim, hi_nibbles=_bp_restore_hibyte_nibs())))
     # LC SIGNED CHAR (c4 ``a = *(char *)a``): after the §Memory read has laid the
     # loaded byte into AX, sign-extend it for LC (byte >= 0x80 -> negative char ->
     # AX nibbles 2..7 filled with 0xF).  Two blocks: detect (LC_SIGN) then fill.  LI
@@ -1864,6 +2265,25 @@ def build_pure_forward_complete_model(code_size: int = 32,
         # (corpus values up to ~10000) survive into the canonical AX nibble band.
         ("imm-ax-nib", compile_imm_ax_nibbles(L, dim)),
     ]
+    if _lea_wide_enabled():
+        # WIDE LEA (C4_LEA_WIDE, #824 ported): overwrite the folded byte-0-only AX with
+        # the FULL 32-bit frame address ``AX = BP + 4*imm`` via a nibble-domain
+        # byte-ripple ADD (operands -> low-byte split -> 4 per-byte add blocks).  Runs
+        # AFTER ``ax-byte-nib`` (which wrote the folded byte 0); byte 0 is re-derived
+        # identically here and bytes 1..3 are widened.  All LEA-gated -> non-LEA ops
+        # untouched.  Flag OFF -> none of these blocks exist -> golden 069cc32f build
+        # byte-identical.
+        block_specs += [
+            # #854: SNAP the deep-context IMM residue to an exact integer BEFORE the wide
+            # operand/split blocks read 4*imm (the raw silu-recomposed IMM_CLEAN scalar's
+            # ~0.26 residue is amplified 4x and mis-fires a frame-byte cell in the 0xFF__ BP
+            # regime).  LEA-gated; runs immediately before lea-wide-operands.
+            ("imm-clean-snap", compile_imm_clean_snap(L, dim)),
+            ("lea-wide-operands", compile_lea_wide_operands(L, dim)),  # A=BP bytes, B2/B3, u16
+            ("lea-wide-split", compile_lea_wide_split(L, dim)),        # B0=u16%256, B1=u16//256
+        ]
+        block_specs += [(f"lea-wide-b{i}", compile_lea_wide_byte(L, dim, i))
+                        for i in range(4)]                             # ripple add -> AX nibbles
     n_blocks = len(block_specs)
     # ---- application order (recurrence) ----------------------------------
     # The model STORES ``n_blocks`` distinct blocks but APPLIES them in
@@ -2313,8 +2733,41 @@ def _overlay_pf_code_frames(x, L, code: List[isa.Instr], base_pos: int = 1,
             x[row, p, L.CODE_IMM_NIB_MEM + j] = float(nv)
 
 
+def _overlay_pf_runtime_code_frames(x, L, runtime_frames, base_pos: int = 1,
+                                    row: int = 0) -> int:
+    """RUNTIME (EMIT-emitted) code frames on the DIRECT-CAM path.
+
+    ``runtime_frames`` maps ``addr -> Instr`` for every instruction the running
+    program produced with ``isa.EMIT`` at a code ADDRESS that is NOT one of the
+    original ``1..len(code)`` positional rows (i.e. a HIGH address, up to
+    ``2^CODE_ADDR_BITS``).  Each is written as ONE COMPACT physical code-frame row
+    (KEY = ``CODE_KEY_BIN`` = bits(addr), VALUE = op + imm nibbles, IS_CODE=1) —
+    the physical row index is independent of the (possibly huge) logical address:
+    the fetch@PC CAM (``_bake_code_cam_head``, ALiBi slope 0) matches PURELY on the
+    ``CODE_ADDR_BITS``-wide address key, so a frame keyed bits(440000) resolves
+    fetch@PC=440000 at a compact row with NO positional decay.  THIS is what lifts
+    the RoPE ~12-16-bit ceiling: the address key rides the position-invariant
+    direct-CAM lanes, not the slow rotary ones.  Returns the number of rows written."""
+    Sn = x.shape[1]
+    n = 0
+    for addr, ins in runtime_frames.items():
+        p = base_pos + n
+        if p >= Sn:
+            break
+        x[row, p, L.IS_CODE] = 1.0
+        x[row, p, L.IS_FRAME_BYTE] = 0.0
+        for b in range(CODE_ADDR_BITS):
+            x[row, p, L.CODE_KEY_BIN + b] = float((addr >> b) & 1)
+        x[row, p, L.CODE_OPV] = float(ins.op)
+        for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
+            x[row, p, L.CODE_IMM_NIB_MEM + j] = float(nv)
+        n += 1
+    return n
+
+
 def make_overlay_complete(code: List[isa.Instr], L: PureForwardCompleteLayout,
-                          store_log=None, frame_start: int = None):
+                          store_log=None, frame_start: int = None,
+                          runtime_frames=None, code_rows: int = None):
     """``overlay(x)`` writes the program into the DATA bands at every position, the
     ROLE/IS_FRAME_BYTE frame-slot tags, and turns each stored frame's MEM token
     into a KV entry.  ``store_log`` maps ``frame_idx -> (addr, val)`` for every
@@ -2323,11 +2776,29 @@ def make_overlay_complete(code: List[isa.Instr], L: PureForwardCompleteLayout,
     CODE-FROM-MEMORY (C4_PF_CFM): the program lives in the KV as CODE frames on the
     positions ``1 .. 1+len(code)`` (not in the per-position DATA bands), so the first
     register/store frame begins at ``frame_start = 1 + len(code)``.  ``frame_start``
-    defaults to ``1`` (baked path, byte-identical) or ``1+len(code)`` under cfm."""
+    defaults to ``1`` (baked path, byte-identical) or ``1+len(code)`` under cfm.
+
+    ``runtime_frames`` (in-transformer JIT, ``C4_CFM_EMIT``): an ``{addr -> Instr}``
+    map of instructions the running program produced with ``isa.EMIT`` at a HIGH code
+    address (past the ``1..len(code)`` positional rows).  They are overlaid as COMPACT
+    address-keyed code frames right after the positional code rows — one physical row
+    per distinct high address, keyed bits(addr) on the position-invariant direct-CAM
+    lanes — so a HIGH-address emit stays fetchable with NO positional decay.  The
+    register frames then begin AFTER these runtime rows (``frame_start`` moves past
+    ``1 + len(code) + len(runtime_frames)``)."""
     store_log = store_log or {}
+    runtime_frames = runtime_frames or {}
     from .blogspec_layout import NIB_PER_REG
     _cfm = getattr(L, "cfm", False)
-    fstart = frame_start if frame_start is not None else (1 + len(code) if _cfm else 1)
+    # ``code_rows`` = how many POSITIONAL code rows exist physically (defaults to
+    # len(code)).  Under EMIT, ``code`` (= run_code) may GROW past the reserved
+    # positional rows for a high-address emit — those high entries live in
+    # ``runtime_frames`` as compact address-keyed rows, NOT positional ones — so the
+    # positional overlay is capped at ``code_rows`` (the original program length).
+    _n_pos = code_rows if code_rows is not None else len(code)
+    _n_rt = len(runtime_frames) if _cfm else 0
+    fstart = (frame_start if frame_start is not None
+              else (1 + _n_pos + _n_rt if _cfm else 1))
 
     def overlay(x: torch.Tensor) -> None:
         Sn = x.shape[1]
@@ -2347,7 +2818,15 @@ def make_overlay_complete(code: List[isa.Instr], L: PureForwardCompleteLayout,
             # CODE_KEY_BIN=bits(addr i), CODE_OPV=op, CODE_IMM_NIB_MEM=imm nibbles.
             # The fetch@PC query (IS_FETCH/CODE_QRY_BIN) is set by the pc-fetch FFN
             # from the PC register — not here.  (Guarded to the available leading rows.)
-            _overlay_pf_code_frames(x, L, code, base_pos=1)
+            _overlay_pf_code_frames(x, L, code[:_n_pos], base_pos=1)
+            # RUNTIME (EMIT) code frames: compact address-keyed rows for HIGH-address
+            # emits, right after the positional code rows.  The fetch@PC CAM matches on
+            # the CODE_ADDR_BITS-bit address key alone (ALiBi slope 0), so their
+            # physical row is position-invariant -> a 440000-address emit fetches at a
+            # compact row with no positional decay.
+            if runtime_frames:
+                _overlay_pf_runtime_code_frames(x, L, runtime_frames,
+                                                base_pos=1 + _n_pos)
         pos = fstart
         frame_idx = 0
         while pos + V.FRAME_LEN <= Sn:
@@ -2573,6 +3052,205 @@ def run_pure_forward_complete(model, L: PureForwardCompleteLayout,
     if collect_tokens:
         return trace, stream
     return trace
+
+
+def run_pure_forward_complete_emit(model, L: PureForwardCompleteLayout,
+                                   code: List[isa.Instr], max_steps: int = 512,
+                                   verbose: bool = False, seed_mem=None,
+                                   mask: int = 0xFF, n_rt_pool: int = 32):
+    """DIRECT-CAM in-transformer JIT: ``run_pure_forward_complete`` + ``isa.EMIT``.
+
+    Same APPEND-ONLY pure-forward step (one ``model.forward`` per VM step, state read
+    from the register CAM at the latest frame, the store log persistent), but
+    ``isa.EMIT`` is serviced as a DRIVER control op (no FFN dispatch rule) exactly as
+    JSR/ENT/LEV are: the model FETCHES the EMIT instruction from the code CAM (proving
+    fetch@PC serves runtime-appended frames), the register CAM reconstructs the input
+    state, and the driver reads the produced word off the model-reconstructed INPUT
+    registers (op<-AX, imm<-STACK0), writes it into a private mutable code copy
+    ``run_code[target]`` AND — when ``target`` is a HIGH address past the
+    ``1..len(code)`` positional rows — into ``runtime_frames``, a COMPACT
+    ``{addr -> Instr}`` map overlaid as address-keyed code frames on the
+    position-invariant direct-CAM lanes.
+
+    THE CEILING LIFT: the fetch@PC CAM (``_bake_code_cam_head``, ALiBi slope 0,
+    ``CODE_ADDR_BITS`` wide) matches on the ``CODE_ADDR_BITS``-bit address key ALONE,
+    so a runtime frame keyed bits(440000) resolves fetch@PC=440000 at a COMPACT
+    physical row with NO positional decay — the RoPE ~12-16-bit ceiling (slow rotary
+    lanes) is lifted to the full ``CODE_ADDR_BITS`` range.  ``n_rt_pool`` compact
+    runtime code-frame rows are RESERVED up-front (right after the positional code
+    rows) so the append-only frame geometry stays stable as EMIT fills them.
+
+    Same-address re-emit OVERWRITES the slot (``run_code`` in place; ``runtime_frames``
+    is a dict) -> latest-write-wins by CONSTRUCTION (one frame per address), so no CAM
+    recency tiebreak is needed — the SAME contract 8e6946e7 used on the RoPE path.
+
+    Returns ``{"ax_trace", "ref_trace", "exact", "steps", "produced_code",
+    "runtime_frames", "max_emit_addr"}``.  ``ref_trace`` is ``isa.interpret`` (the c4
+    oracle) over the initial ``code`` with the ``seed_mem`` data segment preloaded."""
+    if not _cfm_emit_enabled():
+        raise RuntimeError("run_pure_forward_complete_emit requires C4_CFM_EMIT=1")
+    if not getattr(L, "cfm", False):
+        raise RuntimeError("EMIT needs the CFM (C4_PF_CFM=1) direct-CAM code path")
+
+    mem_init = dict(seed_mem or {})
+    ref_trace = isa.interpret(list(code), max_steps=max_steps, mem_init=mem_init or None)
+
+    # PRE-SEED the data §Memory (the "input file" a loaded compiler reads via LI/LC)
+    # as leading STORE frames — the same seed-frame mechanism the read-only path uses.
+    seed_frames, store_log = _seed_frames(seed_mem or {})
+    n_seed = len(store_log)
+    init_frame = _build_frame(0, 0, SP_INIT, SP_INIT, 0)
+
+    n_code = len(code)                             # positional code rows never shrink
+    # STREAM (append-only): BOS | code rows | RESERVED runtime code rows | seed data
+    # frames | init frame | ... step frames.  The reserved runtime rows are neutral MEM
+    # tokens until EMIT fills them (the overlay writes IS_CODE + bits(addr) into the
+    # used ones); reserving them up-front keeps every later position STABLE across
+    # steps (the register CAM latest-write-wins; the store CAM persistent).
+    code_frame_toks: List[int] = ([V.MEM] * n_code + [V.MEM] * n_rt_pool)
+    stream: List[int] = [V.BOS] + code_frame_toks + seed_frames + init_frame
+
+    run_code = list(code)                          # mutable positional code (low-addr)
+    runtime_frames: Dict[int, isa.Instr] = {}      # HIGH-address emits: addr -> Instr
+    # A HIGH-address emit lives ONLY in ``runtime_frames`` (a compact dict), never in a
+    # giant ``run_code`` list — the direct-CAM address key decouples logical address
+    # from physical row, so a 2^20 target costs one dict slot + one KV row, not 2^20
+    # list entries.  ``_fetch`` mirrors the model's code CAM: positional rows for
+    # addr < n_code, the runtime dict for high addrs (else NOP == "no such frame").
+    def _fetch(pc: int) -> isa.Instr:
+        if 0 <= pc < len(run_code):
+            return run_code[pc]
+        return runtime_frames.get(pc, isa.Instr(isa.NOP, 0))
+
+    def _reachable(pc: int) -> bool:
+        return (0 <= pc < len(run_code)) or (pc in runtime_frames)
+
+    trace: List[int] = []
+    cur_pc = 0
+    cur_sp = cur_bp = SP_INIT
+    cur_ax = 0
+    frame_idx = n_seed
+    max_emit_addr = -1
+
+    for _ in range(max_steps):
+        if len(runtime_frames) > n_rt_pool:
+            raise RuntimeError(f"EMIT produced {len(runtime_frames)} runtime frames "
+                               f"> reserved pool {n_rt_pool}; raise n_rt_pool")
+        overlay = make_overlay_complete(run_code, L, store_log=store_log,
+                                        runtime_frames=runtime_frames,
+                                        code_rows=n_code,
+                                        frame_start=1 + n_code + n_rt_pool)
+        toks = torch.tensor([stream])
+        with torch.no_grad():
+            x = model.embed[toks].clone()
+            overlay(x)
+            for blk in model.blocks:
+                x = blk(x)
+        state = x[0, -1]
+
+        ins = _fetch(cur_pc)
+        op, imm = ins.op, ins.imm
+        pc = _snap_lane(state[L.PC_VAL])
+        sp = _snap_lane(state[L.SP_VAL])
+        bp = _snap_lane(state[L.BP_VAL])
+        stk = _snap_lane(state[L.STK_VAL])
+        halted = float(state[L.HALTED]) > 0.5
+        ax = _decode_reg_from_nibbles(state, L, L.AX)
+
+        # HIGH-ADDRESS CONTROL FLOW (driver bookkeeping, keeps the model build byte-
+        # identical to golden 069cc32f): a JMP/BZ/BNZ TARGET rides the fetched
+        # instruction's immediate (IMM_CLEAN), whose SIGNED nibble width is sized for
+        # the corpus code_size — a target above that range folds in the model's PC
+        # decode (a 4096-target -> 0).  The BRANCH DECISION is the model's (its AX
+        # predicate + PC transition are correct); only the target VALUE needs the wide
+        # immediate.  So the driver recomputes the taken target from the fetched imm
+        # (exactly as it already derives EMIT's target + store addresses from the
+        # fetched instruction) — no model weight changes, so C4_CFM_EMIT stays golden.
+        # The model still FETCHES the branch instruction from the code CAM and computes
+        # AX; this only widens the driver's PC bookkeeping past IMM_CLEAN's range.
+        if op == isa.JMP:
+            pc = imm & ((1 << CODE_ADDR_BITS) - 1)
+        elif op == isa.BZ:
+            pc = (imm & ((1 << CODE_ADDR_BITS) - 1)) if (ax & mask) == 0 else (cur_pc + 1)
+        elif op == isa.BNZ:
+            pc = (imm & ((1 << CODE_ADDR_BITS) - 1)) if (ax & mask) != 0 else (cur_pc + 1)
+
+        # ---- EMIT: driver-serviced control op (no FFN rule) --------------------
+        # The model FETCHED this EMIT from the code CAM; the register CAM reconstructed
+        # AX + STACK0.  op<-AX, imm<-STACK0(popped); target = EMIT imm.  We use the
+        # PRE-step (driver-tracked) registers for the produced word — the driver-service
+        # contract 8e6946e7 uses (the model's PC/AX for the EMIT row itself are the
+        # control op's, not a computed transition).
+        if op == isa.EMIT:
+            produced_op = cur_ax & 0xFF            # AX rides the produced op
+            produced_imm = _mem_top(store_log, cur_sp) & 0xFF   # STACK0 rides imm
+            target = imm
+            produced = isa.Instr(produced_op, produced_imm)
+            if target < n_code:                    # LOW addr -> positional row (in place)
+                while target >= len(run_code):
+                    run_code.append(isa.Instr(isa.NOP, 0))
+                run_code[target] = produced
+            else:                                  # HIGH addr -> position-invariant frame
+                runtime_frames[target] = produced  # latest-write-wins (dict compaction)
+                max_emit_addr = max(max_emit_addr, target)
+            # EMIT pops the immediate it consumed off the KV-backed stack: drop the
+            # LATEST (highest frame_idx == the current top-of-stack, latest-write-wins)
+            # store frame at MEM[cur_sp], SP += 4 (the pop).
+            _pop_fi = None
+            for fi in sorted(store_log):
+                if fi > n_seed and store_log[fi][0] == cur_sp:
+                    _pop_fi = fi
+            if _pop_fi is not None:
+                del store_log[_pop_fi]
+            new_sp = (cur_sp + 4) & 0xFFFFFFFF
+            new_pc = cur_pc + 1
+            trace.append(cur_ax & mask)
+            # the EMIT step still emits a (neutral) frame so the stream stays a clean
+            # frame grid: PC advances by one, registers otherwise unchanged.
+            frame_idx += 1
+            stream += _build_frame(new_pc, cur_ax, new_sp, cur_bp, 0)
+            if verbose:
+                print(f"  step pc={cur_pc} op=EMIT -> code[{target}]="
+                      f"({isa.NAMES.get(produced_op, produced_op)} {produced_imm}) "
+                      f"pc={new_pc} (runtime_frame={target >= n_code})", flush=True)
+            cur_pc, cur_sp = new_pc, new_sp
+            # cur_ax/cur_bp unchanged by EMIT.
+            if not _reachable(cur_pc):
+                break
+            continue
+
+        # store bookkeeping (same SI store contract as run_pure_forward_complete).
+        s_addr = s_val = 0
+        is_store = False
+        if op in (isa.SI, isa.SC):
+            is_store = True; s_addr = _mem_top(store_log, cur_sp); s_val = ax & mask
+        elif op == isa.PSH:
+            is_store = True; s_addr = cur_sp - 4; s_val = ax & mask
+        elif op == isa.JSR:
+            is_store = True; s_addr = cur_sp - 4; s_val = (cur_pc + 1) & 0xFFFFFFFF
+        elif op == isa.ENT:
+            is_store = True; s_addr = cur_sp - 4; s_val = cur_bp & 0xFFFFFFFF
+        frame = _build_frame(pc, ax, sp, bp, stk,
+                             mem_addr=(s_addr if is_store else 0),
+                             mem_val=(s_val if is_store else 0))
+        trace.append(ax & mask)
+        frame_idx += 1
+        if is_store:
+            store_log[frame_idx] = (s_addr, s_val)
+        stream += frame
+        if verbose:
+            print(f"  step pc={cur_pc} op={isa.NAMES.get(op, op):4s} -> "
+                  f"pc'={pc} ax={ax & 0xFF} sp={sp} bp={bp} stk={stk} "
+                  f"store={'Y' if is_store else '.'}@{s_addr}={s_val} halt={halted}",
+                  flush=True)
+        cur_pc, cur_sp, cur_bp, cur_ax = pc, sp, bp, ax
+        if halted or not _reachable(pc):
+            break
+
+    return {"ax_trace": trace, "ref_trace": ref_trace,
+            "exact": trace == ref_trace, "steps": len(trace),
+            "produced_code": run_code, "runtime_frames": dict(runtime_frames),
+            "max_emit_addr": max_emit_addr}
 
 
 def _decode_reg_from_nibbles(state: torch.Tensor, L, reg_base: int) -> int:

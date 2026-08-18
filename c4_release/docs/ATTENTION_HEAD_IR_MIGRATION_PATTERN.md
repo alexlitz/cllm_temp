@@ -233,7 +233,7 @@ into the IR's `metadata` block in Wave 6.
 6. **Byte-identity gate via `compare_symbolic_to_lowered_attn`** (Wave
    1D will land the tool — until then use
    `verify_attention_head(ops_for_competition=...)` from
-   [`attention_verifier.py:462`](../neural_vm/unified_compiler/attention_verifier.py),
+   [`attention_verifier.py:462`](../neural_vm/verification/attention_verifier.py),
    plus a diff of `attn.W_*` against the pre-migration baseline). Run
    per query position. Any non-zero diff aborts the migration: revert
    and identify whether the imperative bake had a hidden side-effect

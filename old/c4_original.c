@@ -343,7 +343,7 @@ int main(int argc, char **argv)
 
   if ((fd = open(*argv, 0)) < 0) { printf("could not open(%s)\n", *argv); return -1; }
 
-  poolsz = 256*1024; // arbitrary size
+  poolsz = 256*1024; // rswier default (#855: reverted the temporary 512*1024 bump). The bump only served the 8-byte-int transpile.c self-host (not on this branch); the standard is a 4-byte int cell, under which the emit halves and 256KB is sufficient. Arena sizing is output-neutral — identical emission/execution for any program that fits.
   if (!(sym = malloc(poolsz))) { printf("could not malloc(%d) symbol area\n", poolsz); return -1; }
   if (!(le = e = malloc(poolsz))) { printf("could not malloc(%d) text area\n", poolsz); return -1; }
   if (!(data = malloc(poolsz))) { printf("could not malloc(%d) data area\n", poolsz); return -1; }

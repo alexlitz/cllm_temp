@@ -312,7 +312,7 @@ def global_addr32_enabled() -> bool:
     matched at the low byte; the high bits they now also query are the SAME on the
     store key)."""
     import os
-    return os.environ.get("C4_GLOBAL_ADDR32", "0") not in ("0", "", "false", "False")
+    return os.environ.get("C4_GLOBAL_ADDR32", "1") not in ("0", "", "false", "False")
 
 
 # ===========================================================================
