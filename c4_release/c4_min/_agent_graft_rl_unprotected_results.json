@@ -1,0 +1,1398 @@
+{
+  "host": "Qwen/Qwen2.5-0.5B-Instruct",
+  "device": "cpu",
+  "optimizer": "sgd",
+  "reward_bs": 64,
+  "w_read_init": 4.0,
+  "host_params": 494032768,
+  "temp": 30.0,
+  "margin_m": 0.5,
+  "ref_914": {
+    "optimizer": "adamw",
+    "shared_dim_break_lr": 0.003,
+    "held_le_lr": 0.001,
+    "note": "#914 (AdamW): broke at lr 3e-3 (13%%), margin negative; only FREEZE bulletproof; host LM grad through the shared RESULT dim overwhelms the margin term. This run re-derives the shared/agnostic break WITHIN its optimizer as the in-experiment #914-repro baseline."
+  },
+  "construction_shared": {
+    "ok": 320,
+    "n": 320,
+    "min_margin": 0.9999999999998128,
+    "per_op": {
+      "ADD": "40/40",
+      "SUB": "40/40",
+      "CMP_LT": "40/40",
+      "CMP_EQ": "40/40",
+      "CMP_GT": "40/40",
+      "LI": "40/40",
+      "SI": "40/40",
+      "DIV": "40/40"
+    }
+  },
+  "host_graftoff_maxdiff_shared": 0.0,
+  "construction_decoupled": {
+    "ok": 320,
+    "n": 320,
+    "min_margin": 0.9999999999998128,
+    "per_op": {
+      "ADD": "40/40",
+      "SUB": "40/40",
+      "CMP_LT": "40/40",
+      "CMP_EQ": "40/40",
+      "CMP_GT": "40/40",
+      "LI": "40/40",
+      "SI": "40/40",
+      "DIV": "40/40"
+    }
+  },
+  "host_graftoff_maxdiff_decoupled": 0.0,
+  "rl_runs": [
+    {
+      "label": "shared/reward/lr3e-03",
+      "lr": 0.003,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": true,
+      "result_mode": "shared",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.2335205078125,
+      "graft_weight_drift": 0.0015046138349556412,
+      "max_rl_grad_into_graft": 83.83131551311241,
+      "final_reward_mean": 0.9296875,
+      "final_w_read": 4.0000176429748535,
+      "survived": true,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.542755126953125,
+          "graft_grad_norm": 0.0,
+          "reward_mean": 0.962890625,
+          "w_read": 4.000002384185791,
+          "drift": 0.0008979208078220725
+        },
+        {
+          "step": 20,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.484954833984375,
+          "graft_grad_norm": 23.474975247923584,
+          "reward_mean": 0.904296875,
+          "w_read": 4.000008583068848,
+          "drift": 0.0010115578498173746
+        },
+        {
+          "step": 30,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.287811279296875,
+          "graft_grad_norm": 71.31238702335486,
+          "reward_mean": 0.912109375,
+          "w_read": 4.000013828277588,
+          "drift": 0.001398007387638649
+        },
+        {
+          "step": 40,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.2335205078125,
+          "graft_grad_norm": 78.77485656822074,
+          "reward_mean": 0.9296875,
+          "w_read": 4.0000176429748535,
+          "drift": 0.0015046138349556412
+        }
+      ]
+    },
+    {
+      "label": "shared/reward/lr1e-02",
+      "lr": 0.01,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": true,
+      "result_mode": "shared",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "192/320",
+      "pct_before": 100.0,
+      "pct_after": 60.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": -5.5220947265625,
+      "graft_weight_drift": 0.009410895219880819,
+      "max_rl_grad_into_graft": 43.77643579122627,
+      "final_reward_mean": 0.96484375,
+      "final_w_read": 4.0004143714904785,
+      "survived": false,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "193/320",
+          "pct": 60.3125,
+          "min_margin": -4.89117431640625,
+          "graft_grad_norm": 203.86552514770614,
+          "reward_mean": 0.958984375,
+          "w_read": 4.000038146972656,
+          "drift": 0.00878632329975454
+        },
+        {
+          "step": 20,
+          "byte_exact": "192/320",
+          "pct": 60.0,
+          "min_margin": -5.511474609375,
+          "graft_grad_norm": 213.30611805571823,
+          "reward_mean": 0.98046875,
+          "w_read": 4.000171184539795,
+          "drift": 0.009399584527002876
+        },
+        {
+          "step": 30,
+          "byte_exact": "192/320",
+          "pct": 60.0,
+          "min_margin": -5.52520751953125,
+          "graft_grad_norm": 213.3060722735056,
+          "reward_mean": 0.9765625,
+          "w_read": 4.0002851486206055,
+          "drift": 0.00941359232291634
+        },
+        {
+          "step": 40,
+          "byte_exact": "192/320",
+          "pct": 60.0,
+          "min_margin": -5.5220947265625,
+          "graft_grad_norm": 213.30609058639183,
+          "reward_mean": 0.96484375,
+          "w_read": 4.0004143714904785,
+          "drift": 0.009410895219880819
+        }
+      ]
+    },
+    {
+      "label": "shared/reward/lr3e-02",
+      "lr": 0.03,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": true,
+      "result_mode": "shared",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "176/320",
+      "pct_before": 100.0,
+      "pct_after": 55.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": -22.67333984375,
+      "graft_weight_drift": 0.01870272044346951,
+      "max_rl_grad_into_graft": 81.02478140061385,
+      "final_reward_mean": 0.552734375,
+      "final_w_read": 4.004863262176514,
+      "survived": false,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "203/320",
+          "pct": 63.4375,
+          "min_margin": -2.662109375,
+          "graft_grad_norm": 171.1363845281739,
+          "reward_mean": 0.587890625,
+          "w_read": 4.000746250152588,
+          "drift": 0.0065853097627766475
+        },
+        {
+          "step": 20,
+          "byte_exact": "183/320",
+          "pct": 57.1875,
+          "min_margin": -11.811492919921875,
+          "graft_grad_norm": 317.3912707526784,
+          "reward_mean": 0.55859375,
+          "w_read": 4.002859592437744,
+          "drift": 0.013605523037648127
+        },
+        {
+          "step": 30,
+          "byte_exact": "187/320",
+          "pct": 58.4375,
+          "min_margin": -8.9644775390625,
+          "graft_grad_norm": 290.77872278590127,
+          "reward_mean": 0.486328125,
+          "w_read": 4.003551006317139,
+          "drift": 0.011747075080735084
+        },
+        {
+          "step": 40,
+          "byte_exact": "176/320",
+          "pct": 55.0,
+          "min_margin": -22.67333984375,
+          "graft_grad_norm": 456.0155562039523,
+          "reward_mean": 0.552734375,
+          "w_read": 4.004863262176514,
+          "drift": 0.01870272044346951
+        }
+      ]
+    },
+    {
+      "label": "shared/reward/lr1e-01",
+      "lr": 0.1,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": true,
+      "result_mode": "shared",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "182/320",
+      "pct_before": 100.0,
+      "pct_after": 56.875,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": -12.021331787109375,
+      "graft_weight_drift": 0.014084192208980708,
+      "max_rl_grad_into_graft": 95.36320373659171,
+      "final_reward_mean": 0.65234375,
+      "final_w_read": 4.0134758949279785,
+      "survived": false,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "167/320",
+          "pct": 52.1875,
+          "min_margin": -254.86181640625,
+          "graft_grad_norm": 1293.2225253219185,
+          "reward_mean": 0.537109375,
+          "w_read": 3.999722957611084,
+          "drift": 0.06690435944814607
+        },
+        {
+          "step": 20,
+          "byte_exact": "171/320",
+          "pct": 53.4375,
+          "min_margin": -116.1468505859375,
+          "graft_grad_norm": 903.6879300953442,
+          "reward_mean": 0.435546875,
+          "w_read": 4.000141620635986,
+          "drift": 0.044176188887255635
+        },
+        {
+          "step": 30,
+          "byte_exact": "167/320",
+          "pct": 52.1875,
+          "min_margin": -142.4051513671875,
+          "graft_grad_norm": 1134.304081809111,
+          "reward_mean": 0.494140625,
+          "w_read": 4.0051045417785645,
+          "drift": 0.04687529172133684
+        },
+        {
+          "step": 40,
+          "byte_exact": "182/320",
+          "pct": 56.875,
+          "min_margin": -12.021331787109375,
+          "graft_grad_norm": 305.47836464449284,
+          "reward_mean": 0.65234375,
+          "w_read": 4.0134758949279785,
+          "drift": 0.014084192208980708
+        }
+      ]
+    },
+    {
+      "label": "shared/agnostic/lr3e-03",
+      "lr": 0.003,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": false,
+      "result_mode": "shared",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.978668212890625,
+      "graft_weight_drift": 9.008687498676821e-05,
+      "max_rl_grad_into_graft": 1.0319792009912083,
+      "final_reward_mean": null,
+      "final_w_read": 4.0,
+      "survived": true,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.985809326171875,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 5.834751838985295e-05
+        },
+        {
+          "step": 20,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9818115234375,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 7.273092531324237e-05
+        },
+        {
+          "step": 30,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.979248046875,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 8.295559012245463e-05
+        },
+        {
+          "step": 40,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.978668212890625,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 9.008687498676821e-05
+        }
+      ]
+    },
+    {
+      "label": "shared/agnostic/lr1e-02",
+      "lr": 0.01,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": false,
+      "result_mode": "shared",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.9287109375,
+      "graft_weight_drift": 0.0002109586856561406,
+      "max_rl_grad_into_graft": 0.18322443721211876,
+      "final_reward_mean": null,
+      "final_w_read": 4.0,
+      "survived": true,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.93719482421875,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0001402847627747688
+        },
+        {
+          "step": 20,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.931365966796875,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.00016558576635778238
+        },
+        {
+          "step": 30,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.92974853515625,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.00018764645529343858
+        },
+        {
+          "step": 40,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9287109375,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0002109586856561406
+        }
+      ]
+    },
+    {
+      "label": "shared/agnostic/lr3e-02",
+      "lr": 0.03,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": false,
+      "result_mode": "shared",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.8489990234375,
+      "graft_weight_drift": 0.0005738850655501704,
+      "max_rl_grad_into_graft": 0.3095407201058688,
+      "final_reward_mean": null,
+      "final_w_read": 4.0,
+      "survived": true,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.864593505859375,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0003216684533346793
+        },
+        {
+          "step": 20,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.85504150390625,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.00043300041882410887
+        },
+        {
+          "step": 30,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.851287841796875,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0005005935116258815
+        },
+        {
+          "step": 40,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.8489990234375,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0005738850655501704
+        }
+      ]
+    },
+    {
+      "label": "shared/agnostic/lr1e-01",
+      "lr": 0.1,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": false,
+      "result_mode": "shared",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "232/320",
+      "pct_before": 100.0,
+      "pct_after": 72.5,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": -1.151885986328125,
+      "graft_weight_drift": 0.004474904243818471,
+      "max_rl_grad_into_graft": 0.5862847302630089,
+      "final_reward_mean": null,
+      "final_w_read": 4.0,
+      "survived": false,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "240/320",
+          "pct": 75.0,
+          "min_margin": -0.911163330078125,
+          "graft_grad_norm": 126.61695973362929,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0037807851465513137
+        },
+        {
+          "step": 20,
+          "byte_exact": "232/320",
+          "pct": 72.5,
+          "min_margin": -1.12640380859375,
+          "graft_grad_norm": 128.57273901861933,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.004275651229195661
+        },
+        {
+          "step": 30,
+          "byte_exact": "232/320",
+          "pct": 72.5,
+          "min_margin": -1.14471435546875,
+          "graft_grad_norm": 128.57270863698096,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.004375349218993533
+        },
+        {
+          "step": 40,
+          "byte_exact": "232/320",
+          "pct": 72.5,
+          "min_margin": -1.151885986328125,
+          "graft_grad_norm": 128.5726934461591,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.004474904243818471
+        }
+      ]
+    },
+    {
+      "label": "decoupled/reward/lr3e-03",
+      "lr": 0.003,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": true,
+      "result_mode": "decoupled",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.620574951171875,
+      "graft_weight_drift": 0.0007449685614446482,
+      "max_rl_grad_into_graft": 112.73434359840172,
+      "final_reward_mean": 0.861328125,
+      "final_w_read": 4.000184535980225,
+      "survived": true,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.62060546875,
+          "graft_grad_norm": 0.0,
+          "reward_mean": 0.873046875,
+          "w_read": 4.000135898590088,
+          "drift": 0.0007439887384081965
+        },
+        {
+          "step": 20,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.620574951171875,
+          "graft_grad_norm": 0.0,
+          "reward_mean": 0.869140625,
+          "w_read": 4.000160217285156,
+          "drift": 0.0007442126245617281
+        },
+        {
+          "step": 30,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.620574951171875,
+          "graft_grad_norm": 0.0,
+          "reward_mean": 0.892578125,
+          "w_read": 4.000166416168213,
+          "drift": 0.0007445226462131637
+        },
+        {
+          "step": 40,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.620574951171875,
+          "graft_grad_norm": 0.0,
+          "reward_mean": 0.861328125,
+          "w_read": 4.000184535980225,
+          "drift": 0.0007449685614446482
+        }
+      ]
+    },
+    {
+      "label": "decoupled/reward/lr1e-02",
+      "lr": 0.01,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": true,
+      "result_mode": "decoupled",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.3660888671875,
+      "graft_weight_drift": 0.0012543894574962668,
+      "max_rl_grad_into_graft": 61.32822850309737,
+      "final_reward_mean": 0.5546875,
+      "final_w_read": 4.001091480255127,
+      "survived": true,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.99951171875,
+          "graft_grad_norm": 0.0,
+          "reward_mean": 0.6796875,
+          "w_read": 4.000528812408447,
+          "drift": 3.2057369789601814e-05
+        },
+        {
+          "step": 20,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.36614990234375,
+          "graft_grad_norm": 62.57482825273574,
+          "reward_mean": 0.58203125,
+          "w_read": 4.001020431518555,
+          "drift": 0.0012494327857494499
+        },
+        {
+          "step": 30,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.36614990234375,
+          "graft_grad_norm": 62.57482825273574,
+          "reward_mean": 0.61328125,
+          "w_read": 4.001051425933838,
+          "drift": 0.001251509436596819
+        },
+        {
+          "step": 40,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.3660888671875,
+          "graft_grad_norm": 62.57482825273574,
+          "reward_mean": 0.5546875,
+          "w_read": 4.001091480255127,
+          "drift": 0.0012543894574962668
+        }
+      ]
+    },
+    {
+      "label": "decoupled/reward/lr3e-02",
+      "lr": 0.03,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": true,
+      "result_mode": "decoupled",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "181/320",
+      "pct_before": 100.0,
+      "pct_after": 56.5625,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": -14.1368408203125,
+      "graft_weight_drift": 0.014778810044147342,
+      "max_rl_grad_into_graft": 93.83231282286236,
+      "final_reward_mean": 0.591796875,
+      "final_w_read": 4.006530284881592,
+      "survived": false,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "192/320",
+          "pct": 60.0,
+          "min_margin": -6.23583984375,
+          "graft_grad_norm": 229.75161520106883,
+          "reward_mean": 0.625,
+          "w_read": 4.001936435699463,
+          "drift": 0.010077444220029394
+        },
+        {
+          "step": 20,
+          "byte_exact": "188/320",
+          "pct": 58.75,
+          "min_margin": -8.0174560546875,
+          "graft_grad_norm": 279.88412781006355,
+          "reward_mean": 0.546875,
+          "w_read": 4.003665447235107,
+          "drift": 0.01112460589337226
+        },
+        {
+          "step": 30,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.82989501953125,
+          "graft_grad_norm": 0.0,
+          "reward_mean": 0.439453125,
+          "w_read": 4.005524158477783,
+          "drift": 0.00043828396512275415
+        },
+        {
+          "step": 40,
+          "byte_exact": "181/320",
+          "pct": 56.5625,
+          "min_margin": -14.1368408203125,
+          "graft_grad_norm": 360.3838448446323,
+          "reward_mean": 0.591796875,
+          "w_read": 4.006530284881592,
+          "drift": 0.014778810044147342
+        }
+      ]
+    },
+    {
+      "label": "decoupled/reward/lr1e-01",
+      "lr": 0.1,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": true,
+      "result_mode": "decoupled",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "167/320",
+      "pct_before": 100.0,
+      "pct_after": 52.1875,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": -195.02032470703125,
+      "graft_weight_drift": 0.05802493690545549,
+      "max_rl_grad_into_graft": 12.948591260249124,
+      "final_reward_mean": 0.470703125,
+      "final_w_read": 4.032060146331787,
+      "survived": false,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "167/320",
+          "pct": 52.1875,
+          "min_margin": -392.71575927734375,
+          "graft_grad_norm": 1565.1468780916377,
+          "reward_mean": 0.5078125,
+          "w_read": 4.0085978507995605,
+          "drift": 0.08424438474139034
+        },
+        {
+          "step": 20,
+          "byte_exact": "166/320",
+          "pct": 51.875,
+          "min_margin": -474.7630615234375,
+          "graft_grad_norm": 2043.4997553217372,
+          "reward_mean": 0.619140625,
+          "w_read": 4.017709732055664,
+          "drift": 0.08566248663144742
+        },
+        {
+          "step": 30,
+          "byte_exact": "167/320",
+          "pct": 52.1875,
+          "min_margin": -180.9796142578125,
+          "graft_grad_norm": 1262.0609137438653,
+          "reward_mean": 0.494140625,
+          "w_read": 4.023987293243408,
+          "drift": 0.052844925029815956
+        },
+        {
+          "step": 40,
+          "byte_exact": "167/320",
+          "pct": 52.1875,
+          "min_margin": -195.02032470703125,
+          "graft_grad_norm": 1150.6359654556259,
+          "reward_mean": 0.470703125,
+          "w_read": 4.032060146331787,
+          "drift": 0.05802493690545549
+        }
+      ]
+    },
+    {
+      "label": "decoupled/agnostic/lr3e-03",
+      "lr": 0.003,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": false,
+      "result_mode": "decoupled",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.9999999999998128,
+      "graft_weight_drift": 0.0,
+      "max_rl_grad_into_graft": 0.0,
+      "final_reward_mean": null,
+      "final_w_read": 4.0,
+      "survived": true,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 20,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 30,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 40,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        }
+      ]
+    },
+    {
+      "label": "decoupled/agnostic/lr1e-02",
+      "lr": 0.01,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": false,
+      "result_mode": "decoupled",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.9999999999998128,
+      "graft_weight_drift": 0.0,
+      "max_rl_grad_into_graft": 0.0,
+      "final_reward_mean": null,
+      "final_w_read": 4.0,
+      "survived": true,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 20,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 30,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 40,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        }
+      ]
+    },
+    {
+      "label": "decoupled/agnostic/lr3e-02",
+      "lr": 0.03,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": false,
+      "result_mode": "decoupled",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.9999999999998128,
+      "graft_weight_drift": 0.0,
+      "max_rl_grad_into_graft": 0.0,
+      "final_reward_mean": null,
+      "final_w_read": 4.0,
+      "survived": true,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 20,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 30,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 40,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        }
+      ]
+    },
+    {
+      "label": "decoupled/agnostic/lr1e-01",
+      "lr": 0.1,
+      "steps": 40,
+      "group_n": 8,
+      "reward_aligned": false,
+      "result_mode": "decoupled",
+      "byte_exact_before": "320/320",
+      "byte_exact_after": "320/320",
+      "pct_before": 100.0,
+      "pct_after": 100.0,
+      "min_margin_before": 0.9999999999998128,
+      "min_margin_after": 0.9999999999998128,
+      "graft_weight_drift": 0.0,
+      "max_rl_grad_into_graft": 0.0,
+      "final_reward_mean": null,
+      "final_w_read": 4.0,
+      "survived": true,
+      "trajectory": [
+        {
+          "step": 0,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 10,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 20,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 30,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        },
+        {
+          "step": 40,
+          "byte_exact": "320/320",
+          "pct": 100.0,
+          "min_margin": 0.9999999999998128,
+          "graft_grad_norm": 0.0,
+          "reward_mean": null,
+          "w_read": 4.0,
+          "drift": 0.0
+        }
+      ]
+    }
+  ],
+  "ablation_grid": [
+    {
+      "result_mode": "shared",
+      "reward_aligned": true,
+      "by_lr": {
+        "3e-03": {
+          "survived": true,
+          "pct_after": 100.0,
+          "margin_after": 0.2335205078125,
+          "drift": 0.0015046138349556412,
+          "final_reward": 0.9296875
+        },
+        "1e-02": {
+          "survived": false,
+          "pct_after": 60.0,
+          "margin_after": -5.5220947265625,
+          "drift": 0.009410895219880819,
+          "final_reward": 0.96484375
+        },
+        "3e-02": {
+          "survived": false,
+          "pct_after": 55.0,
+          "margin_after": -22.67333984375,
+          "drift": 0.01870272044346951,
+          "final_reward": 0.552734375
+        },
+        "1e-01": {
+          "survived": false,
+          "pct_after": 56.875,
+          "margin_after": -12.021331787109375,
+          "drift": 0.014084192208980708,
+          "final_reward": 0.65234375
+        }
+      }
+    },
+    {
+      "result_mode": "shared",
+      "reward_aligned": false,
+      "by_lr": {
+        "3e-03": {
+          "survived": true,
+          "pct_after": 100.0,
+          "margin_after": 0.978668212890625,
+          "drift": 9.008687498676821e-05,
+          "final_reward": null
+        },
+        "1e-02": {
+          "survived": true,
+          "pct_after": 100.0,
+          "margin_after": 0.9287109375,
+          "drift": 0.0002109586856561406,
+          "final_reward": null
+        },
+        "3e-02": {
+          "survived": true,
+          "pct_after": 100.0,
+          "margin_after": 0.8489990234375,
+          "drift": 0.0005738850655501704,
+          "final_reward": null
+        },
+        "1e-01": {
+          "survived": false,
+          "pct_after": 72.5,
+          "margin_after": -1.151885986328125,
+          "drift": 0.004474904243818471,
+          "final_reward": null
+        }
+      }
+    },
+    {
+      "result_mode": "decoupled",
+      "reward_aligned": true,
+      "by_lr": {
+        "3e-03": {
+          "survived": true,
+          "pct_after": 100.0,
+          "margin_after": 0.620574951171875,
+          "drift": 0.0007449685614446482,
+          "final_reward": 0.861328125
+        },
+        "1e-02": {
+          "survived": true,
+          "pct_after": 100.0,
+          "margin_after": 0.3660888671875,
+          "drift": 0.0012543894574962668,
+          "final_reward": 0.5546875
+        },
+        "3e-02": {
+          "survived": false,
+          "pct_after": 56.5625,
+          "margin_after": -14.1368408203125,
+          "drift": 0.014778810044147342,
+          "final_reward": 0.591796875
+        },
+        "1e-01": {
+          "survived": false,
+          "pct_after": 52.1875,
+          "margin_after": -195.02032470703125,
+          "drift": 0.05802493690545549,
+          "final_reward": 0.470703125
+        }
+      }
+    },
+    {
+      "result_mode": "decoupled",
+      "reward_aligned": false,
+      "by_lr": {
+        "3e-03": {
+          "survived": true,
+          "pct_after": 100.0,
+          "margin_after": 0.9999999999998128,
+          "drift": 0.0,
+          "final_reward": null
+        },
+        "1e-02": {
+          "survived": true,
+          "pct_after": 100.0,
+          "margin_after": 0.9999999999998128,
+          "drift": 0.0,
+          "final_reward": null
+        },
+        "3e-02": {
+          "survived": true,
+          "pct_after": 100.0,
+          "margin_after": 0.9999999999998128,
+          "drift": 0.0,
+          "final_reward": null
+        },
+        "1e-01": {
+          "survived": true,
+          "pct_after": 100.0,
+          "margin_after": 0.9999999999998128,
+          "drift": 0.0,
+          "final_reward": null
+        }
+      }
+    }
+  ],
+  "holds": {
+    "shared/reward": {
+      "highest_hold_lr": 0.003,
+      "first_break_lr": 0.01
+    },
+    "shared/agnostic": {
+      "highest_hold_lr": 0.03,
+      "first_break_lr": 0.1
+    },
+    "decoupled/reward": {
+      "highest_hold_lr": 0.01,
+      "first_break_lr": 0.03
+    },
+    "decoupled/agnostic": {
+      "highest_hold_lr": 0.1,
+      "first_break_lr": null
+    }
+  },
+  "verdict": {
+    "learned_to_use_alu": false,
+    "reward_alignment_lifts_break": false,
+    "shared_reward_holds_at_3e3": true,
+    "decoupled_reward_holds_at_3e3": true,
+    "survives_unprotected_by_lr": {
+      "3e-03": {
+        "shared/reward": true,
+        "shared/agnostic": true,
+        "decoupled/reward": true,
+        "decoupled/agnostic": true
+      },
+      "1e-02": {
+        "shared/reward": false,
+        "shared/agnostic": true,
+        "decoupled/reward": true,
+        "decoupled/agnostic": true
+      },
+      "3e-02": {
+        "shared/reward": false,
+        "shared/agnostic": true,
+        "decoupled/reward": false,
+        "decoupled/agnostic": true
+      },
+      "1e-01": {
+        "shared/reward": false,
+        "shared/agnostic": false,
+        "decoupled/reward": false,
+        "decoupled/agnostic": true
+      }
+    },
+    "holds": {
+      "shared/reward": {
+        "highest_hold_lr": 0.003,
+        "first_break_lr": 0.01
+      },
+      "shared/agnostic": {
+        "highest_hold_lr": 0.03,
+        "first_break_lr": 0.1
+      },
+      "decoupled/reward": {
+        "highest_hold_lr": 0.01,
+        "first_break_lr": 0.03
+      },
+      "decoupled/agnostic": {
+        "highest_hold_lr": 0.1,
+        "first_break_lr": null
+      }
+    },
+    "reward_vs_agnostic_shared": "A_more_robust",
+    "reward_vs_agnostic_decoupled": "A_more_robust",
+    "decoupling_shared_vs_decoupled_reward": "B_more_robust",
+    "decoupling_shared_vs_decoupled_agnostic": "B_more_robust"
+  },
+  "peak_rss_gb": 7.58001708984375,
+  "elapsed_s": 1551.923799753189
+}
