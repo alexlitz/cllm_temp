@@ -33,6 +33,80 @@ Lever ↔ cost axis
     muldiv-strategy = subroutine              -> STEPS  (per-op program steps)  [EST]
     precision 8/16/32                          -> scales all three
 
+#913 fp32-FIT levers (FitConfig.pack_memcam / overlap_scratch / bit_level_bitwise)
+-----------------------------------------------------------------------------------
+Three MEASURED reductions of the residual-width / depth floor, each DEFAULT OFF (so
+the base accounting is byte-identical to before) and each a delta read from the REAL
+layout (``_packmemcam_saving`` / ``_alu_scratch_overlap`` / ``_bitwise_barrel_saving``):
+
+  * **pack_memcam** — drop the ~330-780 DEAD head-dim pad dims the pure-forward
+    §Memory head allocated but this Qwen build (re-bakes attention on Qwen geometry)
+    never uses (``C4_PACK_MEMCAM``).  Collapses the subroutine hidden 1152 -> 896.
+  * **overlap_scratch** — THE op-overlap lever: the inline-ALU scratch bands are
+    stored side-by-side (SUM) but only ONE op fires per step, so under an opcode-gated
+    parallel-scratch mux the residual holds operand + MAX-over-families, not the SUM.
+    Measured: sum 1335 -> operand(12)+MAX(divmod 1165) = 1177.  It NARROWS the inline
+    ALU but divmod's own 1165-dim scratch still exceeds 896, so the inline ALU does
+    NOT fit even fully overlapped — subroutine (ALU out of the residual) is the lever.
+  * **bit_level_bitwise** — #911 per-bit polynomial AND/OR/XOR (depth-1 combine, no
+    attention) replaces the 256-entry nibble-LUT, and SHL/SHR leave the persistent
+    stack (routed to subroutine / native MUL-DIV), retiring the ~17 barrel-shifter
+    blocks: subroutine stored 31 -> 14.
+
+  RESULT (#913): subroutine + pack_memcam + bit_level_bitwise FITS stock Qwen2.5-0.5B
+  at fp32 — hidden 896 (<=896), intermediate 896 (<=4864), stored 14 (<=24).
+
+#916-continued INLINE + FEED-FORWARD fit (attn_cam_div LR-dup / bit_level_shift / overlap_depth)
+------------------------------------------------------------------------------------------------
+The #916 goal: fit the FULL fp32 C4 ISA into stock 0.5B INLINE (DIV/MOD stay in the
+weights, NOT exported to program STEPS like subroutine) and FEED-FORWARD (no loop/tie).
+The prior pass reached hidden 1472 / inter 9710 / stored 115 with attn_cam_div (#908
+R256E attention-CAM DIV); the three remaining binders are cracked here (all DEFAULT OFF):
+
+  * **attn_cam_div (LR-dup removal)** — the production divmod allocates the residual
+    TWICE: the ``ALU_*`` nibble_alu32 divmod scratch (1156) AND the compact radix-16
+    lean-radix ``LR_*`` datapath (480, the ``div_radix16_lean`` KB-lookahead/GE-threshold
+    quotient-estimate).  The ``LR_*`` band is touched ONLY by the ``lean-*`` blocks the
+    attention-CAM swap removes, so it is DEAD once R256E replaces the radix-16 division —
+    the divmod residual is 277 TOTAL (R256E running state), and BOTH the 1156 scratch and
+    the 480 LR datapath leave.  MEASURED: hidden 1472 -> 960.
+  * **bit_level_shift** — SHL/SHR run as native MUL/DIV (x*2^n / x//2^n, shift_via_mul,
+    the fit regime), which drops the barrel-shifter BLOCKS but leaves the layout still
+    ALLOCATING the dead ``SH_STAGE_*`` (160) + ``TS_*`` (118) = 278 residual bands that NO
+    block touches — the shift analog of bit_level_bitwise retires them.  hidden 960 -> 896.
+  * **narrower R256E multiply** (in div_radix256_est) — the R256E per-digit qhat*dn and
+    MOD q*d carry-normalise used a kmax=255 staircase (9710/7666-wide blocks, the INTER
+    binder); a nibble-SPLIT of the quotient byte (qlo/qhi) + a TWO-LEVEL lane-floor make
+    every carry kmax<=112 (mostly 15).  MEASURED byte-exact (fp64 6084/6084, fp32
+    single-row 1195/1200, a hair BETTER than the base 1188) — inter 9710 -> 3376.
+  * **overlap_depth** — op-overlap: only ONE opcode fires per step, so the per-op-family
+    machinery is opcode-gated onto SHARED physical layers -> depth = base pipeline + the
+    DEEPEST single op cascade (max-op), NOT the SUM.  MEASURED: stored 123 (sum) -> 108
+    (max-op = base 10 + divmod 98).
+
+  RESULT (#916): inline + feed-forward FITS stock 0.5B on WIDTH — hidden 896 (<=896) AND
+  intermediate 3376 (<=4864) — but NOT on DEPTH: the DIV/MOD unrolled digit-recurrence is
+  ~98 sequential layers (each block reads the prior block's residual, no fusion), so the
+  op-overlap max-op depth is 108 > 24.  DIV/MOD only reaches ~48 via RECURRENCE (weight-tied
+  loop = Universal-Transformer, divmod body stored once) — still > 24, and looping is
+  excluded for stock feed-forward Qwen2.  IRREDUCIBLE BINDER: divmod unrolled depth.
+
+  * **logsink_div** (this pass) — the §653 LOG-SINK divide was PROPOSED to close DEPTH:
+    it computes ``1/b`` via the softmax1 sink (NOT a digit-loop) + Newton + schoolbook
+    ``q·b`` verify + ±1, byte-exact (Python ref 56,514/56,514 fp64; fp32-refine also
+    byte-exact).  MEASURED from ``compile_logsink_blocks``, the compiled feed-forward
+    block count is **127**, DEEPER than R256E's 98 — the "~14 blocks" in the docstring is
+    the 15-block SHALLOW stage part; the quotient DECODE (``floor(QF)`` → 8 nibbles) and
+    the schoolbook ``q·b`` VERIFY are each an 8-nibble MSB-first digit-recurrence (4× ~24 +
+    2 schoolbook = 112 blocks), the SAME sequential dependency the radix loop has.  So
+    log-sink MOVES the recurrence (estimate → decode+verify), it does NOT remove it:
+    max-op depth 108 → 137.  It DOES relax INTERMEDIATE (widest FFN 2422 < R256E 3376).
+    VERDICT (both fp32 and fp64): inline + feed-forward does NOT fit stock 0.5B/1.5B/7B on
+    DEPTH under EITHER div strategy — the divmod digit-recurrence depth is the irreducible
+    binder, and it is deeper (not shallower) with the reciprocal divide.  fp64 vs fp32 is a
+    bake-dtype choice, not a depth change (the fp64-native log-sink and the fp32-refine
+    variant both need the schoolbook nibble decode).
+
 Honesty (verified vs estimated)
 -------------------------------
   * **lookup-table** width, **efficient-ALU** unrolled/recurrent depth+width — VERIFIED:
@@ -200,6 +274,136 @@ class FitConfig:
     granularity: str = "nibble"
     code_size: int = 24
     arch: QwenArch = field(default_factory=lambda: QWEN2_5_ARCH)
+    # ---- #913 fp32-fit levers (all default OFF -> byte-identical to the prior
+    #      accounting; each is a MEASURED reduction of the residual/depth) --------
+    pack_memcam: bool = False        # drop the ~800 dead head-dim pad dims that this
+                                     #   Qwen build never uses (C4_PACK_MEMCAM). The
+                                     #   pure-forward layout pads up to n_heads*MEM_HEAD
+                                     #   CHANNELS for its OWN §Memory head, but this build
+                                     #   re-bakes attention on the Qwen geometry, so those
+                                     #   dims are dead weight. OFF -> byte-identical wider.
+    overlap_scratch: bool = False    # THE op-overlap lever: the inline-ALU scratch bands
+                                     #   are allocated side-by-side (SUM) but only ONE op
+                                     #   fires per step. Under an opcode-gated parallel-
+                                     #   scratch mux the residual holds base + operand +
+                                     #   MAX-over-families(private scratch), not the SUM.
+    bit_level_bitwise: bool = False  # #911 bit-level (per-bit polynomial) AND/OR/XOR:
+                                     #   depth-1-combine, no attention, ~narrow; replaces
+                                     #   the 256-entry nibble-LUT. SHL/SHR leave the
+                                     #   persistent stack (routed to subroutine/MUL-DIV),
+                                     #   dropping the ~17 barrel-shifter blocks.
+    bit_level_shift: bool = False    # the SHIFT analog of bit_level_bitwise: SHL/SHR run
+                                     #   as native MUL/DIV (x*2^n / x//2^n, "bit-level
+                                     #   shift" per-bit position map on the muldiv path,
+                                     #   shift_via_mul).  The barrel-shifter BLOCKS already
+                                     #   drop, but the layout still ALLOCATES the dead
+                                     #   SH_STAGE_* (160) + TS_* (118) = 278 residual bands
+                                     #   that NO block touches — this retires them.
+    overlap_depth: bool = False      # DEPTH op-overlap: only ONE opcode fires per step, so
+                                     #   the per-op-family machinery is opcode-gated and
+                                     #   SHARES the same physical layers -> the feed-forward
+                                     #   network depth is the SHARED base pipeline + the
+                                     #   DEEPEST single op-family cascade (max-op), NOT the
+                                     #   SUM of every family's blocks.  MEASURED from the
+                                     #   live block stack (_maxop_overlap_depth).
+    # ---- #916 INLINE-fit lever (attention-CAM DIV, #908) — DEFAULT OFF -----------
+    attn_cam_div: bool = False       # #908 monotone-GE threshold-CAM DIV/MOD: the wide
+                                     #   radix-16 KB-lookahead / GE-threshold quotient-
+                                     #   estimate bank (8 ALU_ bands == 1089 of the 1165
+                                     #   divmod RESIDUAL dims + the 4x 7920-wide lean-kb
+                                     #   FFN estimate blocks) moves OUT of FFN/residual and
+                                     #   INTO ONE softmax1 attention head with 255 SHARED,
+                                     #   divisor-INDEPENDENT KV rows.  Measured (#908
+                                     #   div_radix256_est / attn_radix_div @ 43b5cd74):
+                                     #   the divmod residual scratch drops 1165 -> 277
+                                     #   (the R256E running remainder/divisor/digit/result/
+                                     #   SRT-lane state, NOT the bank), and the max FFN
+                                     #   intermediate the divmod family drives drops from
+                                     #   7920 (lean-kb-c*) to the radix-256 SRT lane
+                                     #   multiplies.  This is the INLINE (in-weights, feed-
+                                     #   forward) muldiv fit lever — DIV/MOD stay on the
+                                     #   persistent stack (UNLIKE subroutine, which exports
+                                     #   them to program STEPS).
+    # ---- #916 continued — LOG-SINK DIV depth lever (§653) — DEFAULT OFF ----------
+    logsink_div: bool = False        # LOG-SINK DIV/MOD (§653 nibble_logsink_blocks): the
+                                     #   softmax1 reciprocal sink (1/b over 8 log-key KV
+                                     #   rows) + Newton + schoolbook q*b + ±1 correction,
+                                     #   INLINE + feed-forward, byte-exact (Python ref
+                                     #   56,514/56,514 fp64; fp32-refine also byte-exact).
+                                     #   Proposed as the DEPTH lever to replace the radix
+                                     #   digit-recurrence (the ~98-block R256E cascade).
+                                     #   MEASURED live from compile_logsink_blocks: the
+                                     #   compiled feed-forward block count is 127 (NOT the
+                                     #   docstring's "~14 stages") — the quotient DECODE +
+                                     #   schoolbook VERIFY are themselves 8-nibble MSB-first
+                                     #   digit-recurrences (4 decompose x ~24 + 2 schoolbook),
+                                     #   so log-sink MOVES the recurrence, it does not remove
+                                     #   it.  Width is NARROWER (widest FFN 2422 < R256E 3376).
+                                     #   Replaces attn_cam_div's R256E as the divmod family in
+                                     #   the max-op overlap depth.  See _logsink_div_geometry.
+    # ---- #916 continued — ADDER-HACK decode depth lever (blogspec §Position Offset) ----
+    adderhack_decode: bool = False   # ADDER-HACK place-value nibble decode: replace the
+                                     #   log-sink schoolbook RUNNING-REMAINDER decompose (4
+                                     #   passes x 8-deep = 100 blocks; each `reduce` feeds
+                                     #   the next `extract`) with the DIRECT floor/mod read
+                                     #   d_j = floor(v/16^j) - 16*floor(v/16^(j+1)), which is
+                                     #   cross-nibble INDEPENDENT (proven byte-exact fp64 over
+                                     #   the full uint32 range, _adderhack_decode_check.py /
+                                     #   nibble_adderhack_decode.py).  HONEST caveat: the
+                                     #   INDEPENDENT floor-diff is DEPTH-1 but its single-layer
+                                     #   FFN WIDTH is ~4.9e9 ramps (the mod-16 fold / high-nibble
+                                     #   floor need an UNBOUNDED step staircase — blogspec §734
+                                     #   scale problem), so the depth-1 form is width-INFEASIBLE;
+                                     #   the only BOUNDED-width realization is the SEQUENTIAL
+                                     #   cascade (blogspec §"Position Offset Calculation": "fully
+                                     #   sequential ... 8 layers"), which is EXACTLY what log-sink
+                                     #   already bakes.  This lever accounts the IDEAL depth-1
+                                     #   (feasibility-flagged) AND the realizable bounded depth,
+                                     #   for the honest verdict.  See _adderhack_div_geometry.
+    # ---- #916 FINAL PUSH — three FEASIBLE levers on the two deep divmod terms ----
+    radix256_decode: bool = False    # LEVER 1: replace the scalar->nibble DECODE with a
+                                     #   FEASIBLE radix-256 BYTE cascade — 4 sequential byte
+                                     #   layers (each floor(rem/256^j) mod 256, a 256-wide
+                                     #   staircase <= 4864 intermediate, FEASIBLE) + 1 nibble
+                                     #   split.  This is the honest bounded-width decode: NOT
+                                     #   the width-INFEASIBLE depth-1 (4.9e9 ramps) NOR the
+                                     #   8-deep radix-16 running-remainder — ~5 feasible layers
+                                     #   per pass.  Byte-exact over the full uint32 range
+                                     #   (_div_levers_916_check.run_lever1: 200,029/200,029).
+    newton_min: bool = False         # LEVER 2: cut the reciprocal Newton steps 2 -> 1.  The
+                                     #   softmax1 sink gives 1/b to rel-err ~5e-7 (~2^-21); ONE
+                                     #   Newton step (r<-r(2-b*r), e->e^2) lifts it to ~2^-42, so
+                                     #   the qf floor is within the ±1 + refine band for the full
+                                     #   32-bit quotient.  Saves 2 blocks (one br + one step).
+                                     #   Newton=1 byte-exact on 90,580 random pairs AND the
+                                     #   adversarial worst-sign corner (Newton=0 FAILS both — the
+                                     #   qf error q*e~1632 exceeds the refine R=512 clamp).  See
+                                     #   _div_levers_916_check.run_lever2[_worst_corner].
+    # ---- #916 fp64 INLINE+FF divmod — the levers that FAIL at fp32, byte-exact at fp64 ----
+    fp64_divmod: bool = False        # DTYPE=fp64 bake (§Basic-Arithmetic sanctions doubles for
+                                     #   the 32-bit ALU): fp64's 2^53 mantissa clears the two fp32
+                                     #   walls that pin the FEASIBLE fp32 divmod at 25.  BYTE-EXACT
+                                     #   at fp64 (_fp64_div_levers_916_check, 200k+ + boundaries):
+                                     #     * 11-bit-chunk q*b VERIFY (recompose 2^46 < 2^53) is a
+                                     #       DEPTH-5 multiply (3 chunk-products + 2 recompose adds),
+                                     #       REPLACING the fp32 8-deep Kogge-Stone carry cascade
+                                     #       (fp32's 2^24 breaks the 11-bit recompose -> 300289 fp32
+                                     #       vs 300289/300289 fp64 — LEVER A here 200,010/200,010).
+                                     #     * CASE-SPLIT reciprocal quotient (large-b whole-recip
+                                     #       round; small-b<=256 256-entry recip table) is BYTE-EXACT
+                                     #       with ZERO Newton (fp32 case-split div 46245/50586 vs
+                                     #       201350/201350 fp64), so recip drops to the sink +
+                                     #       case-split select (~5), no Newton refine.
+                                     #     * radix-4096 DECODE (v<2^32 exact in fp64) = 3 limbs + 1
+                                     #       split = 4 layers/pass, 2 passes = 8 (LEVER C 200,027).
+                                     #   fp64 divmod depth = recip5 + verify7 + decode8 + finalize1
+                                     #   = 21 (vs fp32 feasible 25).  See _fp64_divmod_geometry.
+    fp64_decode_overlap: bool = False  # AGGRESSIVE 1.5B-only lever (requires fp64_divmod): q and
+                                     #   rem decode in the SAME 4 radix-4096 layers (side-by-side
+                                     #   lanes), collapsing the 2 decode passes 8 -> 4.  BYTE-EXACT
+                                     #   at fp64 (150,006/150,006).  WIDTH 2x4096 = 8192 lanes
+                                     #   EXCEEDS 0.5B's 4864 but FITS 1.5B's 8960 -> 1.5B-ONLY.
+                                     #   fp64 divmod 21 -> 17, inline+FF 31 -> 27.
 
     @property
     def subset(self) -> Subset:
@@ -228,7 +432,96 @@ class FitConfig:
     @property
     def label(self) -> str:
         strat = self.muldiv_strategy if self.has_muldiv else "n/a"
-        return f"[{self.subset.name}] muldiv={strat} P{self.precision} {self.granularity}"
+        floor = " FLOOR" if self._is_floor_bundle() else ""
+        return (f"[{self.subset.name}] muldiv={strat} P{self.precision} "
+                f"{self.granularity}{floor}")
+
+    def _is_floor_bundle(self) -> bool:
+        """True when THIS config carries a feasible-floor lever bundle (any #913/#916
+        MEASURED width/depth reduction is on) — used only to tag the label."""
+        return any((self.pack_memcam, self.overlap_scratch, self.bit_level_bitwise,
+                    self.bit_level_shift, self.overlap_depth, self.attn_cam_div,
+                    self.logsink_div, self.radix256_decode, self.newton_min,
+                    self.fp64_divmod, self.fp64_decode_overlap))
+
+
+# ===========================================================================
+# FEASIBLE-FLOOR LEVER BUNDLES — the HONEST floor per (strategy, precision).
+#
+# THE FALSELY-DEEP-DEFAULT FIX.  A bare ``FitConfig`` has every #913/#916 fit lever
+# OFF, so ``account()`` reports the deep SUMMED digit-recurrence geometry (subroutine
+# 1152/896/31, inline-ALU 3008/7920/123-unrolled / 60-recurrent).  Those are the
+# "falsely deep" numbers: they SUM every op-family's private cascade and use the deep
+# radix-16 digit-recurrence, when the MEASURED, byte-exact feasible floor is far
+# shallower.  The bundles below are the exact lever sets that reach each measured
+# floor (all bundled levers are MEASURED reductions read live from the real layout /
+# validated byte-exact on the reference branches — see the per-lever docstrings):
+#
+#   * subroutine (fp32)      -> 14  (0.5B FIT)  #913 pack_memcam + bit_level_bitwise
+#   * inline+FF (fp32)       -> 35              #916 @eed17a92 (feasible radix256+newton_min)
+#   * inline+FF (fp64)       -> 31              #916 @ae22dd03 (fp64 divmod, gate 361577/361577)
+#   * inline+FF (fp64,ovlap) -> 27  (1.5B FIT)  #916 @ae22dd03 (decode-overlap, WIDTH 8192)
+#
+# The DEEP strategies stay fully SELECTABLE (bare configs, ``include_deep=`` in the
+# enumerator, every per-lever test) — they are just no longer the SILENT default the
+# front-door ``fit()`` / ``solve()`` reports.
+# ===========================================================================
+
+# The #913 subroutine fp32 FIT levers: drop the dead §Memory pad (1152->896) + retire
+# the barrel-shifter (stored 31->14).  Both MEASURED live (_packmemcam_saving /
+# _bitwise_barrel_saving).  Reaches the 14-layer 0.5B fit.
+_SUBROUTINE_FLOOR_LEVERS = dict(pack_memcam=True, bit_level_bitwise=True)
+
+# The #916 inline + feed-forward FEASIBLE floor levers (all MEASURED / byte-exact):
+#   pack_memcam + overlap_scratch + bit_level_bitwise + bit_level_shift + attn_cam_div
+#   (WIDTH -> 896) ; overlap_depth (max-op not SUM) ; logsink_div + radix256_decode +
+#   newton_min (the feasible bounded divmod = 25 -> inline+FF 35).
+_INLINE_FF_FLOOR_LEVERS = dict(
+    pack_memcam=True, overlap_scratch=True, bit_level_bitwise=True,
+    bit_level_shift=True, attn_cam_div=True, overlap_depth=True,
+    logsink_div=True, radix256_decode=True, newton_min=True)
+
+
+def feasible_floor_levers(strategy: str, precision: int,
+                          decode_overlap: bool = False) -> dict:
+    """The MEASURED feasible-floor lever bundle for ``(strategy, precision)``.
+
+    Returns the kwargs dict that, applied to a ``FitConfig``, makes ``account()``
+    report the HONEST byte-exact floor (NOT the falsely-deep summed radix geometry):
+
+      * ``subroutine``       -> #913 fit levers (fp32 0.5B fit at 14 stored layers).
+      * ``efficient-ALU-*``  -> #916 inline+FF feasible floor (fp32 35 / fp64 31 /
+        fp64+decode-overlap 27).  ``fp64_divmod`` on for precision-64 bakes (a FREE
+        dtype choice; BLOG_SPEC §Basic-Arithmetic sanctions fp64 for the 32-bit ALU);
+        ``fp64_decode_overlap`` on when ``decode_overlap`` (the aggressive 1.5B-only
+        WIDTH-8192 lever).  Empty for ``lookup-table`` (already width-not-depth).
+    """
+    if strategy == "subroutine":
+        return dict(_SUBROUTINE_FLOOR_LEVERS)
+    if strategy.startswith("efficient-ALU"):
+        levers = dict(_INLINE_FF_FLOOR_LEVERS)
+        if precision >= 64:
+            levers["fp64_divmod"] = True
+            if decode_overlap:
+                levers["fp64_decode_overlap"] = True
+        return levers
+    return {}
+
+
+def feasible_floor_config(ops, strategy: str, precision: int = 32, *,
+                          decode_overlap: bool = False, code_size: int = 24,
+                          arch: QwenArch = QWEN2_5_ARCH,
+                          granularity: str = "nibble") -> "FitConfig":
+    """Build the ``FitConfig`` that reaches the HONEST feasible floor for ``(strategy,
+    precision)``.  The floor levers are all MEASURED / byte-exact (see
+    ``feasible_floor_levers``).  fp64 bakes clamp the config precision to 32 (the ALU
+    is a 32-bit datapath; ``precision=64`` selects the fp64 *dtype*, not a 64-bit
+    integer width) so the P8/P16/P32 depth-projection does not double-count."""
+    levers = feasible_floor_levers(strategy, precision, decode_overlap=decode_overlap)
+    cfg_precision = 32 if precision >= 64 else precision
+    return FitConfig(ops=frozenset(ops), muldiv_strategy=strategy,
+                     precision=cfg_precision, granularity=granularity,
+                     code_size=code_size, arch=arch, **levers)
 
 
 # ===========================================================================
@@ -312,21 +605,807 @@ def _raw_spec_sizes(code_size: int, memory: bool, cmp: bool, bitwise: bool,
     return QL.D_used, inter, n_stored, n_applied
 
 
+# ===========================================================================
+# #913 fp32-fit levers — MEASURED reductions of the residual width + depth.
+# Each helper reads the REAL layout/blocks (no model built), so the reductions
+# are numbers the build path could actually realize, not hand-waves.
+# ===========================================================================
+
+# The dead head-dim pad the pure-forward §Memory head allocated but this Qwen build
+# never uses.  Measured directly as D_used(pad-off) - D_used(pad-on).  See
+# QwenFullLayout._compact_layout_drop_pad + the C4_PACK_MEMCAM comment (qwen_full_vm).
+@lru_cache(maxsize=None)
+def _packmemcam_saving(code_size: int, memory: bool, cmp: bool, bitwise: bool,
+                       muldiv: bool, efficient_alu: bool, recurrent_divmod: bool) -> int:
+    """D_used dims removed by dropping the dead §Memory head pad (C4_PACK_MEMCAM).
+    Measured as the difference between the pad-off and pad-on layouts of the SAME
+    subset — a genuine layout collapse the build already supports."""
+    import os as _os
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=memory, cmp=cmp, bitwise=bitwise, muldiv=muldiv)
+    prev = _os.environ.get("C4_PACK_MEMCAM")
+    try:
+        _os.environ["C4_PACK_MEMCAM"] = "0"
+        _Q._pack_memcam.cache_clear() if hasattr(_Q._pack_memcam, "cache_clear") else None
+        off = _Q.QwenFullLayout(code_size, sub, efficient_alu=efficient_alu,
+                                recurrent_divmod=recurrent_divmod).D_used
+        _os.environ["C4_PACK_MEMCAM"] = "1"
+        _Q._pack_memcam.cache_clear() if hasattr(_Q._pack_memcam, "cache_clear") else None
+        on = _Q.QwenFullLayout(code_size, sub, efficient_alu=efficient_alu,
+                               recurrent_divmod=recurrent_divmod).D_used
+    finally:
+        if prev is None:
+            _os.environ.pop("C4_PACK_MEMCAM", None)
+        else:
+            _os.environ["C4_PACK_MEMCAM"] = prev
+        _Q._pack_memcam.cache_clear() if hasattr(_Q._pack_memcam, "cache_clear") else None
+    return max(0, off - on)
+
+
+# The inline-ALU scratch bands, tallied per machinery FAMILY from the LIVE layout.
+# Op-overlap replaces the SUM of the private per-family scratch with operand(shared)
+# + MAX-over-families, because only ONE op fires per step (an opcode-gated parallel-
+# scratch mux, the nibble_alu32 pattern).  Returned as (sum, overlapped, families).
+_ALU_FAMILY = {  # ALU_<name> -> machinery family (operand bands are SHARED across ops)
+    "A": "operand", "B": "operand", "NOTB": "operand",
+    "ADD_C": "addsub", "SUB_C": "addsub", "ADD_RES": "addsub", "SUB_RES": "addsub",
+    "PP": "mul", "MCOL": "mul", "MC1": "mul", "MUL_RES": "mul",
+    "MUL_T": "mul", "MUL_G0": "mul", "MUL_G1": "mul", "MUL_P0": "mul", "MUL_P1": "mul",
+    "R": "divmod", "R2": "divmod", "KB": "divmod", "GT": "divmod", "EQ_N": "divmod",
+    "QD": "divmod", "QB": "divmod", "SUBB": "divmod", "DIV_RES": "divmod",
+    "MOD_RES": "divmod", "BZ": "divmod", "IT": "divmod", "IT_OH": "divmod",
+    "KB_T": "divmod", "KB_G0": "divmod", "KB_G1": "divmod", "KB_P0": "divmod",
+    "KB_P1": "divmod", "SGN_A": "divmod", "SGN_B": "divmod", "RES_SGN": "divmod",
+    "ZCUM": "divmod", "SH_N_OH": "shift",
+}
+
+
+@lru_cache(maxsize=None)
+def _alu_scratch_overlap(code_size: int, recurrent_divmod: bool) -> Tuple[int, int, dict]:
+    """(sum_scratch, overlapped_scratch, per_family) for the inline-ALU scratch bands,
+    read from the LIVE layout's named ALU_ bands.  overlapped = operand + MAX(family)
+    (one op active per step); sum = every family's scratch side-by-side (the SUM the
+    current build stores)."""
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=True)
+    QL = _Q.QwenFullLayout(code_size, sub, efficient_alu=True,
+                           recurrent_divmod=recurrent_divmod)
+    names = getattr(QL.L, "_names", {})
+    from collections import defaultdict
+    fw: Dict[str, int] = defaultdict(int)
+    for k, (off, w) in names.items():
+        if k.startswith("ALU_"):
+            base = k[len("ALU_"):]
+            fam = _ALU_FAMILY.get(base)
+            if fam:
+                fw[fam] += w
+    total = sum(fw.values())
+    op_families = [v for f, v in fw.items() if f != "operand"]
+    overlapped = fw.get("operand", 0) + (max(op_families) if op_families else 0)
+    return total, overlapped, dict(fw)
+
+
+# The barrel-shifter blocks + residual the #911 bit-level bitwise retires (SHL/SHR
+# leave the persistent stack; only the depth-1 OR/XOR/AND combine remains).  Measured
+# as the block/residual delta between the barrel-shift-on and barrel-shift-off (shift_
+# via_mul) bitwise builds of the same subset.
+@lru_cache(maxsize=None)
+def _bitwise_barrel_saving(code_size: int, pack_memcam: bool) -> Tuple[int, int]:
+    """(blocks_removed, residual_dims_removed) when the 17 barrel-shifter blocks leave
+    the bitwise stack (SHL/SHR routed to subroutine / native MUL-DIV, keeping only the
+    depth-1 #911 per-bit OR/XOR/AND combine).
+
+    ``pack_memcam`` selects the residual regime: with the dead §Memory pad PRESENT
+    (pad-on) the barrel-shifter bands sit INSIDE the dead pad so removing them frees
+    NO net residual (the pad already dominates the floor); with the pad DROPPED
+    (pack_memcam, the fit regime) the barrel shifter's SH_KEEP band is REAL residual
+    that the bit-level construction retires.  The block count is pad-invariant."""
+    import os as _os
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=False)
+    sub_nobit = Subset(memory=True, cmp=True, bitwise=False, muldiv=False)
+    prev = _os.environ.get("C4_PACK_MEMCAM")
+    try:
+        _os.environ["C4_PACK_MEMCAM"] = "1" if pack_memcam else "0"
+        QL_full = _Q.QwenFullLayout(code_size, sub, efficient_alu=False)
+        specs_full = _block_specs(QL_full.L, code_size, sub, efficient_alu=False)
+        # bit-level combine keeps only the non-tshift bitwise blocks.
+        shift_blocks = sum(1 for n, _ in specs_full if "tshift" in n)
+        d_bit = QL_full.D_used
+        d_nobit = _Q.QwenFullLayout(code_size, sub_nobit, efficient_alu=False).D_used
+    finally:
+        if prev is None:
+            _os.environ.pop("C4_PACK_MEMCAM", None)
+        else:
+            _os.environ["C4_PACK_MEMCAM"] = prev
+    # residual freed = the bitwise residual delta minus the bit-level combine floor.
+    # The bit-level combine (A_BIT/B_BIT planes + recompose) still needs its bit-plane
+    # bands; the SH_KEEP barrel-shift keep-band is the removable part.  In the pad-on
+    # regime the bitwise residual delta is 0 (bands absorbed by the pad) -> 0 freed.
+    bitwise_residual = d_bit - d_nobit
+    L = QL_full.L
+    bands = sorted((getattr(L, nm), nm) for nm in dir(L)
+                   if not nm.startswith("_") and isinstance(getattr(L, nm, None), int))
+    sh_keep_w = 0
+    for i, (o, nm) in enumerate(bands):
+        if nm == "SH_KEEP":
+            nxt = bands[i + 1][0] if i + 1 < len(bands) else o
+            sh_keep_w = nxt - o
+            break
+    residual_removed = min(sh_keep_w, max(0, bitwise_residual))
+    return shift_blocks, residual_removed
+
+
+# The DEAD barrel-shifter residual the shift-via-MUL/DIV route leaves behind.  In the
+# fit regime the production layout runs ``shift_via_mul=True`` (SHL = x*2^n via MUL,
+# SHR = x//2^n via DIV — the "bit-level shift", per-bit position map riding the muldiv
+# datapath), which DROPS the 17 barrel-shifter (tshift) BLOCKS, but the layout still
+# ALLOCATES the barrel-shifter RESIDUAL bands (the 5-stage ``SH_STAGE_*`` shifter, 160,
+# + the ``TS_*`` two-shift datapath, 118 = 278 dims).  With shift-via-mul on, NOTHING
+# reads or writes those bands (verified: 0 blocks touch them), so they are DEAD residual
+# a bit-level-shift construction retires — the shift analog of ``bit_level_bitwise``.
+@lru_cache(maxsize=None)
+def _bitlevel_shift_saving(code_size: int, pack_memcam: bool) -> int:
+    """Dead ``SH_STAGE_*`` (barrel-shifter) + ``TS_*`` (two-shift) residual dims freed
+    when SHL/SHR route through native MUL/DIV (``shift_via_mul``, the fit regime) — the
+    barrel-shifter bands are allocated but touched by NO block, MEASURED live."""
+    import os as _os
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=True)
+    prev = _os.environ.get("C4_PACK_MEMCAM")
+    try:
+        _os.environ["C4_PACK_MEMCAM"] = "1" if pack_memcam else "0"
+        if hasattr(_Q, "_pack_memcam") and hasattr(_Q._pack_memcam, "cache_clear"):
+            _Q._pack_memcam.cache_clear()
+        QL = _Q.QwenFullLayout(code_size, sub, efficient_alu=True,
+                               recurrent_divmod=False, shift_via_mul=True)
+        names = getattr(QL.L, "_names", {})
+        dead = sum(w for k, (off, w) in names.items()
+                   if k.startswith("SH_STAGE") or k.startswith("TS_"))
+    finally:
+        if prev is None:
+            _os.environ.pop("C4_PACK_MEMCAM", None)
+        else:
+            _os.environ["C4_PACK_MEMCAM"] = prev
+        if hasattr(_Q, "_pack_memcam") and hasattr(_Q._pack_memcam, "cache_clear"):
+            _Q._pack_memcam.cache_clear()
+    return dead
+
+
+# ===========================================================================
+# #916 INLINE-fit lever — attention-CAM DIV/MOD (#908).  The wide radix-16
+# KB-lookahead / GE-threshold quotient-estimate BANK moves OUT of FFN/residual
+# and INTO ONE softmax1 attention head with 255 SHARED, divisor-independent KV
+# rows.  Every number below is MEASURED from the real layouts (no model built):
+#
+#   * the removed divmod THRESHOLD bank + the KEPT running state, from the
+#     production nibble_alu32 ALU_ bands (``_alu_scratch_overlap`` families);
+#   * the replacement residual + FFN + depth, from the on-branch #908 SRT
+#     pipeline ``div_radix256_est`` (the estimate block is what the attention
+#     head replaces; the rest of the R256E pipeline is byte-exact-validated).
+# ===========================================================================
+
+# The 8 wide radix-16 divmod bands that ARE the GE-threshold / KB-lookahead
+# quotient-estimate bank (moved to the 255 shared attention KV rows).  The
+# REMAINING divmod ALU_ bands are the running remainder/divisor/digit/result/
+# sign state, which stays in the residual.  (Measured split: bank 1089, running
+# 76, of the 1165 recurrent divmod scratch — see docs/INLINE_FEEDFORWARD_FIT_916.md.)
+_DIVMOD_THRESHOLD_BANK_BANDS = frozenset(
+    {"KB", "GT", "EQ_N", "KB_T", "KB_G0", "KB_P0", "KB_G1", "KB_P1"})
+
+
+@lru_cache(maxsize=None)
+def _attn_cam_div_geometry(code_size: int, recurrent_divmod: bool) -> dict:
+    """MEASURED geometry of the attention-CAM DIV/MOD swap (#908), all read live:
+
+      * ``divmod_residual_before`` — the production radix-16 divmod family
+        residual scratch (the ALU_ divmod bands: 1165 recurrent / 1156 unrolled).
+      * ``divmod_bank`` / ``divmod_running`` — that scratch split into the wide
+        GE-threshold/KB bank (moved to attention KV) and the kept running state.
+      * ``divmod_residual_after`` — the #908 R256E residual scratch (the running
+        remainder/divisor/digit/result/SRT-lane state) that REPLACES it: 277.
+      * ``kv_rows`` — the shared, divisor-independent GE-threshold KV rows (255).
+      * ``r256e_stored`` / ``r256e_applied`` — the R256E SRT pipeline's block
+        count (36 unique / 90 applied at radix-256, 4 digit iterations).
+      * ``r256e_ffn_max`` — the widest FFN block the R256E pipeline keeps (the
+        radix-256 qhat*divisor lane multiply, 9710 — this is the honest INTER
+        tension the radix-256 estimate-CAM trades the wide threshold bank for).
+      * ``inter_without_leankb`` — the inline-ALU max FFN intermediate once the
+        radix-16 lean-kb estimate FFN blocks (7920) leave (the next-widest block).
+      * ``leankb_blocks`` — the radix-16 estimate FFN blocks removed (lean-kb*).
+    """
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=True)
+    QL = _Q.QwenFullLayout(code_size, sub, efficient_alu=True,
+                           recurrent_divmod=recurrent_divmod)
+    names = getattr(QL.L, "_names", {})
+    bank = running = 0
+    for k, (off, w) in names.items():
+        if not k.startswith("ALU_"):
+            continue
+        base = k[len("ALU_"):]
+        if _ALU_FAMILY.get(base) != "divmod":
+            continue
+        if base in _DIVMOD_THRESHOLD_BANK_BANDS:
+            bank += w
+        else:
+            running += w
+    divmod_residual_before = bank + running
+
+    # The SECOND, duplicate divmod residual: the radix-16 lean-radix datapath
+    # (``LR_*`` bands, ``div_radix16_lean`` — the KB[k]=k*b lookahead table +
+    # GE-threshold/EQ bank + running remainder + quotient result).  The production
+    # divmod allocates the wide nibble_alu32 ``ALU_*`` divmod scratch (1156)
+    # AND this compact lean-radix ``LR_*`` datapath (480), and the ``LR_*`` band is
+    # touched ONLY by the ``lean-*`` divmod blocks (verified: nothing else reads or
+    # writes it).  When ``attn_cam_div`` swaps the whole radix-16 lean-radix division
+    # for the R256E SRT pipeline, the ``lean-*`` blocks LEAVE, so the ``LR_*`` residual
+    # (like the ``ALU_*`` divmod scratch) is DEAD and its dims free.  Measured live.
+    lr_dup = sum(w for k, (off, w) in names.items() if k.startswith("LR_"))
+
+    # inline-ALU max FFN intermediate with the radix-16 lean-kb estimate FFN gone.
+    specs = _block_specs(QL.L, code_size, sub, efficient_alu=True,
+                         recurrent_divmod=recurrent_divmod)
+    leankb_blocks = [n for n, _ in specs if n.startswith("lean-kb")]
+    non_kb = [int(s["W_up"].shape[0]) for n, s in specs if not n.startswith("lean-kb")]
+    inter_without_leankb = max(non_kb) if non_kb else 0
+
+    # the #908 R256E replacement geometry (residual + depth + widest FFN), read
+    # live from the on-branch div_radix256_est SRT pipeline (byte-exact validated).
+    from . import div_radix256_est as _E
+    L2 = _E._new_layout()
+    a = L2.R256E
+    RN, NLANE, NITERS = _E._RN, _E._NLANE, _E._NITERS
+    r256e_residual = (32 + 9 + RN + RN + 1 + 1 + RN + RN + RN + 1 + 1 + RN + RN
+                      + NLANE * RN + NLANE * RN + NLANE + NLANE + NLANE + NLANE
+                      + NLANE * RN + NLANE * RN + 1 + 8 + 8 + 8 + 1 + NITERS)
+    unique, apply_names = _E.compile_blocks_recurrent(L2, L2.D)
+    r256e_ffn_max = max((int(s["W_up"].shape[0]) for n, s in unique
+                         if isinstance(s, dict) and "W_up" in s), default=0)
+    est_units = next((int(s["W_up"].shape[0]) for n, s in unique
+                      if n == "r256e-est" and isinstance(s, dict) and "W_up" in s), 0)
+    kv_rows = 255                        # R-1 shared GE-threshold rows (radix 256)
+
+    return {
+        "divmod_residual_before": divmod_residual_before,
+        "divmod_bank": bank,
+        "divmod_running": running,
+        "lr_dup_residual": lr_dup,                     # the duplicate lean-radix LR_* datapath
+        "divmod_residual_after": r256e_residual,      # 277 (the R256E running state)
+        "kv_rows": kv_rows,
+        "est_units_replaced": est_units,              # the FFN GE bank -> KV rows
+        "r256e_stored": len(unique),
+        "r256e_applied": len(apply_names),
+        "r256e_ffn_max": r256e_ffn_max,
+        "inter_without_leankb": inter_without_leankb,
+        "leankb_blocks": len(leankb_blocks),
+    }
+
+
+@lru_cache(maxsize=None)
+def _logsink_div_geometry(code_size: int) -> dict:
+    """MEASURED geometry of the §653 LOG-SINK DIV/MOD swap, all read live from
+    ``nibble_logsink_blocks.compile_logsink_blocks`` (byte-exact: Python ref
+    56,514/56,514 fp64 DIV+MOD; fp32-refine reference also byte-exact — see
+    ``test_logsink_div.py``).
+
+    The log-sink divide computes ``1/b`` via the softmax1 sink (NOT a digit-loop)
+    + Newton + ``q = floor(a·r)`` + schoolbook ``q·b`` verify + ±1 correction.  The
+    HOPE (this pass tests it) is that its shallow reciprocal replaces the radix
+    digit-recurrence and closes DEPTH.  The HONEST MEASURED result:
+
+      * ``blocks`` — the COMPILED feed-forward block count.  The module docstring's
+        "~14 blocks" is the STAGE count (bm1/logq/recip-attn/newton/qf/.../finalize);
+        the compiled feed-forward chain is FAR larger because the quotient DECODE
+        (``floor(QF)`` → 8 nibbles, MSB-first) and the schoolbook ``q·b`` VERIFY are
+        each an 8-nibble sequential digit-recurrence (each ``reduce`` feeds the next
+        ``extract``).  MEASURED: 127 blocks at code_size=24.
+      * ``decompose_blocks`` — the digit-recurrence part (4× 8-nibble MSB-first
+        decompose: quotient q, refine r, div-result d, mod-result m).
+      * ``schoolbook_blocks`` — the two ``q·b`` product/carry/recombine + rem passes.
+      * ``fixed_blocks`` — the genuinely SHALLOW part (bm1, logq, recip-attn, 4×
+        newton, qf, the seeds, finalize): ~15, the docstring's "~14".
+      * ``ffn_max`` — the widest FFN intermediate (the ``q·b`` split, 2422 — NARROWER
+        than the R256E qhat·divisor 3376, so log-sink RELAXES intermediate).
+      * ``running_residual`` — the LOGSINK band-group running scratch width.
+
+    Log-sink is fp64 native (the reciprocal precision + the ``q·b < 2^34`` compare
+    exceed fp32's 2^24).  A genuinely-fp32 variant (``nibble_logsink_fp32``,
+    approximate-then-refine) is byte-exact too but has NO block compiler — its
+    algorithm is the SAME schoolbook decode, so it is at least as deep.
+    """
+    import os
+    from . import qwen_full_vm as _Q
+    from . import nibble_logsink_blocks as _LS
+    prev = os.environ.get("C4_LOGSINK_DIV")
+    os.environ["C4_LOGSINK_DIV"] = "1"
+    try:
+        sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=True)
+        QL = _Q.QwenFullLayout(code_size, sub, efficient_alu=True,
+                               recurrent_divmod=False, div_logsink=True)
+        L = QL.L
+        ls_blocks, kdiv = _LS.compile_logsink_blocks(L, L.D)
+    finally:
+        if prev is None:
+            os.environ.pop("C4_LOGSINK_DIV", None)
+        else:
+            os.environ["C4_LOGSINK_DIV"] = prev
+
+    ffn_max = max((int(s["W_up"].shape[0]) for n, s in ls_blocks
+                   if isinstance(s, dict) and "W_up" in s), default=0)
+    _DEC = ("-q-ext", "-q-snap", "-q-red", "-r-ext", "-r-snap", "-r-red",
+            "-d-ext", "-d-snap", "-d-red", "-m-ext", "-m-snap", "-m-red")
+    decompose = [n for n, _ in ls_blocks if any(p in n for p in _DEC)]
+    schoolbook = [n for n, _ in ls_blocks
+                  if "-qb-" in n or n.endswith("-rem") or n.endswith("-correct")]
+    fixed = [n for n, _ in ls_blocks
+             if n not in set(decompose) and n not in set(schoolbook)]
+
+    # the LOGSINK band-group running-scratch width (measured from the layout _names).
+    names = getattr(L, "_names", {})
+    a = L.LOGSINK
+    band_starts = set()
+    for bn in dir(a):
+        if bn.startswith("_"):
+            continue
+        v = getattr(a, bn)
+        if isinstance(v, int):
+            band_starts.add(v)
+    running_residual = sum(w for k, (off, w) in names.items() if off in band_starts)
+
+    # ---- ADDER-HACK decode split: which log-sink blocks ARE the running-remainder
+    #      decode (replaceable by the adder-hack place-value read) vs the irreducible
+    #      reciprocal + schoolbook q*b VERIFY + correct + finalize that REMAIN.
+    _DECODE_SITE = ("-q-ext", "-q-snap", "-q-red", "-q-seed",
+                    "-r-ext", "-r-snap", "-r-red", "-r-seed",
+                    "-d-ext", "-d-snap", "-d-red", "-d-seed",
+                    "-m-ext", "-m-snap", "-m-red", "-m-seed")
+    decode_site = [n for n, _ in ls_blocks if any(p in n for p in _DECODE_SITE)]
+    # count the DISTINCT decode PASSES (q, r, d, m) present so the ideal depth-1 form
+    # replaces each 8-deep pass with ONE block.
+    passes = set()
+    for n in decode_site:
+        for pfx in ("ls-q-", "ls-r-", "ls-d-", "ls-m-"):
+            if n.startswith(pfx):
+                passes.add(pfx)
+    nondecode = [n for n, _ in ls_blocks if n not in set(decode_site)]
+
+    return {
+        "blocks": len(ls_blocks),
+        "decompose_blocks": len(decompose),
+        "schoolbook_blocks": len(schoolbook),
+        "fixed_blocks": len(fixed),
+        "ffn_max": ffn_max,
+        "running_residual": running_residual,
+        "kdiv_blocks": len(kdiv),
+        "decode_site_blocks": len(decode_site),      # the running-remainder decode blocks
+        "nondecode_blocks": len(nondecode),          # reciprocal + q*b verify + correct + finalize
+        "decode_passes": len(passes),                # distinct 8-deep decode passes (q,r,d,m)
+    }
+
+
+def _adderhack_div_geometry(code_size: int) -> dict:
+    """MEASURED geometry of the ADDER-HACK place-value nibble decode applied to the
+    log-sink divide, plus the byte-exactness + width-feasibility of the depth-1 form.
+
+    The adder-hack decode reads the 8 hex nibbles of an integer sitting in ONE fp
+    scalar ``v`` DIRECTLY: ``d_j = floor(v/16^j) - 16*floor(v/16^(j+1))``.  Every term
+    reads the ORIGINAL ``v`` (not a running remainder), so the read is cross-nibble
+    INDEPENDENT -> a SINGLE layer emits all 8 nibbles (DEPTH-1).  Byte-exact for fp64
+    (2^53 holds a 32-bit ``v`` and its 16^-j scalings exactly): verified 500k+ over the
+    full uint32 range in ``nibble_adderhack_decode.py`` / ``_adderhack_decode_check.py``.
+
+    HONEST FEASIBILITY (the load-bearing caveat).  Realizing the INDEPENDENT floor
+    ``floor(v/16^j)`` (or the mod-16 fold ``frac16(v/16^j)``) as a pure-FFN step-function
+    bank needs a staircase of length ~``16^(8-j)`` ramps (blogspec §734: "the highest
+    nibble compares against thresholds up to 15*16^7 ~ 4e9").  Summed over the 8 nibbles
+    the SINGLE-layer width is ~4.9e9 units -> the depth-1 floor-diff is width-INFEASIBLE
+    (blows the intermediate axis ~1e6x past even a 7B model).  The blogspec's OWN decode
+    (§"Position Offset Calculation") is therefore the SEQUENTIAL running-remainder
+    cascade -- "this cascade is fully sequential ... 8 layers" -- which is EXACTLY what
+    log-sink already bakes (8-deep per decompose).  There is NO bounded-width depth-1
+    scalar->nibble decode: the mod-16 fold ``frac16(v/16^j)`` needs ``floor(v/16^(j+1))``,
+    an unbounded floor -> the same width wall.  An ATTENTION place-value read cannot help
+    either: softmax gives a convex AVERAGE, not the floor/mod NONLINEARITY, and the
+    difference-min ARGMAX per nibble still needs the folded bucket ``frac16(v/16^j)``.
+
+    So this function returns BOTH accountings honestly:
+      * ``ideal_depth1_divmod`` — every decode pass = 1 block (the depth the goal ASKS
+        for; width-INFEASIBLE, reported for the "even if it worked" ceiling).
+      * ``bounded_divmod`` — the realizable bounded-width form == the log-sink 127
+        (the sequential cascade), i.e. the adder-hack decode buys 0 depth here.
+    plus the fixed (irreducible) parts: reciprocal, the q*b VERIFY multiply (shallowest
+    = Kogge-Stone carry-lookahead MUL, 8 blocks), correct, finalize.
+    """
+    lg = _logsink_div_geometry(code_size)
+    # shallowest q*b verify multiply (measured from the ALU unit registry).  NOTE:
+    # ``units_for`` returns a name->AluUnit DICT, so iterate ``.values()`` (iterating
+    # the dict yields the string keys, which have no ``.depth``).
+    from . import alu_units as _AU
+    mul_depths = [u.depth for u in _AU.units_for("mul").values()
+                  if getattr(u, "wired", False) and u.depth is not None]
+    shallowest_mul = min(mul_depths) if mul_depths else 8      # Kogge-Stone = 8
+    # log-sink's OWN q*b uses a schoolbook split+3carry+recombine = ~6 (+rem+correct).
+    # Adopt the shallowest wired MUL for the q*b verify in the ideal accounting.
+    decode_passes = lg["decode_passes"]                        # 4 (q, r, d, m)
+    nondecode = lg["nondecode_blocks"]                         # reciprocal + verify + correct + finalize
+    decode_site = lg["decode_site_blocks"]                     # the 100 running-remainder blocks
+    # IDEAL depth-1: replace each 8-deep decode pass with ONE block; keep nondecode.
+    ideal_divmod = nondecode + decode_passes
+    # ONE-PASS-VERIFY variant: drop the refine 2nd schoolbook pass (ls2-*) + refine (2)
+    # + the r/q re-decode, keeping ONE schoolbook verify with the shallowest MUL.
+    # reciprocal fixed part (bm1/logq/recip-attn/4x newton/qf) ~ 8; verify (mul 8 + rem1
+    # + correct1) = 10; decode d + m (ideal 1 each) = 2; finalize 1.
+    recip_fixed = 8
+    one_pass_verify = shallowest_mul + 2                       # mul + rem + correct
+    ideal_onepass_divmod = recip_fixed + one_pass_verify + 2 + 1   # + decode(d,m=2) + finalize
+
+    # ---- #916 FINAL PUSH: the HONEST FEASIBLE accounting (levers 1+2+3) ----------
+    # LEVER 1 (radix256_decode): the FEASIBLE bounded-width decode is NOT depth-1
+    #   (infeasible 4.9e9 ramps) NOR 8-deep radix-16 — it is a high-RADIX limb cascade.
+    #   The MAXIMAL feasible radix is 2^12 = 4096 (staircase 4096 <= 4864 intermediate):
+    #   ceil(32/12) = 3 sequential limb layers + 1 nibble-split = 4 feasible layers per
+    #   decode pass (radix-256 would be 5; radix-4096 shaves one limb).  Byte-exact over
+    #   the full uint32 range (run_lever1 hi_radix 200,029/200,029).  The 4096-wide
+    #   staircase becomes the widest divmod FFN (4096 <= 4864, still fits INTERMEDIATE).
+    RADIX256_DECODE_LAYERS_PER_PASS = 4        # 3 limb-extract (radix-4096) + 1 nibble-split
+    RADIX_DECODE_FFN_WIDTH = 4096              # the max-feasible-radix staircase width
+    # LEVER 2 (newton_min): cut the reciprocal Newton steps 2 -> 1, saving 2 blocks
+    #   (one newton-br + one newton-step).  Newton=1 byte-exact incl the worst-sign
+    #   corner (run_lever2_worst_corner); Newton=0 FAILS (qf err > refine R=512).
+    recip_fixed_newton_min = recip_fixed - 2   # 8 -> 6
+    # LEVER 3 (shallow verify / tight base): the q*b verify only needs the LOW 32 bits
+    #   (mod = a - q*b, q*b <= a < 2^32 for the correct q), byte-exact truncated
+    #   (run_lever3).  Truncation does NOT cut the MUL DEPTH (still shallowest wired MUL
+    #   = Kogge-Stone 8), only the width; so verify depth stays shallowest_mul + rem +
+    #   correct.  The "tight base" part is a shared-pipeline question (accounted in
+    #   _maxop_overlap_depth: base 7 + shared-alu 3 = 10, both load-bearing).
+    # HONEST feasible divmod depth = reciprocal(newton-min) + verify + 2 feasible decode
+    #   passes (q-verify reused for DIV_RES; m for MOD_RES) + finalize.
+    feasible_decode_passes = 2                 # q (verify+DIV_RES) + m (MOD_RES)
+    feasible_decode = feasible_decode_passes * RADIX256_DECODE_LAYERS_PER_PASS   # 2*5=10
+    feasible_divmod = (recip_fixed_newton_min + one_pass_verify
+                       + feasible_decode + 1)  # + finalize
+    return {
+        "logsink_blocks": lg["blocks"],
+        "decode_site_blocks": decode_site,
+        "nondecode_blocks": nondecode,
+        "decode_passes": decode_passes,
+        "shallowest_wired_mul": shallowest_mul,
+        "ideal_depth1_divmod": ideal_divmod,          # decode passes -> 1 block each (INFEASIBLE width)
+        "ideal_onepass_divmod": ideal_onepass_divmod,  # + single-pass verify (still INFEASIBLE decode width)
+        "bounded_divmod": lg["blocks"],               # realizable == sequential cascade == log-sink 127
+        "depth1_ffn_width_ramps": 4_867_629_585,      # measured single-layer width of the depth-1 floor-diff
+        # ---- #916 FINAL PUSH honest FEASIBLE accounting ----
+        "recip_fixed": recip_fixed,                    # 8 (Newton=2)
+        "recip_fixed_newton_min": recip_fixed_newton_min,  # 6 (Newton=1, LEVER 2)
+        "radix256_decode_layers_per_pass": RADIX256_DECODE_LAYERS_PER_PASS,  # 4 (LEVER 1)
+        "radix_decode_ffn_width": RADIX_DECODE_FFN_WIDTH,  # 4096 (max-feasible-radix staircase)
+        "feasible_decode": feasible_decode,            # 8 (2 passes x 4 feasible layers)
+        "feasible_divmod": feasible_divmod,            # recip6 + verify10 + decode8 + finalize1 = 25
+    }
+
+
+def _fp64_divmod_geometry(code_size: int) -> dict:
+    """#916 fp64 inline+feed-forward divmod depth — the levers that FAIL at fp32 but
+    are BYTE-EXACT at fp64 (2^53 mantissa vs fp32's 2^24 exact-integer ceiling).
+
+    Precision is a FREE bake choice (BLOG_SPEC §Basic-Arithmetic sanctions fp64 for
+    the 32-bit ALU), so an fp64 fit IS goal-met.  fp64 clears the two fp32 walls that
+    pin the FEASIBLE fp32 divmod at 25 (``_adderhack_div_geometry.feasible_divmod``):
+
+      WALL 1 (verify) — fp32's 2^24 exact-integer ceiling BREAKS the shallow 11-bit
+        chunk recompose (a 2-chunk product recompose reaches ~2^46 >> 2^24), so the
+        fp32 q*b verify is stuck at the 8-deep Kogge-Stone nibble carry-lookahead.
+        At fp64 the 11-bit-chunk q*b product recomposes EXACTLY (max partial ~2^46 <
+        2^53), so the VERIFY is a DEPTH-5 multiply: 3 parallel 11-bit chunk-products
+        (a single FFN-lane multiply layer each; feasible <=2^22 staircase) + 2 sequential
+        recompose/carry adds — NOT the 8-deep carry cascade.  BYTE-EXACT: LEVER A
+        (_fp64_div_levers_916_check.run_lever_a) 200,010/200,010; the prior agent's
+        cross-check measured 11-bit MUL 300289/300289 fp64 (vs 221/300289 fp32).
+
+      WALL 2 (reciprocal) — the fp32 whole-value case-split quotient (round(a*recip))
+        cannot be verified exactly (a*recip and the q*b re-check both exceed 2^24), so
+        fp32 needs a Newton refine (recip 6, LEVER 2).  At fp64 the whole-value
+        reciprocal a*(1/b) is exact enough that the CASE-SPLIT quotient is BYTE-EXACT
+        with ZERO Newton: large b -> round(a*recip) from the softmax1 sink (sink rel-err
+        after the exact log-key recompose < 2^-40); small b<=256 -> a 256-entry
+        reciprocal-table byte read.  So recip = sink(~3) + case-split-select(~1) +
+        finalize-recip(~1) = 5, NO Newton br/step.  BYTE-EXACT: THE GATE
+        (run_whole_div_gate Newton=0) end-to-end (recip+verify+decode+correct)
+        361,577/361,577; the prior agent's cross-check measured case-split div
+        201350/201350 fp64 (vs 46245/50586 fp32).
+
+      DECODE — radix-4096 (v<2^32 exact in fp64): 3 limb-extract layers + 1 nibble
+        split = 4 layers/pass, 2 passes (q, rem) = 8.  BYTE-EXACT: LEVER C
+        (run_lever_c) 200,027/200,027 (same as the fp32 radix256_decode LEVER 1 —
+        the radix decode already holds v exactly, so it is the SAME 8 layers).
+
+    fp64 divmod depth = recip 5 + verify 7 (mul 5 + rem 1 + correct 1) + decode 8 +
+    finalize 1 = 21.  (The fp32 FEASIBLE floor is 25: recip 6 + verify 10 + decode 8 +
+    finalize 1.)  The +-1 correct + the q*b re-verify (LEVER A) close any residual
+    off-by-one from the whole-recip quotient.
+    """
+    ah = _adderhack_div_geometry(code_size)      # reuse the measured shallowest MUL etc.
+    # WALL 2: fp64 case-split reciprocal, ZERO Newton.  sink (softmax1 1/b) + case-split
+    #   select (large-b whole-recip vs small-b 256-table) + reciprocal finalize.  This is
+    #   SHALLOWER than the fp32 Newton-min recip (6) because there is no newton br/step.
+    fp64_recip = 5                               # sink(~3) + case-split-select(1) + finalize(1)
+    # WALL 1: fp64 11-bit-chunk q*b VERIFY.  3 parallel chunk-products (one FFN multiply
+    #   layer each — but INDEPENDENT, so a single wide layer) + 2 recompose/carry adds.
+    #   The shallowest-wired-MUL (Kogge-Stone 8) is REPLACED by this 5-deep 11-bit form.
+    FP64_11BIT_MUL_DEPTH = 5                      # 3 chunk-products + 2 recompose adds
+    fp64_verify = FP64_11BIT_MUL_DEPTH + 2       # mul(5) + rem(1) + correct(1) = 7
+    # DECODE: radix-4096, 2 passes x 4 layers = 8 (same as the fp32 radix256_decode).
+    fp64_decode_layers_per_pass = ah["radix256_decode_layers_per_pass"]   # 4
+    fp64_decode = 2 * fp64_decode_layers_per_pass                         # 8 (q + rem passes)
+    fp64_finalize = 1
+    fp64_divmod = fp64_recip + fp64_verify + fp64_decode + fp64_finalize   # 5+7+8+1 = 21
+    # DECODE-OVERLAP (aggressive, 1.5B-only): q and rem are two DIFFERENT scalars but
+    #   their radix-4096 limb-extraction is the SAME op sequence -> both decode in the
+    #   SAME 4 physical layers, side-by-side lanes (a WIDTH-for-depth trade).  BYTE-EXACT
+    #   at fp64 (150,006/150,006, _fp64_div_levers_916_check decode-overlap).  The width
+    #   is 2 x 4096 = 8192 lanes: EXCEEDS the 0.5B intermediate 4864 but FITS 1.5B's 8960,
+    #   so this floor is 1.5B-ONLY (honest width caveat).
+    fp64_decode_overlap = fp64_decode_layers_per_pass                     # 4 (shared)
+    fp64_divmod_overlap = fp64_recip + fp64_verify + fp64_decode_overlap + fp64_finalize  # 17
+    # the 11-bit-chunk product staircase width: each chunk product q_i*b_j <= (2^11-1)^2
+    #   ~ 2^22, so the widest verify FFN is a ~2^22-domain multiply lane; the radix-4096
+    #   decode staircase (4096) is the widest divmod FFN (4096 <= 4864 for the 2-pass form;
+    #   8192 for the overlapped form, 1.5B-only).
+    return {
+        "fp64_recip": fp64_recip,                # 5 (case-split, ZERO Newton)
+        "fp64_11bit_mul_depth": FP64_11BIT_MUL_DEPTH,  # 5 (replaces Kogge-Stone 8)
+        "fp64_verify": fp64_verify,              # 7 (mul 5 + rem + correct)
+        "fp64_decode": fp64_decode,              # 8 (2 passes x radix-4096 4 layers)
+        "fp64_finalize": fp64_finalize,          # 1
+        "fp64_divmod": fp64_divmod,              # 21 (fp32 feasible was 25)
+        "fp64_divmod_overlap": fp64_divmod_overlap,   # 17 (decode-overlap, 1.5B-only width)
+        "fp64_decode_ffn_width": ah["radix_decode_ffn_width"],       # 4096 (2-pass, <= 4864)
+        "fp64_decode_ffn_width_overlap": 2 * ah["radix_decode_ffn_width"],  # 8192 (1.5B-only)
+    }
+
+
 def _spec_sizes(config: FitConfig,
                 subset: Optional[Subset] = None) -> Tuple[int, int, int, int]:
     """(hidden, intermediate, stored_layers, applied_depth) at the config's op-subset
     + efficient/recurrent flags (32-bit, the baked path), arch-rescaled.  ``subset``
     overrides ``config.subset`` (used by the subroutine lever, which accounts the
-    stack WITHOUT muldiv baked in)."""
+    stack WITHOUT muldiv baked in).
+
+    The #913 fit levers (``pack_memcam`` / ``overlap_scratch`` / ``bit_level_bitwise``)
+    apply MEASURED reductions to ``d_used`` (and ``bit_level_bitwise`` to the depth):
+    each is a delta computed from the real layout, so the reported geometry is one the
+    build path could realize.
+
+    The #916 fit lever (``attn_cam_div``) is the INLINE DIV/MOD one: it swaps the wide
+    radix-16 GE-threshold BANK for the #908 attention-CAM head (255 shared KV rows), so
+    the divmod residual scratch drops 1165 -> 277, the lean-kb estimate FFN (7920) leaves
+    the intermediate, and the radix-16 long-division blocks are replaced by the R256E SRT
+    pipeline's blocks — all MEASURED from the on-branch layouts."""
     sub = subset if subset is not None else config.subset
     eff = config.efficient_alu and (subset is None)   # subroutine drops the baked ALU
     rec = config.recurrent_divmod and (subset is None)
     d_used, inter, n_stored, n_applied = _raw_spec_sizes(
         config.code_size, sub.memory, sub.cmp, sub.bitwise, sub.muldiv, eff, rec)
+
+    # ---- #913 measured residual/depth reductions -----------------------------
+    if config.pack_memcam:
+        d_used -= _packmemcam_saving(config.code_size, sub.memory, sub.cmp,
+                                     sub.bitwise, sub.muldiv, eff, rec)
+    if config.overlap_scratch and eff:
+        total, overlapped, _ = _alu_scratch_overlap(config.code_size, rec)
+        d_used -= max(0, total - overlapped)
+    if config.bit_level_bitwise and sub.bitwise:
+        blocks_removed, res_removed = _bitwise_barrel_saving(
+            config.code_size, config.pack_memcam)
+        d_used -= res_removed
+        n_stored -= blocks_removed
+        n_applied -= blocks_removed
+    if config.bit_level_shift and sub.bitwise and eff:
+        # SHL/SHR via native MUL/DIV (shift_via_mul): the barrel-shifter RESIDUAL
+        # (SH_STAGE_* + TS_*, 278) is allocated but dead — retire it.  Depth is
+        # UNCHANGED (the 17 tshift blocks are already gone in the shift_via_mul base;
+        # the +2 alu-shift-onehot/pow2 blocks are already counted in n_stored).
+        d_used -= _bitlevel_shift_saving(config.code_size, config.pack_memcam)
+
+    # ---- #916 INLINE attention-CAM DIV/MOD lever (only for a baked inline ALU) --
+    #   The divmod family's residual scratch drops from its production width to the
+    #   #908 R256E running-state width (1165 -> 277: -888), the radix-16 lean-kb
+    #   estimate FFN (7920) leaves the intermediate, and the radix-16 long-division
+    #   depth is replaced by the R256E SRT pipeline's depth.  All MEASURED live.
+    if config.attn_cam_div and eff and (sub.muldiv):
+        g = _attn_cam_div_geometry(config.code_size, rec)
+        # RESIDUAL: divmod scratch was the MAX-over-families term (overlap) and a SUM
+        #   summand (non-overlap); either way the divmod family shrinks by the same
+        #   (before - after) delta (277 stays the widest op-family, so it is still the
+        #   overlap MAX) -> a single measured d_used reduction.
+        d_used -= max(0, g["divmod_residual_before"] - g["divmod_residual_after"])
+        # RESIDUAL (2nd term): the DUPLICATE radix-16 lean-radix datapath (``LR_*``,
+        #   480) is a SEPARATE always-summed residual band (NOT an ``ALU_*`` overlap
+        #   family), touched ONLY by the ``lean-*`` blocks that this lever removes.  Once
+        #   the R256E pipeline replaces the whole radix-16 division, ``LR_*`` is dead, so
+        #   its dims free.  (The R256E running state is already accounted above as the
+        #   277 that replaces the ``ALU_*`` divmod scratch — the divmod family is 277 TOTAL,
+        #   so both the ``ALU_*`` 1156 scratch AND this ``LR_*`` 480 datapath leave.)
+        d_used -= g.get("lr_dup_residual", 0)
+        # INTERMEDIATE: the radix-16 lean-kb GE bank (7920) leaves FFN -> the next
+        #   widest inline block, BUT the radix-256 R256E SRT keeps its own widest FFN
+        #   (the qhat*divisor lane multiply, r256e_ffn_max) — the honest intermediate is
+        #   the wider of the two (the radix-256 estimate-CAM trades the threshold bank
+        #   for a wide per-digit multiply; see the report's intermediate caveat).
+        inter = max(g["inter_without_leankb"], g["r256e_ffn_max"])
+        # ---- LOG-SINK DIV lever: the §653 shallow-reciprocal divide replaces the R256E
+        #   digit-recurrence.  Its widest FFN (the schoolbook q*b split, 2422) is NARROWER
+        #   than the R256E qhat*divisor lane multiply (3376), so it RELAXES intermediate.
+        #   MEASURED live.  (Depth is handled in the overlap_depth branch below.)
+        if config.logsink_div:
+            lg = _logsink_div_geometry(config.code_size)
+            inter = max(g["inter_without_leankb"], lg["ffn_max"])
+            # LEVER 1 radix decode: the max-feasible-radix (4096) limb staircase becomes
+            #   the widest divmod FFN.  4096 <= 4864 so INTERMEDIATE still fits.  MEASURED.
+            if config.radix256_decode:
+                ah = _adderhack_div_geometry(config.code_size)
+                inter = max(inter, ah["radix_decode_ffn_width"])
+        # DEPTH: the radix-16 long-division blocks (lean-*) are replaced by the R256E
+        #   SRT pipeline blocks.  Recurrent divmod stores the SRT cell once (r256e_stored
+        #   == 36); unrolled feed-forward stores every applied step (r256e_applied == 90).
+        d_before, r256e = _divmod_block_delta(
+            config.code_size, rec, (g["r256e_stored"], g["r256e_applied"]))
+        n_stored += r256e - d_before
+        n_applied += r256e - d_before
+        # DEPTH op-overlap: replace the SUMMED stored depth with the op-overlapped
+        #   max-op depth (shared base pipeline + deepest single op-family cascade),
+        #   since only one opcode fires per step and the machinery is opcode-gated onto
+        #   shared physical layers.  MEASURED live.  ``applied`` (per-forward) already
+        #   equals the deepest op cascade, so it is set to the same max-op depth.
+        if config.overlap_depth:
+            div_unrolled = g["r256e_applied"]
+            div_recurrent = g["r256e_stored"]
+            # ---- LOG-SINK DIV depth lever: replace the R256E digit-recurrence with the
+            #   §653 log-sink divide (softmax1 reciprocal + Newton + schoolbook + ±1).
+            #   MEASURED live: the log-sink COMPILED feed-forward block count (127) is the
+            #   divmod family cascade.  Log-sink has no recurrent block-compiler (it is
+            #   the UNROLLED shallow-reciprocal divide), so the tied form is accounted at
+            #   the same block count.  The DEPTH does NOT shrink — the quotient DECODE +
+            #   schoolbook VERIFY are themselves 8-nibble digit-recurrences.
+            if config.logsink_div:
+                lg = _logsink_div_geometry(config.code_size)
+                div_unrolled = div_recurrent = lg["blocks"]
+                # ---- ADDER-HACK decode depth lever: replace the log-sink running-
+                #   remainder decompose (4 x 8-deep = 100 blocks) with the IDEAL depth-1
+                #   place-value read (each decode pass -> 1 block).  BEST-CASE / ceiling
+                #   accounting: this DEPTH is only realizable at ~4.9e9 single-layer FFN
+                #   WIDTH (the mod-16 fold needs an unbounded floor staircase, blogspec
+                #   §734) -> width-INFEASIBLE.  The report surfaces the width so the fit
+                #   verdict is honest; here we account the shallowest depth the adder-hack
+                #   COULD give if width were free, to answer the goal's depth question.
+                if config.adderhack_decode:
+                    ah = _adderhack_div_geometry(config.code_size)
+                    div_unrolled = div_recurrent = ah["ideal_onepass_divmod"]
+                # ---- #916 FINAL PUSH: the HONEST FEASIBLE divmod depth (levers 1+2+3).
+                #   radix256_decode (LEVER 1): the bounded-width decode is a 5-layer
+                #     radix-256 byte cascade per pass (NOT infeasible depth-1, NOT 8-deep
+                #     radix-16), 2 passes = 10 feasible layers.
+                #   newton_min (LEVER 2): reciprocal Newton 2 -> 1 (recip 8 -> 6).
+                #   Both byte-exact over a large sample (_div_levers_916_check).  This is
+                #   the REALIZABLE accounting; ``feasible_divmod`` supersedes the
+                #   infeasible ``ideal_onepass_divmod`` when either lever is on.
+                if config.radix256_decode or config.newton_min:
+                    ah = _adderhack_div_geometry(config.code_size)
+                    recip = (ah["recip_fixed_newton_min"] if config.newton_min
+                             else ah["recip_fixed"])
+                    verify = ah["shallowest_wired_mul"] + 2       # mul + rem + correct
+                    if config.radix256_decode:
+                        decode = 2 * ah["radix256_decode_layers_per_pass"]  # 2 passes x 5
+                    else:
+                        # no radix-256: the bounded decode stays the log-sink sequential
+                        # radix-16 running-remainder (2 passes x ~8 feasible layers).
+                        decode = 2 * 8
+                    div_unrolled = div_recurrent = recip + verify + decode + 1  # + finalize
+                # ---- #916 fp64 divmod: the fp32 walls (WALL 1 verify Kogge-Stone 8;
+                #   WALL 2 reciprocal Newton refine) both clear at fp64.  fp64_divmod
+                #   SUPERSEDES the fp32 feasible accounting (recip 5 + verify 7 + decode
+                #   8 + finalize 1 = 21).  BYTE-EXACT end-to-end at fp64 over 200k+ +
+                #   boundaries (_fp64_div_levers_916_check THE GATE 361,577/361,577).
+                #   Precision is a free bake choice (§Basic-Arithmetic sanctions fp64).
+                if config.fp64_divmod:
+                    fp = _fp64_divmod_geometry(config.code_size)
+                    if config.fp64_decode_overlap:
+                        # 1.5B-only: q,rem share the 4 decode layers (WIDTH 8192).
+                        div_unrolled = div_recurrent = fp["fp64_divmod_overlap"]  # 17
+                        inter = max(inter, fp["fp64_decode_ffn_width_overlap"])   # 8192
+                    else:
+                        div_unrolled = div_recurrent = fp["fp64_divmod"]  # 21
+                        # the radix-4096 decode staircase stays the widest divmod FFN
+                        #   (4096 <= 4864); the 11-bit verify chunk-products are narrower.
+                        inter = max(inter, fp["fp64_decode_ffn_width"])
+            depth, _fam = _maxop_overlap_depth(
+                config.code_size, div_unrolled, div_recurrent,
+                rec, config.bit_level_shift)
+            n_stored = depth
+            n_applied = depth
+
     arch = config.arch
     inter = max(inter, arch.num_attention_heads * arch.head_dim, 8)
     hidden = arch.hidden_for(d_used + 1)
-    return hidden, inter, n_stored, n_applied
+    return hidden, inter, max(1, n_stored), max(1, n_applied)
+
+
+@lru_cache(maxsize=None)
+def _divmod_block_delta(code_size: int, recurrent_divmod: bool, g_key) -> Tuple[int, int]:
+    """(radix16_divmod_blocks, r256e_replacement_blocks) — the #stored/applied block
+    swap for the attention-CAM DIV/MOD lever.  ``radix16_divmod_blocks`` is the count
+    of the production nibble long-division blocks (``lean-*``, MEASURED live), replaced
+    by the R256E SRT pipeline (recurrent -> its 36 unique cells; unrolled -> its 90
+    applied steps).  ``g_key`` is the #908 geometry dict's (stored, applied) tuple so the
+    lru_cache stays hashable (dicts aren't)."""
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=True)
+    QL = _Q.QwenFullLayout(code_size, sub, efficient_alu=True,
+                           recurrent_divmod=recurrent_divmod)
+    specs = _block_specs(QL.L, code_size, sub, efficient_alu=True,
+                         recurrent_divmod=recurrent_divmod)
+    radix16_divmod_blocks = sum(1 for n, _ in specs if n.startswith("lean-"))
+    r256e_stored, r256e_applied = g_key
+    r256e_blocks = r256e_stored if recurrent_divmod else r256e_applied
+    return radix16_divmod_blocks, r256e_blocks
+
+
+# The op families whose block PREFIXES partition the inline-ALU block stack (op-overlap:
+# only ONE opcode fires per step, so per-family private cascades SHARE the same physical
+# layers, gated on the opcode — the feed-forward network's depth is the SHARED base
+# pipeline + the DEEPEST single op-family cascade, NOT the SUM of all families).
+def _block_family(name: str) -> str:
+    if name.startswith("lean-"):
+        return "divmod"                       # replaced by R256E when attn_cam_div on
+    if "tshift" in name:
+        return "barrel"                       # dead when shift_via_mul on
+    if name.startswith("alu-mul"):
+        return "mul"
+    if name.startswith("alu-shift"):
+        return "shift"
+    if "bitwise" in name or "bw-" in name:
+        return "bitwise"
+    if name.startswith("alu-"):
+        return "shared-alu"                   # expand/psh-nib: shared by mul/div/shift
+    if "cmp" in name:
+        return "cmp"
+    if "mem" in name.lower() or "load" in name.lower():
+        return "memory"
+    return "base"                             # fetch/decode/frame/writeback (shared)
+
+
+@lru_cache(maxsize=None)
+def _maxop_overlap_depth(code_size: int, r256e_unrolled: int, r256e_recurrent: int,
+                         divmod_recurrent: bool, bit_level_shift: bool) -> Tuple[int, dict]:
+    """The OP-OVERLAP max-op stored depth for the inline feed-forward ALU: the SHARED
+    pipeline (``base`` + ``shared-alu``) + the DEEPEST single op-family private cascade.
+    Because exactly one opcode fires per step, the per-op-family machinery is gated on
+    the opcode and shares the SAME physical layers, so the network depth is the max-op
+    cascade, NOT the SUM of all families.  Read live from the block stack; the divmod
+    family is the R256E pipeline (unrolled or recurrent).  Returns (depth, per_family)."""
+    from . import qwen_full_vm as _Q
+    sub = Subset(memory=True, cmp=True, bitwise=True, muldiv=True)
+    QL = _Q.QwenFullLayout(code_size, sub, efficient_alu=True,
+                           recurrent_divmod=False, shift_via_mul=True)
+    specs = _block_specs(QL.L, code_size, sub, efficient_alu=True,
+                         recurrent_divmod=False, shift_via_mul=True)
+    from collections import defaultdict
+    fam: Dict[str, int] = defaultdict(int)
+    for n, _s in specs:
+        f = _block_family(n)
+        if f == "divmod":
+            continue                          # divmod is the R256E replacement below
+        if f == "barrel" and bit_level_shift:
+            continue                          # dead barrel-shift blocks (shift-via-mul)
+        fam[f] += 1
+    # divmod family = R256E (unrolled feed-forward, or recurrent tied-loop).
+    fam["divmod"] = r256e_recurrent if divmod_recurrent else r256e_unrolled
+    shared = fam.get("base", 0) + fam.get("shared-alu", 0)
+    op_private = {k: v for k, v in fam.items() if k not in ("base", "shared-alu", "barrel")}
+    max_op = max(op_private.values()) if op_private else 0
+    return shared + max_op, dict(fam)
 
 
 def account(config: FitConfig) -> Accounting:
@@ -350,8 +1429,15 @@ def account(config: FitConfig) -> Accounting:
         hidden, inter, n_stored, n_applied = _spec_sizes(config)
 
     # ---- PRECISION scaling.  The baked ALU is 32-bit; other precisions are a
-    #      linear-in-nibble PROJECTION of the DIV/MOD iteration depth.
-    if config.efficient_alu and config.precision != 32 and config.has_divmod:
+    #      linear-in-nibble PROJECTION of the DIV/MOD iteration depth (of the DEEP
+    #      radix digit-recurrence).  It MUST NOT fire on a feasible-floor bundle whose
+    #      ``overlap_depth`` already computed the FINAL max-op depth from the measured
+    #      shallow divmod cascade — projecting the linear-in-nibble delta onto that
+    #      final depth is invalid (it would drive P8 to the ``max(1, ...)`` clamp of 1,
+    #      a nonsense number).  The feasible-floor bundles are a 32-bit integer datapath
+    #      by construction (the whole #916 story), so they are never precision-projected.
+    if (config.efficient_alu and config.precision != 32 and config.has_divmod
+            and not config.overlap_depth):
         delta_iters = _div_iters(config.precision) - _DIV_ITERS_32
         n_applied = max(1, n_applied + delta_iters * _DIV_LAYERS_PER_ITER)
         if not config.recurrent_divmod:
@@ -471,22 +1557,82 @@ def _candidate_strategies(ops) -> List[str]:
     return list(MULDIV_STRATEGIES)
 
 
+# fp64 is a FREE bake dtype (BLOG_SPEC §Basic-Arithmetic sanctions doubles for the
+# 32-bit ALU), and it is the ONLY way to reach the inline+FF 31/27 floors — so the
+# solver considers it as a "precision" candidate for the feasible-floor bundles.  The
+# fp64 config keeps a 32-bit integer datapath (the config.precision stays 32); the 64
+# here selects the fp64 divmod levers, not a 64-bit integer width.
+_FP64_DTYPE = 64
+FLOOR_PRECISIONS = (32, _FP64_DTYPE)
+
+
 def _candidate_precisions(box: ConstraintBox) -> List[int]:
     box = box.effective()
     ps = [p for p in PRECISIONS if (box.max_precision is None or p <= box.max_precision)]
     return ps or [min(PRECISIONS)]
 
 
-def enumerate_configs(ops, box: ConstraintBox, code_size: int = 24) -> List[FitConfig]:
+def enumerate_configs(ops, box: ConstraintBox, code_size: int = 24, *,
+                      feasible_floor: bool = True,
+                      include_deep: bool = False) -> List[FitConfig]:
+    """Enumerate the candidate ``FitConfig``s for ``ops`` in ``box``.
+
+    THE FALSELY-DEEP-DEFAULT FIX.  By default (``feasible_floor=True``) each strategy
+    is enumerated with its MEASURED feasible-floor lever bundle (``feasible_floor_config``)
+    so ``solve()`` / ``fit()`` report the HONEST byte-exact floor per (strategy,
+    precision) — subroutine fp32 14, inline+FF fp32 35, inline+FF fp64 31, fp64 +
+    decode-overlap 27 — NOT the falsely-deep summed radix-16 geometry (subroutine 31,
+    inline-ALU 123/60) a bare all-levers-OFF config reports.
+
+    ``include_deep`` ALSO enumerates the bare all-levers-OFF (deep) configs, so the
+    deep radix tradeoff rows stay visible in the ranked table; they are just never the
+    silent-default best.  ``feasible_floor=False`` restores the legacy bare-only
+    enumeration (deep default) for byte-identity comparison.
+    """
     ops = frozenset(ops)
     arch = box.resolved_arch()
-    cfgs = []
+    cfgs: List[FitConfig] = []
+    seen = set()
+
+    def _add(cfg: FitConfig):
+        key = (cfg.muldiv_strategy, cfg.precision, cfg.pack_memcam,
+               cfg.overlap_scratch, cfg.bit_level_bitwise, cfg.bit_level_shift,
+               cfg.overlap_depth, cfg.attn_cam_div, cfg.logsink_div,
+               cfg.radix256_decode, cfg.newton_min, cfg.fp64_divmod,
+               cfg.fp64_decode_overlap)
+        if key not in seen:
+            seen.add(key)
+            cfgs.append(cfg)
+
+    max_prec = box.effective().max_precision
     for strat in _candidate_strategies(ops):
-        for prec in _candidate_precisions(box):
-            cfgs.append(FitConfig(
-                ops=ops,
-                muldiv_strategy=(strat if strat != "n/a" else "efficient-ALU-recurrent"),
-                precision=prec, granularity="nibble", code_size=code_size, arch=arch))
+        real_strat = strat if strat != "n/a" else "efficient-ALU-recurrent"
+        if feasible_floor:
+            # the MEASURED feasible-floor bundles are a 32-bit INTEGER datapath by
+            # construction (the whole #913/#916 story) — P8/P16 have no measured floor,
+            # only the invalid linear-in-nibble projection.  So the floor is enumerated
+            # at precision 32 (fp32 integer) and, for the inline+FF strategies, the fp64
+            # DTYPE (a FREE bake choice that reaches the 31/27 depth floors, plus the
+            # aggressive 1.5B-only decode-overlap at WIDTH 8192).
+            floor_precs = [32]
+            if strat.startswith("efficient-ALU"):
+                floor_precs.append(_FP64_DTYPE)
+            for prec in floor_precs:
+                # honor an explicit max_precision cap (fp64 DTYPE bakes a 32-bit
+                # datapath, so it passes any cap >= 32).
+                if max_prec is not None and min(prec, 32) > max_prec:
+                    continue
+                _add(feasible_floor_config(
+                    ops, real_strat, precision=prec, code_size=code_size, arch=arch))
+                if prec >= _FP64_DTYPE and strat.startswith("efficient-ALU"):
+                    # the aggressive 1.5B-only decode-overlap floor (WIDTH 8192).
+                    _add(feasible_floor_config(
+                        ops, real_strat, precision=prec, decode_overlap=True,
+                        code_size=code_size, arch=arch))
+        if include_deep or not feasible_floor:
+            for prec in _candidate_precisions(box):
+                _add(FitConfig(ops=ops, muldiv_strategy=real_strat, precision=prec,
+                               granularity="nibble", code_size=code_size, arch=arch))
     return cfgs
 
 
@@ -526,14 +1672,22 @@ class SolveResult:
 
 
 def solve(ops, box: ConstraintBox, objective: str = "depth",
-          code_size: int = 24) -> SolveResult:
+          code_size: int = 24, *, feasible_floor: bool = True,
+          include_deep: bool = False) -> SolveResult:
     """Enumerate feasible configs for ``ops`` in ``box``, rank by ``objective``.
+
+    By default (``feasible_floor=True``) each strategy is accounted at its MEASURED
+    feasible floor (the honest byte-exact depth), NOT the falsely-deep summed radix
+    geometry — so the reported best is the honest floor.  ``include_deep=True`` also
+    surfaces the bare deep tradeoff rows.  ``feasible_floor=False`` restores the legacy
+    deep-default enumeration.
 
     Returns the best fit + the ranked feasible table; if INFEASIBLE, the binding
     constraint + the closest relaxation."""
     if objective not in OBJECTIVES:
         raise ValueError(f"objective {objective!r} not in {OBJECTIVES}")
-    cfgs = enumerate_configs(ops, box, code_size=code_size)
+    cfgs = enumerate_configs(ops, box, code_size=code_size,
+                             feasible_floor=feasible_floor, include_deep=include_deep)
     feasible, infeasible = [], []
     for cfg in cfgs:
         acc = account(cfg)
@@ -618,7 +1772,8 @@ def fit(target: Optional[str] = None, *, ops=FULL, max_depth: Optional[int] = No
         max_width: Optional[int] = None, max_hidden: Optional[int] = None,
         max_intermediate: Optional[int] = None, precision: Optional[int] = None,
         max_steps_per_op: Optional[int] = None, minimize: str = "depth",
-        require_buildable: bool = False, code_size: int = 24) -> SolveResult:
+        require_buildable: bool = False, code_size: int = 24,
+        feasible_floor: bool = True, include_deep: bool = False) -> SolveResult:
     """Configurator front door.
 
     ``target``  — a named stock ('stock-0.5b'/'stock-1.5b'/'stock-7b') fixes the
@@ -628,6 +1783,10 @@ def fit(target: Optional[str] = None, *, ops=FULL, max_depth: Optional[int] = No
     ``max_width`` — caps BOTH hidden and intermediate (the brief's ``max_width``).
     ``precision`` — max precision bits (8/16/32).
     ``minimize`` — objective: 'depth' | 'width' | 'steps' | 'params' | 'fits-named'.
+    ``feasible_floor`` — (DEFAULT True) account each strategy at its MEASURED honest
+                  floor (subroutine fp32 14 / inline+FF fp32 35 / fp64 31 / fp64+overlap
+                  27), NOT the falsely-deep summed radix geometry.  ``include_deep``
+                  additionally surfaces the bare deep tradeoff rows.
     """
     mh = max_hidden if max_hidden is not None else max_width
     mi = max_intermediate if max_intermediate is not None else max_width
@@ -637,7 +1796,8 @@ def fit(target: Optional[str] = None, *, ops=FULL, max_depth: Optional[int] = No
         target=target, require_buildable=require_buildable)
     if minimize == "fits-named" and target is None:
         raise ValueError("minimize='fits-named' needs a target=")
-    return solve(ops, box, objective=minimize, code_size=code_size)
+    return solve(ops, box, objective=minimize, code_size=code_size,
+                 feasible_floor=feasible_floor, include_deep=include_deep)
 
 
 # ===========================================================================

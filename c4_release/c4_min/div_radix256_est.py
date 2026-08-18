@@ -113,6 +113,8 @@ class R256Bands:
         self.LF16 = L._band("R256E_LF16", _NLANE * RN)
         self.LF256 = L._band("R256E_LF256", _NLANE * RN)
         self.QC = L._scalar("R256E_QC")             # chosen quotient byte
+        self.QLO = L._scalar("R256E_QLO")           # qhat mod 16  (nibble, for narrow qmul)
+        self.QHI = L._scalar("R256E_QHI")           # floor(qhat/16) (nibble, for narrow qmul)
         self.ROUT = L._band("R256E_ROUT", 8)        # de-normalized remainder nibbles
         self.DIV_RES = L._band("R256E_DIV", 8)
         self.MOD_RES = L._band("R256E_MOD", 8)
@@ -371,34 +373,61 @@ def _estimate_block(L, dim) -> Dict[str, torch.Tensor]:
     return _truncate(spec, u, dim)
 
 
+# NARROW qhat*dn: split the quotient byte qhat into two NIBBLES (qlo = qhat mod 16,
+# qhi = floor(qhat/16)) so every partial product is a nibble*nibble <= 15*15 = 225
+# (kmax 15) instead of the byte*nibble qhat*dn[c] <= 255*15 = 3825 (kmax 255).  This
+# keeps the SAME QDRAW/QD semantics (QDRAW = qhat*dn raw columns, QD = its clean
+# nibbles) but replaces the ONE kmax=255 carry round (9710-wide block, the fp32-FIT
+# intermediate binder) with a kmax=31 round on raw columns kept < 16*32 = 512 (a
+# column holds qlo*dn[c] + qhi*dn[c-1] <= 450), ~8x narrower.  qhat is still a byte
+# 0..255; only the MULTIPLY is limb-split, exactly like the plain nibble_alu32 MUL.
+def _qsplit_block(L, dim) -> Dict[str, torch.Tensor]:
+    """Split the quotient byte qhat into nibbles QLO = qhat mod 16, QHI = floor(qhat/16)."""
+    a = L.R256E
+    spec = _empty_spec(dim, 2 + 15 * 2 + 15 * 2)
+    u = 0
+    u = _clear(spec, u, a.QLO)
+    u = _clear(spec, u, a.QHI)
+    u = _ident(spec, u, {a.QHAT: 1.0}, 0.0, a.QLO, 1.0)
+    u = _floor_div_pow(spec, u, {a.QHAT: 1.0}, 0.0, 16, 15, a.QHI, 1.0)     # floor(qhat/16)
+    u = _floor_div_pow(spec, u, {a.QHAT: 1.0}, 0.0, 16, 15, a.QLO, -16.0)   # qhat - 16*floor
+    return _truncate(spec, u, dim)
+
+
 def _qmul_raw_block(L, dim) -> Dict[str, torch.Tensor]:
-    """QDRAW = qhat * dn (raw columns).  qhat is a byte (0..255), dn nibbles.  A
-    byte*nibble product qhat*dn[c] <= 255*15 = 3825; laid into column c raw.  (One
-    multiply per column via _mul_gate: qhat as the byte multiplicand, dn[c] gate.)"""
+    """QDRAW = qhat*dn raw columns, via the NIBBLE-SPLIT partials qlo*dn[c] (into
+    column c) + qhi*dn[c] (into column c+1, weight 1 because qhi carries the *16).
+    Each partial is a nibble*nibble <= 225; a column holds <= qlo*dn[c] + qhi*dn[c-1]
+    <= 450.  (qhat*dn = (16*qhi+qlo)*dn = qlo*dn + qhi*dn<<4; the <<4 = one column up.)"""
     a = L.R256E
     RN = a.RN
-    spec = _empty_spec(dim, RN + RN * 2)
+    spec = _empty_spec(dim, RN + 2 * RN * 2)
     u = 0
     for c in range(RN):
         u = _clear(spec, u, a.QDRAW + c)
-        u = _mul_gate(spec, u, a.QHAT, a.DN + c, a.QDRAW + c, 1.0)   # qhat * dn[c]
+    for c in range(RN):
+        u = _mul_gate(spec, u, a.QLO, a.DN + c, a.QDRAW + c, 1.0)          # qlo * dn[c] -> col c
+        if c + 1 < RN:
+            u = _mul_gate(spec, u, a.QHI, a.DN + c, a.QDRAW + c + 1, 1.0)  # qhi * dn[c] -> col c+1
     return _truncate(spec, u, dim)
 
 
 def _qmul_carry_block(L, dim) -> Dict[str, torch.Tensor]:
-    """Carry-normalise qhat*dn columns (each <= 3825 -> kmax 255) into QD nibbles.
-    One round; column c carry into c+1.  A single round is NOT enough for cols up to
-    3825 (carry ~239 ripples several columns), so we call this twice."""
+    """Carry-normalise the nibble-split qhat*dn columns (each <= 450 -> kmax 31) into
+    QD nibbles.  One round; column c carry into c+1.  Raw cols <= 450 need kmax 31
+    (floor(450/16)=28, +headroom); a single round leaves QD < 256, cleaned by the
+    kmax=15 second pass (_qmul_carry2_block)."""
     a = L.R256E
     RN = a.RN
-    spec = _empty_spec(dim, RN * (2 + 255 * 2 + 255 * 2))
+    KM = 31
+    spec = _empty_spec(dim, RN * (2 + KM * 2 + KM * 2))
     u = 0
     for c in range(RN):
         u = _clear(spec, u, a.QD + c)
         u = _ident(spec, u, {a.QDRAW + c: 1.0}, 0.0, a.QD + c, 1.0)
-        u = _floor_div_pow(spec, u, {a.QDRAW + c: 1.0}, 0.0, 16, 255, a.QD + c, -16.0)
+        u = _floor_div_pow(spec, u, {a.QDRAW + c: 1.0}, 0.0, 16, KM, a.QD + c, -16.0)
         if c + 1 < RN:
-            u = _floor_div_pow(spec, u, {a.QDRAW + c: 1.0}, 0.0, 16, 255, a.QD + c + 1, 1.0)
+            u = _floor_div_pow(spec, u, {a.QDRAW + c: 1.0}, 0.0, 16, KM, a.QD + c + 1, 1.0)
     return _truncate(spec, u, dim)
 
 
@@ -505,14 +534,36 @@ def _lane_limb_V(a, L, lane, li):
     return V, st, cnt
 
 
-def _lane_floors_block(L, dim) -> Dict[str, torch.Tensor]:
-    """Clean floors F16 = floor(V/16), F256 = floor(V/256) per lane per limb, via
-    SHARP staircases that SNAP the ``16^j`` recompose residue (the div_radix16_lean
-    fp32-hygiene: never carry a sub-integer residue into the next iteration's 256x
-    shift).  V <= 4095 -> F16 kmax 255, F256 kmax 15."""
+def _lane_f256_block(L, dim) -> Dict[str, torch.Tensor]:
+    """F256 = floor(V/256) per lane per limb (V <= 4095 -> kmax 15).  A PRIOR block so
+    the two-level F16 below can read a SETTLED F256 (no same-block stale read)."""
     a = L.R256E
     RN = a.RN
-    spec = _empty_spec(dim, _NLANE * len(_LIMBS) * (2 + 255 * 2 + 15 * 2))
+    spec = _empty_spec(dim, _NLANE * len(_LIMBS) * (2 + 15 * 2))
+    u = 0
+    for lane in range(_NLANE):
+        for li, (st, cnt) in enumerate(_LIMBS):
+            V, st, cnt = _lane_limb_V(a, L, lane, li)
+            f256 = a.LF256 + lane * RN + st
+            u = _clear(spec, u, f256)
+            u = _floor_div_pow(spec, u, V, 0.0, 256, 15, f256, 1.0)      # floor(V/256), kmax 15
+    return _truncate(spec, u, dim)
+
+
+def _lane_floors_block(L, dim) -> Dict[str, torch.Tensor]:
+    """Clean floors F16 = floor(V/16) per lane per limb, via SHARP staircases that SNAP
+    the ``16^j`` recompose residue (the div_radix16_lean fp32-hygiene: never carry a
+    sub-integer residue into the next iteration's 256x shift).  V <= 4095.
+
+    TWO-LEVEL F16 (the fp32-FIT narrowing): floor(V/16) directly is kmax 255 (was the
+    6504-wide intermediate binder).  Instead read the SETTLED F256 = floor(V/256) (from
+    the prior _lane_f256_block, kmax 15), then F16 = 16*F256 + floor((V - 256*F256)/16)
+    — the residue ``V - 256*F256 = V mod 256`` is ``< 256`` so its floor(./16) is kmax
+    15.  Both staircases kmax 15 (~17x narrower) and F16 stays byte-EXACT (F256 exact ->
+    residue exact -> floor(./16) exact)."""
+    a = L.R256E
+    RN = a.RN
+    spec = _empty_spec(dim, _NLANE * len(_LIMBS) * (2 + 15 * 2 + 15 * 2))
     u = 0
     for lane in range(_NLANE):
         for li, (st, cnt) in enumerate(_LIMBS):
@@ -520,9 +571,9 @@ def _lane_floors_block(L, dim) -> Dict[str, torch.Tensor]:
             f16 = a.LF16 + lane * RN + st
             f256 = a.LF256 + lane * RN + st
             u = _clear(spec, u, f16)
-            u = _floor_div_pow(spec, u, V, 0.0, 16, 255, f16, 1.0)       # floor(V/16)
-            u = _clear(spec, u, f256)
-            u = _floor_div_pow(spec, u, V, 0.0, 256, 15, f256, 1.0)      # floor(V/256)
+            u = _floor_div_pow(spec, u, {f256: 1.0}, 0.0, 1, 15, f16, 16.0)   # + 16*F256
+            # + floor((V - 256*F256)/16): residue V mod 256 < 256 -> kmax 15.
+            u = _floor_div_pow(spec, u, _addk(V, f256, -256.0), 0.0, 16, 15, f16, 1.0)
     return _truncate(spec, u, dim)
 
 
@@ -624,6 +675,7 @@ def _iteration_body(L, dim):
         ("r256e-shiftc", _shift_carry_block(L, dim)),
         ("r256e-ahat", _ahat_block(L, dim)),
         ("r256e-est", _estimate_block(L, dim)),
+        ("r256e-qsplit", _qsplit_block(L, dim)),
         ("r256e-qmulraw", _qmul_raw_block(L, dim)),
         ("r256e-qmulc", _qmul_carry_block(L, dim)),
         ("r256e-qmulc2", _qmul_carry2_block(L, dim)),
@@ -631,6 +683,7 @@ def _iteration_body(L, dim):
         ("r256e-lanesubc", _lane_sub_carry_block(L, dim)),
         ("r256e-lanesubc2", _lane_sub_carry_block(L, dim)),   # 2nd round: carry can ripple 2 cols
     ] + borrow + [
+        ("r256e-lanef256", _lane_f256_block(L, dim)),
         ("r256e-lanefloors", _lane_floors_block(L, dim)),
         ("r256e-lanenibs", _lane_nibbles_block(L, dim)),
         ("r256e-selemit", _select_emit_block(L, dim)),
@@ -662,16 +715,21 @@ def _mod_qd_raw_block(L, dim) -> Dict[str, torch.Tensor]:
 
 
 def _mod_qd_carry_block(L, dim) -> Dict[str, torch.Tensor]:
-    """Carry-normalise q*d columns (<= 1800 -> kmax 255) into QD nibbles (8)."""
+    """Carry-normalise q*d columns into QD nibbles (8).  A column holds Σ_{i+j=c}
+    q_nib[i]*d_nib[j] <= (c+1)*225 <= 8*225 = 1800, so the floor(col/16) staircase is
+    TIGHT at kmax = floor(1800/16) = 112 (NOT the loose 255) -> ~2.3x narrower block
+    (the fp32-FIT intermediate binder after the qhat*dn split).  One round leaves QD
+    < 256, cleaned by the kmax=15 second pass."""
     a = L.R256E
-    spec = _empty_spec(dim, 8 * (2 + 255 * 2 + 255 * 2))
+    KM = 112
+    spec = _empty_spec(dim, 8 * (2 + KM * 2 + KM * 2))
     u = 0
     for c in range(8):
         u = _clear(spec, u, a.QD + c)
         u = _ident(spec, u, {a.QDRAW + c: 1.0}, 0.0, a.QD + c, 1.0)
-        u = _floor_div_pow(spec, u, {a.QDRAW + c: 1.0}, 0.0, 16, 255, a.QD + c, -16.0)
+        u = _floor_div_pow(spec, u, {a.QDRAW + c: 1.0}, 0.0, 16, KM, a.QD + c, -16.0)
         if c + 1 < 8:
-            u = _floor_div_pow(spec, u, {a.QDRAW + c: 1.0}, 0.0, 16, 255, a.QD + c + 1, 1.0)
+            u = _floor_div_pow(spec, u, {a.QDRAW + c: 1.0}, 0.0, 16, KM, a.QD + c + 1, 1.0)
     return _truncate(spec, u, dim)
 
 
