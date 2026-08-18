@@ -1,0 +1,53 @@
+{
+  "record": "c-torture #if long-long feature-guard evaluator + softint64 array/by-value ABI fix (#903 sub-lever, builds on #920)",
+  "oracle": "gcc -m32 -std=c90",
+  "machine": "compiler32(WORD=4)+c4vm32u(STRIDE=4)+transpile(preprocess,native32,fnptr,softint64)",
+  "corpus_total": 1694,
+  "gcc_rejected": 200,
+  "fix_location": "c4_doom id_port/transpile.py (#if long-long guard seed) + id_port/softint64.py (const-declarator / split-functions array-init / __u32lit unwrap / by-value-param private-copy / prototype-skip)",
+  "reclassified_longlong_in_subset": {
+    "in_subset_total": 1274,
+    "baseline_920_pass": 941,
+    "fixed_pass": 945,
+    "gain": 4,
+    "regressions_pass_to_fail": 0,
+    "stage_breakdown": {
+      "PASS": 945,
+      "vm_error": 7,
+      "compile_error": 206,
+      "MISMATCH": 115,
+      "transpile_error": 1
+    }
+  },
+  "legacy_longlong_oob": {
+    "in_subset_total": 1100,
+    "in_subset_pass": 816,
+    "note": "core in-subset UNCHANGED vs #920 (816/1100); long-long OOB bucket below",
+    "longlong_oob_bucket": {
+      "total": 174,
+      "pass": 129,
+      "fail": 45
+    },
+    "longlong_oob_bucket_baseline_920_pass": 125
+  },
+  "newly_closed_cases": [
+    "ashldi-1",
+    "ashrdi-1",
+    "lshrdi-1",
+    "pr85582-2"
+  ],
+  "regressions": [],
+  "canonical_dimode_shift_status": {
+    "ashldi-1": "PASS",
+    "ashrdi-1": "PASS",
+    "lshrdi-1": "PASS",
+    "shiftdi": "compile_error",
+    "shiftdi-2": "MISMATCH",
+    "note": "shiftdi/shiftdi-2 have NO #if guard (dg-require comment) -- their residual is a separate softint64/runtime gap, not the #if evaluator"
+  },
+  "gates": {
+    "golden_174ece66": "untouched (fix confined to c4_doom id_port transpiler; zero c4_min model-build files; 0 c4_min imports of transpile/softint64)",
+    "doom_byte_identity": "62/62 linuxdoom-1.10 modules SHA-identical under flagless transpile(src) (PYTHONHASHSEED=0)",
+    "ctorture_regressions": 0
+  }
+}
